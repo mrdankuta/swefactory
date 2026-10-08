@@ -48,6 +48,20 @@ Adapter resolution: `--adapter`, else `$FACTORY_CHECK_ADAPTER`, else the
 nearest `scripts/factory-check` walking up from the current directory.
 On success the adapter prints `FACTORY-CHECK PASSED`; any stage failure
 fails the run with a non-zero exit and no marker.
+```sh
+factory handoff 11 --signal READY_FOR_REVIEW --body HANDOFF.md
+factory handoff 11 --signal BLOCKED            # posts the trailer alone
+factory reconcile                               # read-only: open issues vs dev
+factory start 11                                # worktree + branch + brief
+factory --json reconcile                        # machine-parseable drift report
+```
+
+All GitHub access shells out to the `gh` CLI (same as the bash parity
+target); there is no API client code. `FACTORY_GH_BIN` / `FACTORY_GIT_BIN`
+override the binaries under test. `reconcile` never writes: no issue
+comments/edits and no pushes. `start` never touches GitHub state either —
+it reads the ticket via `gh issue view` and creates only local
+worktree/branch/brief state.
 
 ## Checks
 
