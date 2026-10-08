@@ -1,0 +1,20 @@
+[package]
+name = "factory"
+version = "0.1.0"
+edition = "2021"
+description = "swefactory — the software factory as a product (single static binary)"
+license = "MIT"
+
+[[bin]]
+name = "factory"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serde_json = "1"

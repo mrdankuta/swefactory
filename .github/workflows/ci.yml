@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --manifest-path swefactory/Cargo.toml --check
+      - name: Lint (deny warnings)
+        run: cargo clippy --manifest-path swefactory/Cargo.toml --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --manifest-path swefactory/Cargo.toml
+      - name: Test
+        run: cargo test --manifest-path swefactory/Cargo.toml
