@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Wrapper: reconcile now lives in scripts/factory (pi-factory CLI).
+set -euo pipefail
+exec "$(dirname "$0")/factory" reconcile
