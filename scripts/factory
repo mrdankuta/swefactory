@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# factory — thin CLI for the pi-factory workflow (gh-issues native).
+# Subcommands: init | update | freeze | sync | handoff | reconcile | check | version
+# Run from the project root. Requires: git, gh (authenticated) for issue ops.
+set -euo pipefail
+
+FACTORY_VERSION="0.5.1"
+# FACTORY_SRC: when running from a project shim (scripts/factory), this points
+# back at the pi-factory checkout/clone for templates. Resolved at install time.
+FACTORY_SRC="${FACTORY_SRC:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"
+
+# gh() wrapper: filters version-manager noise (mise prints to stdout) so
+# --jq parsing stays exact. Real errors still surface on stderr.
+gh() { command gh "$@" 2>/dev/null | grep -v '^mise ' || true; }
+
+# body_hash: canonical sha256 of an issue body (exactly one trailing newline)
+# so editor/trailing-whitespace differences can never false-mismatch.
+body_hash() { printf '%s\n' "$1"; }
+
+usage() {
+  cat <<'EOF'
+Usage: factory <cmd> [args]
+
+  init [--stack elixir|node|python] [--global-skills]
+      Seed the factory into the current project (idempotent, never clobbers).
+  update [--pin vX.Y.Z]
+      Refresh prompts/shim/checks from pi-factory main (or pinned tag).
+  freeze <issue> [--label spec-approved]
+      Record approval: sha256 of the issue body posted as SPEC-APPROVED comment.
+  sync <issue>
+      Write factory/.cache/SPEC-<n>.md snapshot of the issue (gitignored cache).
+  handoff <issue> --signal READY_FOR_REVIEW|NEEDS_CLARIFICATION|BLOCKED [--body FILE]
+      Post handoff comment to the issue and print the FACTORY: signal line.
+  reconcile
+      Read-only drift report between open GitHub issues and origin/dev.
+  verify-freeze <spec-issue>
+      Exit 0 iff the spec body still matches its SPEC-APPROVED hash.
+  metrics [--limit N]
+      Cycle-time + label-bucket report from ticket issues.
+  start <ticket-issue> [--pane ID]
+      Create worktree+branch+brief; with --pane, launch Herdr agent too.
+  check [-- args...]
+      Run scripts/factory-check (the project gate).
+  version
+      Print factory version.
+EOF
+}
+
+need_gh() {
+  command -v gh >/dev/null 2>&1 || { echo "factory: gh CLI not found — install from https://cli.github.com" >&2; exit 1; }
+}
+
+cmd_version() { echo "factory $FACTORY_VERSION (pi-factory)"; }
+
+cmd_init() {
+  local stack="elixir" global_skills="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stack) stack="${2:?}"; shift 2 ;;
+      --global-skills) global_skills="1"; shift ;;
+      *) echo "factory init: unknown arg $1" >&2; exit 1 ;;
+    esac
+  done
+  local dest="$PWD"
+  if [ ! -d "$FACTORY_SRC/prompts" ]; then
+    echo "factory init: templates not found locally." >&2
+    echo "Fetch pi-factory first:" >&2
+    echo '  curl -fsSL https://raw.githubusercontent.com/mrdankuta/pi-factory/main/install.sh | bash -s -- --stack '"$stack" >&2
+    exit 1
+  fi
+  echo "factory init: seeding $dest (stack: $stack)"
+
+  # --- prerequisites (warn, don't fail) ---
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "WARN: gh CLI not found — issue templates/labels will be skipped. Install: https://cli.github.com"
+  fi
+  if ! command -v herdr >/dev/null 2>&1; then
+    echo "WARN: herdr not found — install from https://herdr.dev then run: herdr integration install pi"
+  else
+    echo "herdr: $(herdr --version 2>/dev/null | head -n 1)"
+    if ! herdr integration status 2>/dev/null | grep -qi pi; then
+      echo "hint: run 'herdr integration install pi' to enable the pi agent in Herdr panes"
+    fi
+  fi
+
+  mkdir -p "$dest"/{.pi/prompts,.agents/skills,.github/ISSUE_TEMPLATE,factory/.cache,docs/{product,architecture,adr,runbooks},scripts}
+
+  # --- prompts ---
+  for p in plan build review handoff; do
+    if [ -f "$dest/.pi/prompts/$p.md" ]; then
+      echo "keep: .pi/prompts/$p.md exists, not overwriting"
+    else
+      cp "$FACTORY_SRC/prompts/$p.md" "$dest/.pi/prompts/$p.md"
+      echo "install: .pi/prompts/$p.md"
+    fi
+  done
+
+  # --- skills (project-local, hermetic; never overwrite existing) ---
+  local skill_dest="$dest/.agents/skills"
+  [ "$global_skills" = "1" ] && skill_dest="$HOME/.agents/skills" && mkdir -p "$skill_dest"
+  for s in "$FACTORY_SRC"/skills/*/; do
+    local name; name="$(basename "$s")"
+    if [ -d "$skill_dest/$name" ]; then
+      echo "keep: skills/$name exists, not overwriting"
+    else
+      cp -r "$s" "$skill_dest/$name"
+      echo "install: skills/$name -> $skill_dest/$name"
+    fi
+  done
+  if [ ! -f "$dest/.agents/skills/land/SKILL.md" ]; then
+    echo "hint: adapt templates/land-skill.template.md into .agents/skills/land/SKILL.md for this project's landing rules"
+  fi
+
+  # --- checks + shim ---
+  if [ -f "$dest/scripts/factory-check" ]; then
+    echo "keep: scripts/factory-check exists, not overwriting"
+  else
+    case "$stack" in
+      elixir) cp "$FACTORY_SRC/checks/factory-check-elixir" "$dest/scripts/factory-check" ;;
+      node) cp "$FACTORY_SRC/checks/factory-check-node" "$dest/scripts/factory-check" ;;
+      python) cp "$FACTORY_SRC/checks/factory-check-python" "$dest/scripts/factory-check" ;;
+      *) echo "WARN: no check adapter for '$stack' — write scripts/factory-check (contract: format→lint→test, non-zero on fail)";;
+    esac
+    chmod +x "$dest/scripts/factory-check" 2>/dev/null || true
+    echo "install: scripts/factory-check ($stack)"
+  fi
+  if [ ! -f "$dest/scripts/factory" ]; then
+    cp "$FACTORY_SRC/bin/factory" "$dest/scripts/factory"
+    chmod +x "$dest/scripts/factory"
+    echo "install: scripts/factory (project shim)"
+  else
+    echo "keep: scripts/factory exists"
+  fi
+
+  # --- AGENTS.md header (marker-based merge) ---
+  if grep -q "factory:header:start" "$dest/AGENTS.md" 2>/dev/null; then
+    echo "keep: AGENTS.md already has factory header"
+  else
+    if [ -f "$dest/AGENTS.md" ]; then
+      { cat "$FACTORY_SRC/templates/AGENTS.header.md"; echo ""; cat "$dest/AGENTS.md"; } > "$dest/AGENTS.md.new"
+      mv "$dest/AGENTS.md.new" "$dest/AGENTS.md"
+      echo "merged: factory header prepended to AGENTS.md (review the join)"
+    else
+      cp "$FACTORY_SRC/templates/AGENTS.header.md" "$dest/AGENTS.md"
+      echo "install: AGENTS.md (header only — append stack rules below)"
+    fi
+  fi
+
+  # --- glossary + docs skeleton (only if missing) ---
+  [ -f "$dest/GLOSSARY.md" ] || { cp "$FACTORY_SRC/templates/GLOSSARY.md" "$dest/GLOSSARY.md"; echo "install: GLOSSARY.md"; }
+  [ -f "$dest/docs/README.md" ] || { cp "$FACTORY_SRC/templates/docs-README.md" "$dest/docs/README.md"; echo "install: docs/README.md"; }
+
+  # --- GitHub templates + labels (best effort) ---
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    cp "$FACTORY_SRC/github/ISSUE_TEMPLATE/spec.yml" "$dest/.github/ISSUE_TEMPLATE/spec.yml" 2>/dev/null || true
+    cp "$FACTORY_SRC/github/ISSUE_TEMPLATE/ticket.yml" "$dest/.github/ISSUE_TEMPLATE/ticket.yml" 2>/dev/null || true
+    echo "install: .github/ISSUE_TEMPLATE/{spec,ticket}.yml"
+    while IFS= read -r line; do
+      name="${line%%:*}"; color="$(echo "$line" | cut -d: -f2)"; desc="$(echo "$line" | cut -d: -f3-)"
+      gh label create "$name" --color "$color" --description "$desc" 2>/dev/null \
+        || gh label edit "$name" --color "$color" --description "$desc" 2>/dev/null || true
+    done < "$FACTORY_SRC/github/labels.txt"
+    echo "labels: ensured factory label set"
+  else
+    echo "skip: gh not authenticated — copy github/ISSUE_TEMPLATE manually and create labels from github/labels.txt"
+  fi
+
+  # --- gitignore cache ---
+  if [ -f "$dest/.gitignore" ]; then
+    grep -q "factory/.cache/" "$dest/.gitignore" || echo "factory/.cache/" >> "$dest/.gitignore"
+  fi
+  echo "$FACTORY_VERSION" > "$dest/.factory-version"
+  echo "factory init done ($stack). Next: fill GLOSSARY.md, file epic issue, /plan."
+}
+
+cmd_update() {
+  echo "factory update: re-run the installer from pi-factory main (or --pin <tag>):"
+  echo "  curl -fsSL https://raw.githubusercontent.com/mrdankuta/pi-factory/main/install.sh | bash"
+  echo "init is idempotent and never overwrites existing files; delete a file to force refresh."
+}
+
+cmd_freeze() {
+  need_gh
+  local issue="${1:?usage: factory freeze <issue>}"; shift || true
+  local label="spec-approved"
+  while [ $# -gt 0 ]; do case "$1" in --label) label="$2"; shift 2;; *) shift;; esac; done
+  local body; body="$(gh issue view "$issue" --json body --jq .body)"
+  local hash; hash="$(body_hash "$body" | sha256sum | cut -d' ' -f1)"
+  gh issue comment "$issue" --body "SPEC-APPROVED \`$hash\`
+
+Approval-time snapshot hash of the issue body. If the body changes after this comment, the hash no longer matches and the spec must be re-frozen before review. Verify with: \`factory sync $issue\` (compares cached hash)."
+  gh issue edit "$issue" --add-label "$label" >/dev/null
+  echo "frozen: issue #$issue label=$label hash=$hash"
+}
+
+cmd_sync() {
+  need_gh
+  local issue="${1:?usage: factory sync <issue>}"
+  local num="${issue//#/}"
+  mkdir -p factory/.cache
+  local body title state
+  body="$(gh issue view "$issue" --json body --jq .body)"
+  title="$(gh issue view "$issue" --json title --jq .title)"
+  state="$(gh issue view "$issue" --json state --jq .state)"
+  local hash; hash="$(body_hash "$body" | sha256sum | cut -d' ' -f1)"
+  {
+    echo "<!-- factory cache: issue #$num hash=$hash — DO NOT EDIT, regenerate with: factory sync $num -->"
+    echo "# SPEC-$num: $title"
+    echo ""
+    echo "- Issue: #$num (authoritative; this file is a local cache)"
+    echo "- State: $state | body-sha256: \`$hash\`"
+    echo ""
+    printf '%s\n' "$body"
+  } > "factory/.cache/SPEC-$num.md"
+  echo "cached: factory/.cache/SPEC-$num.md (hash=$hash)"
+}
+
+cmd_handoff() {
+  need_gh
+  local issue="${1:?usage: factory handoff <issue> --signal SIG [--body FILE]}"; shift
+  local signal="" body_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --signal) signal="$2"; shift 2 ;;
+      --body) body_file="$2"; shift 2 ;;
+      *) echo "factory handoff: unknown arg $1" >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$signal" ] || { echo "factory handoff: --signal required" >&2; exit 1; }
+  local body="HANDOFF \`FACTORY:$signal\`"
+  [ -n "$body_file" ] && body="$(cat "$body_file")"$'\n\n'"$body"
+  gh issue comment "$issue" --body "$body"
+  echo ""
+  echo "FACTORY:$signal"
+}
+
+cmd_reconcile() {
+  need_gh
+  git fetch origin dev --quiet 2>/dev/null || git fetch origin --quiet 2>/dev/null || true
+  local base="origin/dev"
+  git rev-parse --verify --quiet "$base" >/dev/null || base="origin/main"
+  echo "== open issues vs $base =="
+  gh issue list --state open --limit 50 --json number,title --jq '.[] | "\(.number) \(.title)"' |
+    while read -r num title; do
+      local hits; hits=$(git log "$base" --oneline --grep="#${num}\b" 2>/dev/null | head -n 3)
+      if [ -n "$hits" ]; then
+        echo "#${num} POSSIBLY-LANDED: ${title}"
+        echo "$hits" | sed 's/^/    /'
+      else
+        echo "#${num} open: ${title}"
+      fi
+    done
+  echo
+  echo "== factory branches =="
+  git branch -a 2>/dev/null | grep -E "factory/|feat/" | head -n 20 || echo "(none)"
+  echo
+  echo "Suggested actions (human decides): close landed issues, delete merged branches."
+}
+
+cmd_verify_freeze() {
+  need_gh
+  local issue="${1:?usage: factory verify-freeze <spec-issue>}"
+  local body; body="$(gh issue view "$issue" --json body --jq .body)"
+  local hash; hash="$(body_hash "$body" | sha256sum | cut -d' ' -f1)"
+  local approved
+  approved="$(gh issue view "$issue" --json comments --jq '[.comments[].body | capture("SPEC-APPROVED `?(?<h>[0-9a-f]{64})`?") | .h] | last' 2>/dev/null)"
+  if [ "$hash" = "$approved" ]; then
+    echo "freeze OK: #$issue hash=$hash"
+  else
+    echo "freeze MISMATCH: #$issue body=$hash approved=${approved:-none} — re-freeze required" >&2
+    exit 1
+  fi
+}
+
+cmd_metrics() {
+  need_gh
+  local limit=20
+  [ "${1:-}" = "--limit" ] && limit="${2:-20}"
+  echo "== open tickets by label =="
+  for l in ready running review accepted blocked; do
+    printf "%-10s %s\n" "$l:" "$(gh issue list --state open --label ticket --label "$l" --limit 100 --json number --jq length 2>/dev/null)"
+  done
+  echo
+  echo "== closed tickets cycle time (created -> closed) =="
+  gh issue list --state closed --label ticket --limit "$limit" --json number,title,createdAt,closedAt \
+    --jq '.[] | "\(.number) | \(.title[:60]) | \(.createdAt[:10]) -> \(.closedAt[:10])"' 2>/dev/null
+}
+
+cmd_start() {
+  need_gh
+  local ticket="${1:?usage: factory start <ticket-issue> [--pane ID}"; shift || true
+  local pane=""
+  [ "${1:-}" = "--pane" ] && pane="${2:?}"
+  local info; info="$(gh issue view "$ticket" --json number,title,body)"
+  local title; title="$(echo "$info" | python3 -c "import json,sys; print(json.load(sys.stdin)['title'])")"
+  local num; num="$(echo "$info" | python3 -c "import json,sys; print(json.load(sys.stdin)['number'])")"
+  local slug; slug="$(echo "$title" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g' | cut -c1-30 | sed 's/^-//;s/-$//')"
+  local branch="factory/T${num}-${slug}" wt="../$(basename "$PWD")-T${num}"
+  git fetch origin dev --quiet 2>/dev/null || true
+  local base; base="$(git rev-parse origin/dev 2>/dev/null || git rev-parse HEAD)"
+  git worktree add "$wt" -b "$branch" "$base" 2>&1 | tail -n 1
+  { echo "Ticket issue: #$num"; echo "Branch: $branch (base $base)"; echo ""; echo "$info" | python3 -c "import json,sys; print(json.load(sys.stdin)['body'])"; } > "$wt/.factory-brief.md"
+  cat .pi/prompts/build.md "$wt/.factory-brief.md" > "$wt/.factory-prompt.md"
+  echo "worktree: $wt | branch: $branch | brief: $wt/.factory-prompt.md"
+  if [ -n "$pane" ]; then
+    local np; np="$(herdr pane split --pane "$pane" --direction right --cwd "$wt")"
+    herdr agent start pi --kind pi --pane "$np" --timeout 60000
+    herdr agent prompt "$np" "$(cat "$wt/.factory-prompt.md")"
+    echo "launched in Herdr pane $np"
+  else
+    echo "next: herdr pane split --pane <shell-pane> --direction right --cwd $wt"
+    echo "      herdr agent start pi --kind pi --pane <new-pane> --timeout 60000"
+    echo "      herdr agent prompt <new-pane> \"\$(cat $wt/.factory-prompt.md)\""
+  fi
+}
+
+cmd_check() {
+  exec ./scripts/factory-check "$@"
+}
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  freeze) shift; cmd_freeze "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
+  handoff) shift; cmd_handoff "$@" ;;
+  reconcile) shift; cmd_reconcile "$@" ;;
+  verify-freeze) shift; cmd_verify_freeze "$@" ;;
+  metrics) shift; cmd_metrics "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  version|--version|-v) cmd_version ;;
+  *) usage; exit 1 ;;
+esac

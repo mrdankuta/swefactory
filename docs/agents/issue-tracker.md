@@ -14,6 +14,22 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
 
+## Two label vocabularies on this repo
+
+swefactory runs two systems side by side — do not confuse them:
+
+- **Triage roles** (`needs-triage`, `needs-info`, `ready-for-agent`,
+  `ready-for-human`, `wontfix`): the matt-pocock skills queue. Managed by
+  `/triage`; see `docs/agents/triage-labels.md`.
+- **Factory protocol** (`ticket`, `ready`, `running`, `review`, `accepted`,
+  `integrated`, `blocked`, `spec`, `spec-approved`, `epic`): the pi-factory
+  dispatcher loop. An issue needs `ticket` + `ready` for `factory-dispatch`
+  to pick it up; the dispatcher moves it through the rest itself.
+
+An issue about to be built typically carries both (`ready-for-agent` + `ticket`
++ `ready`). Triage never adds protocol labels and the dispatcher never adds
+triage labels.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
