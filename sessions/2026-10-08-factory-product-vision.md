@@ -49,5 +49,5 @@
 ## Continuation pointers
 
 * Work from `~/Deving/rc_int/swefactory` from here on.
-* Proven behavior reference: `factory-v0.4.0/` (do not edit — rewrite target).
+* Proven behavior reference: `upstream/` (true source, pinned @ `51df377` — do not edit — rewrite target). `factory-v0.4.0/` shows the installed/adapted shape in a real project.
 * Next: answer the 4 open questions, then scaffold the Rust workspace.

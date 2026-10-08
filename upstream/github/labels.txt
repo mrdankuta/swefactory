@@ -1,0 +1,11 @@
+# name:color:description (hex without #)
+epic:1D76DB:Parent epic tracking a body of work
+spec:0E8A16:Product spec issue (authoritative at SPEC-APPROVED freeze)
+spec-approved:0E8A16:Spec frozen — body hash recorded in SPEC-APPROVED comment
+ticket:FBCA04:Single unit of implementation work
+blocked:B60205:Waiting on a decision or another ticket
+review:5319E7:In independent review
+accepted:0E8A16:Reviewed and accepted by human, ready to land
+integrated:8250DF:Merged into the open release train (distinct from accepted)
+ready:1D76DB:Ticket ready for implementation (dispatcher picks up)
+running:1D76DB:Ticket under active dispatcher attempt

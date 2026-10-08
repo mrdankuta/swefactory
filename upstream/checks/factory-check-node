@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Factory gate (node adapter). Contract: format check → lint → tests; non-zero exit on failure.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== lint =="
+npm run lint --if-present
+
+echo "== test =="
+npm test
+
+echo "FACTORY-CHECK PASSED"

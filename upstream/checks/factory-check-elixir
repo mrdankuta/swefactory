@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Factory gate: one deterministic command humans and agents run before handoff.
+# Contract (all stack adapters): format check → lint/compile → tests; non-zero exit on failure.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "== format =="
+mix format --check-formatted
+
+echo "== compile (warnings as errors) =="
+mix compile --warnings-as-errors
+
+echo "== test =="
+MIX_ENV=test mix test "$@"
+
+echo "== assets =="
+mix assets.build
+
+echo "FACTORY-CHECK PASSED"

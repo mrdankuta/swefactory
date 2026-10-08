@@ -5,8 +5,15 @@
 
 ## Layout
 
-* `factory-v0.4.0/` — frozen snapshot of the working bash factory (v0.4.0),
-  exported from booksbuddy Oct 2026. Source of proven behavior for the Rust rewrite.
+* `upstream/` — exact mirror of the true source, `github.com/mrdankuta/pi-factory` @ `51df377` (minus `.git`). Pinned commit recorded in `upstream/UPSTREAM-COMMIT`. This is the rewrite reference.
+  * `bin/` — `factory`, `factory-dispatch` · `checks/` — elixir/node/python adapters
+  * `prompts/` (incl. `review-integration.md`), `skills/`, `templates/`,
+  * `docs/` (`DISPATCHER`, `HERDR`, `SKILL-PINS`, `USAGE`, `WORKFLOW`),
+  * `github/` (issue templates + labels), `install.sh`, `README.md`
+* `factory-v0.4.0/` — installed/adapted instance as deployed in booksbuddy
+  (project shim layout: `scripts/` instead of `bin/`, adapted `SKILL.md`
+  files, `AGENTS.header.md` merge result, `GLOSSARY` example). Shows how
+  the toolkit lands in a real project; secondary reference.
   * `scripts/` — `factory`, `factory-dispatch`, `factory-check`, `factory-reconcile`
   * `prompts/` — `plan`, `build`, `review`, `handoff`
   * `skills/` — `to-spec`, `to-tickets`, `tdd`, `code-review`, `land`, `pr`, `retro`, …

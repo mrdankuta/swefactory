@@ -1,7 +1,7 @@
 # Factory Product Vision — production-grade software, consumer-simple UX
 
 > Status: vision / pre-spec. Authoritative decisions live in GitHub issues once the repo is created.
-> Source snapshot: `factory-v0.4.0/` (bash factory `0.4.0` exported from booksbuddy).
+> Source snapshot: `upstream/` (pi-factory @ `51df377`) + `factory-v0.4.0/` (installed instance in booksbuddy).
 > Session origin: fork of Orca session `9cff49ef…`, agent `pi`, Oct 2026.
 
 ## 1. The bet
