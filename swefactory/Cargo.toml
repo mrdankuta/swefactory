@@ -30,6 +30,9 @@ resolver = "2"
 # formula. Linux builds target musl for a fully static binary.
 [workspace.metadata.dist]
 cargo-dist-version = "0.33.0"
+# CI is hand-maintained (product lives in swefactory/, not repo root,
+# which the generator does not model): do not fail plan on workflow drift.
+allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
 targets = [
