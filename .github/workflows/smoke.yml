@@ -1,0 +1,84 @@
+# Installer smoke (ticket #12): after cargo-dist publishes a tagged release,
+# prove the install UX stays curl-pipe-shaped on every platform — install from
+# the just-published release assets into a scratch dir (no checkout, no Rust
+# toolchain) and run `factory version` / `factory --json version`.
+#
+# Kept as a separate workflow (not inside release.yml) so release.yml stays
+# pristine `cargo dist generate-ci` output — `dist plan` fails when the
+# generated file drifts.
+
+name: Installer smoke
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to smoke-test (e.g. v0.1.0); blank = latest release"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            installer: shell
+          - runner: macos-latest
+            installer: shell
+          - runner: macos-latest
+            installer: homebrew
+          - runner: windows-latest
+            installer: powershell
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          TAG='${{ github.event.release.tag_name }}${{ inputs.tag }}'
+          if [ -z "$TAG" ]; then
+            TAG="$(gh release view --json tagName -q .tagName --repo '${{ github.repository }}')"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Smoking release $TAG via ${{ matrix.installer }} installer"
+
+      - name: Install via shell installer (curl-pipe)
+        if: matrix.installer == 'shell'
+        shell: bash
+        run: >
+          curl --proto '=https' --tlsv1.2 -LsSf
+          'https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/factory-installer.sh'
+          | sh
+
+      - name: Install via Homebrew formula
+        if: matrix.installer == 'homebrew'
+        shell: bash
+        run: >
+          brew install
+          'https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/factory.rb'
+
+      - name: Install via PowerShell installer
+        if: matrix.installer == 'powershell'
+        shell: powershell
+        run: >
+          irm 'https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/factory-installer.ps1'
+          | iex
+
+      - name: Smoke against a scratch project (no toolchain, no checkout)
+        shell: bash
+        run: |
+          SCRATCH="$(mktemp -d)"
+          cd "$SCRATCH"
+          factory version
+          factory --json version
+          echo "scratch smoke OK in $SCRATCH"
