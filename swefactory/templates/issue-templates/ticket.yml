@@ -1,0 +1,40 @@
+name: Ticket
+description: Single unit of implementation work (one worktree + branch)
+title: "[ticket] <title>"
+labels: ["ticket"]
+body:
+  - type: input
+    id: spec
+    attributes:
+      label: Spec issue
+      description: Parent spec issue number (e.g. #42)
+    validations:
+      required: true
+  - type: input
+    id: depends
+    attributes:
+      label: Depends on
+      description: Ticket issues that must land first, or "none"
+      value: "none"
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      options: ["low", "medium", "high"]
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Acceptance criteria (copied from spec at start)
+      value: "- [ ] "
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope (allowed files/interfaces)
+  - type: textarea
+    id: out
+    attributes:
+      label: Out of scope

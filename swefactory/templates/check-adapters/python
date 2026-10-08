@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# factory-check (python) — check adapter for swefactory.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets concurrent state so
+# parallel dispatcher workers never share mutable resources.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ ! -f pyproject.toml ] && [ ! -f setup.py ] && [ ! -f setup.cfg ]; then
+  echo "factory-check: no Python project manifest yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: separate temp/pytest state per dispatcher worker.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export TMPDIR="${TMPDIR:-/tmp}/factory-slot-$FACTORY_SLOT"
+  mkdir -p "$TMPDIR"
+fi
+
+echo "==> ruff format --check"
+ruff format --check .
+
+echo "==> ruff check"
+ruff check .
+
+echo "==> pytest"
+python -m pytest "$@"
+
+echo "FACTORY-CHECK PASSED"
