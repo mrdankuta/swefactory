@@ -1,0 +1,3 @@
+[submodule "pi-factory"]
+	path = pi-factory
+	url = https://github.com/mrdankuta/pi-factory.git

@@ -5,7 +5,7 @@
 
 ## Layout
 
-* `upstream/` — exact mirror of the true source, `github.com/mrdankuta/pi-factory` @ `dc477a7` (minus `.git`; worktree at sync included uncommitted v0.5.1 `release finish`/`abandon` changes). Pinned commit recorded in `upstream/UPSTREAM-COMMIT`. This is the rewrite reference.
+* `pi-factory/` — git submodule of the true source, `github.com/mrdankuta/pi-factory` @ `0343c74` (v0.5.1+). This is the rewrite reference. Clone with `git clone --recurse-submodules`, or run `git submodule update --init` after clone.
   * `bin/` — `factory`, `factory-dispatch` · `checks/` — elixir/node/python adapters
   * `prompts/` (incl. `review-integration.md`), `skills/`, `templates/`,
   * `docs/` (`DISPATCHER`, `HERDR`, `SKILL-PINS`, `USAGE`, `WORKFLOW`),
