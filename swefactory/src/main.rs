@@ -86,6 +86,29 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         worktree: Option<PathBuf>,
     },
+    /// Deterministic dispatch loop: single passes moving a ready ticket
+    /// through implement, verify, and review. Never lands, never touches
+    /// dev/main.
+    Dispatch {
+        #[command(subcommand)]
+        action: DispatchAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DispatchAction {
+    /// Single scheduling pass over ready tickets.
+    Once {
+        /// Survey only: no worktrees, subprocesses, or writes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show attempts + worktrees + STOP state.
+    Status,
+    /// Halt the loop: later `once` runs exit 0 without work.
+    Stop,
+    /// Restart the loop after a stop.
+    Resume,
 }
 
 #[derive(Serialize)]
@@ -612,6 +635,990 @@ fn cmd_start(ticket: &str, worktree_override: Option<&PathBuf>, json: bool) -> i
     0
 }
 
+// ---------------------------------------------------------------------------
+// DISPATCH LOOP (ticket #13)
+//
+// SAFETY CONTRACT (asserted in tests/cli_dispatch.rs, not just documented):
+// The dispatcher NEVER lands and NEVER touches dev/main. There is
+// deliberately NO code path in this section that pushes, merges into,
+// checks out-and-commits-to, or branch-forces dev or main. Worktrees are
+// cut from HEAD (read-only rev-parse) and removed afterwards; review runs
+// in a second detached worktree. The human owns the train→dev review and
+// the land. `git fetch` / `git push` do not appear here at all.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct DispatchAttempt {
+    id: u64,
+    ticket: u64,
+    attempt_no: u64,
+    base_commit: String,
+    #[serde(default)]
+    head_commit: String,
+    branch: String,
+    worktree: String,
+    status: String,
+    #[serde(default)]
+    exit_code: i32,
+    log_path: String,
+    started_at: String,
+    finished_at: String,
+}
+
+#[derive(Serialize, serde::Deserialize, Default)]
+struct DispatchLedger {
+    #[serde(default)]
+    attempts: Vec<DispatchAttempt>,
+}
+
+/// Implementer/reviewer seam: shell out only, never an API client.
+/// Overridable via FACTORY_PI_BIN for hermetic tests.
+fn pi_bin() -> String {
+    std::env::var("FACTORY_PI_BIN").unwrap_or_else(|_| "pi".to_string())
+}
+
+/// State root: FACTORY_STATE_DIR, else <cwd>/factory/.state.
+fn dispatch_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("FACTORY_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("factory")
+        .join(".state")
+}
+
+fn dispatch_max_concurrent() -> usize {
+    std::env::var("MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn dispatch_max_attempts() -> u64 {
+    std::env::var("MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+fn now_stamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// `gh` via the FACTORY_GH_BIN seam, with mise stdout noise filtered.
+fn dgh(args: &[&str]) -> Result<String, String> {
+    let out = run_gh_output(args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout
+        .lines()
+        .filter(|l| !l.starts_with("mise "))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn ledger_path(state: &std::path::Path) -> PathBuf {
+    state.join("dispatch.json")
+}
+
+fn load_ledger(state: &std::path::Path) -> DispatchLedger {
+    std::fs::read_to_string(ledger_path(state))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Atomic ledger write (temp file + rename) so concurrent workers never
+/// observe a torn ledger; each attempt also owns its worktree, log, slot,
+/// and TMPDIR, so no mutable state is ever shared.
+fn save_ledger(state: &std::path::Path, ledger: &DispatchLedger) -> Result<(), String> {
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let tmp = state.join("dispatch.json.tmp");
+    let text = serde_json::to_string_pretty(ledger)
+        .map_err(|e| format!("cannot serialize ledger: {e}"))?;
+    std::fs::write(&tmp, text).map_err(|e| format!("cannot write ledger: {e}"))?;
+    std::fs::rename(&tmp, ledger_path(state)).map_err(|e| format!("cannot replace ledger: {e}"))?;
+    Ok(())
+}
+
+/// Atomic mkdir lock so two concurrent `dispatch once` processes serialize
+/// instead of double-scheduling the same ticket.
+struct DispatchLock {
+    path: PathBuf,
+}
+
+impl DispatchLock {
+    fn acquire(path: PathBuf) -> Option<Self> {
+        std::fs::create_dir(&path).ok()?;
+        Some(Self { path })
+    }
+}
+
+impl Drop for DispatchLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+fn dispatch_active(ledger: &DispatchLedger) -> usize {
+    ledger
+        .attempts
+        .iter()
+        .filter(|a| a.status == "impl_running" || a.status == "review_running")
+        .count()
+}
+
+fn dgh_labels(view: &serde_json::Value) -> Vec<String> {
+    view.get("labels")
+        .and_then(|l| l.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| {
+                    if let Some(s) = l.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        l.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `Depends on: #9, #10` references in a ticket body.
+fn depends_on(body: &str) -> Vec<u64> {
+    let mut deps = Vec::new();
+    let low = body.to_lowercase();
+    let mut search = low.as_str();
+    while let Some(idx) = search.find("depends on:") {
+        search = &search[idx + "depends on:".len()..];
+        let line = search.lines().next().unwrap_or("");
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '#' {
+                let mut num = String::new();
+                while let Some(d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        num.push(*d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Ok(n) = num.parse::<u64>() {
+                    deps.push(n);
+                }
+            }
+        }
+        search = &search[line.len().min(search.len())..];
+    }
+    deps
+}
+
+/// `Spec issue: #N` / `Spec: #N` reference in a ticket body (#none → None).
+fn linked_spec(body: &str) -> Option<u64> {
+    let low = body.to_lowercase();
+    let mut idx = 0;
+    while idx < low.len() {
+        let rest = &low[idx..];
+        let found = rest
+            .find("spec issue:")
+            .map(|i| (i, "spec issue:".len()))
+            .or_else(|| rest.find("spec:").map(|i| (i, "spec:".len())));
+        let Some((i, len)) = found else {
+            break;
+        };
+        let segment = rest[i + len..].lines().next().unwrap_or("");
+        if let Some(h) = segment.find('#') {
+            let num: String = segment[h + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = num.parse::<u64>() {
+                return Some(n);
+            }
+        }
+        idx += i + len;
+    }
+    None
+}
+
+/// Inline freeze gate for a ticket's linked spec: body hash must match the
+/// latest SPEC-APPROVED comment hash (same canonical hash as `freeze`).
+fn dispatch_verify_spec(spec: u64) -> Result<(), String> {
+    let text = dgh(&[
+        "issue",
+        "view",
+        &spec.to_string(),
+        "--json",
+        "number,title,body,state,comments",
+    ])?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("cannot parse gh issue view {spec}: {e}"))?;
+    let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
+    let hash = body_hash(body);
+    let mut approved: Option<String> = None;
+    if let Some(comments) = v.get("comments").and_then(|c| c.as_array()) {
+        for c in comments {
+            if let Some(b) = c.get("body").and_then(|b| b.as_str()) {
+                if let Some(h) = extract_approved_hash(b) {
+                    approved = Some(h);
+                }
+            }
+        }
+    }
+    if approved.as_deref() == Some(hash.as_str()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "freeze MISMATCH: #{spec} body={hash} approved={} — re-freeze required",
+            approved.as_deref().unwrap_or("none")
+        ))
+    }
+}
+
+fn gh_comment(ticket: u64, body: &str) {
+    if let Err(e) = dgh(&["issue", "comment", &ticket.to_string(), "--body", body]) {
+        eprintln!("dispatch: gh comment #{ticket} failed: {e}");
+    }
+}
+
+fn gh_relabel(ticket: u64, remove: Option<&str>, add: &str) {
+    let t = ticket.to_string();
+    let mut owned = vec!["issue".to_string(), "edit".to_string(), t];
+    if let Some(r) = remove {
+        owned.push("--remove-label".to_string());
+        owned.push(r.to_string());
+    }
+    owned.push("--add-label".to_string());
+    owned.push(add.to_string());
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    if let Err(e) = dgh(&refs) {
+        eprintln!("dispatch: gh edit #{ticket} failed: {e}");
+    }
+}
+
+fn append_log(log_path: &std::path::Path, text: &str) {
+    let mut existing = std::fs::read_to_string(log_path).unwrap_or_default();
+    existing.push_str(text);
+    let _ = std::fs::write(log_path, existing);
+}
+
+fn log_event(log_path: &std::path::Path, attempt_id: u64, ticket: u64, phase: &str, code: i32) {
+    append_log(
+        log_path,
+        &format!(
+            "{}\n",
+            serde_json::json!({"attempt": attempt_id, "ticket": ticket, "phase": phase, "event": "done", "code": code, "ts": now_stamp()})
+        ),
+    );
+}
+
+/// Run one phase (implement / verify / review) with slot + private TMPDIR
+/// isolation, appending all output to the attempt log.
+#[allow(clippy::too_many_arguments)]
+fn run_phase(
+    program: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    slot: &str,
+    tmpdir: &std::path::Path,
+    log: &std::path::Path,
+    phase: &str,
+    attempt_id: u64,
+    ticket: u64,
+) -> (bool, String) {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("FACTORY_SLOT", slot)
+        .env("TMPDIR", tmpdir);
+    match cmd.output() {
+        Ok(o) => {
+            let code = o.status.code().unwrap_or(1);
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            append_log(
+                log,
+                &format!("--- {phase} {slot} (exit {code}) ---\n{combined}\n"),
+            );
+            log_event(log, attempt_id, ticket, phase, code);
+            (o.status.success(), combined)
+        }
+        Err(e) => {
+            append_log(
+                log,
+                &format!("--- {phase} failed to spawn {program}: {e} ---\n"),
+            );
+            log_event(log, attempt_id, ticket, phase, 1);
+            (false, String::new())
+        }
+    }
+}
+
+fn git_head(cwd: &std::path::Path) -> String {
+    run_git(&["rev-parse", "HEAD"], Some(cwd))
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn remove_worktree(path: &std::path::Path) {
+    let s = path.to_string_lossy().to_string();
+    let removed = run_git(&["worktree", "remove", "--force", &s], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !removed {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    let _ = run_git(&["worktree", "prune"], None);
+}
+
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Trailing `VERDICT: accept|changes_requested` wins.
+fn parse_verdict(text: &str) -> Option<String> {
+    let mut verdict = None;
+    for line in text.lines() {
+        if line.contains("VERDICT:") {
+            if line.contains("changes_requested") {
+                verdict = Some("changes_requested".to_string());
+            } else if line.contains("accept") {
+                verdict = Some("accept".to_string());
+            }
+        }
+    }
+    verdict
+}
+
+enum TicketOutcome {
+    Done,
+    Skipped,
+}
+
+fn finish_attempt(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    idx: usize,
+    status: &str,
+    exit_code: i32,
+) {
+    ledger.attempts[idx].status = status.to_string();
+    ledger.attempts[idx].exit_code = exit_code;
+    ledger.attempts[idx].finished_at = now_stamp();
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_dispatch_ticket(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    ticket: u64,
+    max_attempts: u64,
+    dry_run: bool,
+) -> TicketOutcome {
+    let view_text = match dgh(&[
+        "issue",
+        "view",
+        &ticket.to_string(),
+        "--json",
+        "number,title,body,labels,state",
+    ]) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("dispatch: #{ticket} unreadable — skip ({e})");
+            return TicketOutcome::Skipped;
+        }
+    };
+    let view: serde_json::Value = match serde_json::from_str(&view_text) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("dispatch: #{ticket} unreadable — skip ({e})");
+            return TicketOutcome::Skipped;
+        }
+    };
+    let labels = dgh_labels(&view);
+    if labels.iter().any(|l| l == "blocked") {
+        println!("dispatch: #{ticket} blocked — skip");
+        return TicketOutcome::Skipped;
+    }
+    if !labels.iter().any(|l| l == "ready") {
+        println!("dispatch: #{ticket} not ready — skip");
+        return TicketOutcome::Skipped;
+    }
+    if ledger
+        .attempts
+        .iter()
+        .any(|a| a.ticket == ticket && (a.status == "impl_running" || a.status == "review_running"))
+    {
+        println!("dispatch: #{ticket} already active — skip");
+        return TicketOutcome::Skipped;
+    }
+    let past = ledger
+        .attempts
+        .iter()
+        .filter(|a| {
+            a.ticket == ticket && (a.status.ends_with("_done") || a.status.ends_with("_failed"))
+        })
+        .count() as u64;
+    if past >= max_attempts {
+        println!("dispatch: #{ticket} exhausted ({past} attempts) — labelling blocked");
+        if !dry_run {
+            gh_comment(
+                ticket,
+                &format!(
+                    "DISPATCH: attempt budget exhausted ({past}/{max_attempts}). Human decision required."
+                ),
+            );
+            gh_relabel(ticket, Some("ready"), "blocked");
+        }
+        return TicketOutcome::Skipped;
+    }
+    let title = view
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let body = view
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut open_deps = Vec::new();
+    for dep in depends_on(&body) {
+        let dep_text =
+            dgh(&["issue", "view", &dep.to_string(), "--json", "state"]).unwrap_or_default();
+        let dep_state = serde_json::from_str::<serde_json::Value>(&dep_text)
+            .ok()
+            .and_then(|v| {
+                v.get("state")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        if dep_state.eq_ignore_ascii_case("open") {
+            open_deps.push(dep);
+        }
+    }
+    if !open_deps.is_empty() {
+        let list = open_deps
+            .iter()
+            .map(|d| format!("#{d}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("dispatch: #{ticket} waiting on open deps: {list} — skip");
+        return TicketOutcome::Skipped;
+    }
+    let spec = linked_spec(&body);
+    let attempt_no = past + 1;
+    let slot = format!("T{ticket}-a{attempt_no}");
+    if dry_run {
+        println!(
+            "dry-run: would build factory/T{ticket}-<slug> @ {}/worktrees/{slot}, run implement, verify, review",
+            state.display()
+        );
+        return TicketOutcome::Skipped;
+    }
+    let log_path = state
+        .join("logs")
+        .join(format!("T{ticket}-a{attempt_no}-impl.log"));
+    let id = ledger.attempts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+
+    // Spec freeze gate: a drifted spec refuses the ticket before any
+    // worktree exists. The refusal itself is a logged failed attempt.
+    if let Some(s) = spec {
+        if let Err(e) = dispatch_verify_spec(s) {
+            println!("dispatch: #{ticket} spec #{s} freeze mismatch — needs re-freeze");
+            append_log(&log_path, &format!("spec gate refused: {e}\n"));
+            ledger.attempts.push(DispatchAttempt {
+                id,
+                ticket,
+                attempt_no,
+                base_commit: String::new(),
+                head_commit: String::new(),
+                branch: String::new(),
+                worktree: String::new(),
+                status: "impl_failed".to_string(),
+                exit_code: 1,
+                log_path: log_path.to_string_lossy().into_owned(),
+                started_at: now_stamp(),
+                finished_at: now_stamp(),
+            });
+            log_event(&log_path, id, ticket, "spec-gate", 1);
+            gh_comment(ticket, &format!("DISPATCH: linked spec #{s} body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs."));
+            return TicketOutcome::Done;
+        }
+    }
+
+    let base = git_head(
+        std::env::current_dir()
+            .as_deref()
+            .unwrap_or(std::path::Path::new(".")),
+    );
+    let base = if base.is_empty() {
+        "HEAD".to_string()
+    } else {
+        base
+    };
+    let slug = slugify(&title);
+    let slug = if slug.is_empty() {
+        format!("ticket-{ticket}")
+    } else {
+        slug
+    };
+    let branch = format!("factory/T{ticket}-{slug}");
+    let wt = state.join("worktrees").join(&slot);
+    let tmpdir = state.join("tmp").join(&slot);
+    let _ = std::fs::create_dir_all(&tmpdir);
+    println!("dispatch: #{ticket} '{title}' (attempt {attempt_no})");
+
+    // Reuse an existing ticket branch for retries; never touch dev/main.
+    let branch_exists = run_git(&["rev-parse", "--verify", "--quiet", &branch], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let wt_s = wt.to_string_lossy().to_string();
+    let added = if branch_exists {
+        run_git(&["worktree", "add", &wt_s, &branch], None)
+    } else {
+        run_git(&["worktree", "add", &wt_s, "-b", &branch, &base], None)
+    };
+    match added {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let msg = format!(
+                "dispatch: #{ticket} worktree add failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            println!("{msg}");
+            append_log(&log_path, &format!("{msg}\n"));
+            log_event(&log_path, id, ticket, "worktree-add", 1);
+            return TicketOutcome::Skipped;
+        }
+        Err(e) => {
+            println!("dispatch: #{ticket} worktree add failed: {e}");
+            return TicketOutcome::Skipped;
+        }
+    }
+    ledger.attempts.push(DispatchAttempt {
+        id,
+        ticket,
+        attempt_no,
+        base_commit: base.clone(),
+        head_commit: String::new(),
+        branch: branch.clone(),
+        worktree: wt_s.clone(),
+        status: "impl_running".to_string(),
+        exit_code: 0,
+        log_path: log_path.to_string_lossy().into_owned(),
+        started_at: now_stamp(),
+        finished_at: String::new(),
+    });
+    let idx = ledger.attempts.len() - 1;
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+    }
+
+    // --- implement ---
+    let spec_label = spec
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {branch} (base {base})\n\n{body}\n");
+    let _ = std::fs::write(wt.join(".factory-brief.md"), &brief);
+    let build_prompt = PathBuf::from(".pi/prompts/build.md");
+    if build_prompt.is_file() {
+        if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
+            let _ = std::fs::write(wt.join(".factory-prompt.md"), format!("{prefix}{brief}"));
+        }
+    }
+    let prompt =
+        std::fs::read_to_string(wt.join(".factory-prompt.md")).unwrap_or_else(|_| brief.clone());
+    append_log(
+        &log_path,
+        &format!("dispatch attempt {slot} implement base={base} branch={branch}\n"),
+    );
+    println!("  implement: pi -p (slot {slot})");
+    let (ok, _) = run_phase(
+        &pi_bin(),
+        &["-p", &prompt],
+        &wt,
+        &slot,
+        &tmpdir,
+        &log_path,
+        "implement",
+        id,
+        ticket,
+    );
+    if !ok {
+        println!("  implement failed — will retry next pass");
+        gh_comment(ticket, &format!("DISPATCH: implementer failed (attempt {attempt_no}/{max_attempts}). Log kept in dispatcher state."));
+        finish_attempt(state, ledger, idx, "impl_failed", 1);
+        remove_worktree(&wt);
+        return TicketOutcome::Done;
+    }
+
+    // --- verify ---
+    println!("  verify: check adapter");
+    let adapter = std::env::var_os("FACTORY_CHECK_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(discover_adapter);
+    let Some(adapter) = adapter else {
+        append_log(&log_path, "verify: no check adapter found\n");
+        gh_comment(
+            ticket,
+            &format!("DISPATCH: no check adapter found (attempt {attempt_no}/{max_attempts})."),
+        );
+        finish_attempt(state, ledger, idx, "impl_failed", 1);
+        remove_worktree(&wt);
+        return TicketOutcome::Done;
+    };
+    let (vok, _) = run_phase(
+        &adapter.to_string_lossy(),
+        &[],
+        &wt,
+        &slot,
+        &tmpdir,
+        &log_path,
+        "verify",
+        id,
+        ticket,
+    );
+    if !vok {
+        println!("  checks FAILED — routing back");
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        gh_comment(ticket, &format!("DISPATCH: factory-check failed (attempt {attempt_no}/{max_attempts}). Tail:\n```\n{}\n```", last_lines(&log_text, 30)));
+        finish_attempt(state, ledger, idx, "impl_failed", 1);
+        remove_worktree(&wt);
+        return TicketOutcome::Done;
+    }
+
+    // --- evidence: HANDOFF.md goes to the issue, scaffolding never commits ---
+    let mut handoff_text = String::new();
+    let handoff_path = wt.join("HANDOFF.md");
+    if handoff_path.is_file() {
+        handoff_text = std::fs::read_to_string(&handoff_path).unwrap_or_default();
+        gh_comment(ticket, &handoff_text);
+        println!("  handoff posted to #{ticket}");
+    }
+    let _ = std::fs::remove_file(wt.join(".factory-brief.md"));
+    let _ = std::fs::remove_file(wt.join(".factory-prompt.md"));
+    let _ = std::fs::remove_file(&handoff_path);
+
+    // --- head must exist ---
+    let cur = git_head(&wt);
+    let _ = run_git(&["add", "-A"], Some(&wt));
+    let staged_clean = run_git(&["diff", "--cached", "--quiet"], Some(&wt))
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let mut head = cur.clone();
+    if staged_clean && cur == base {
+        if handoff_text.is_empty() {
+            println!("  no changes produced — releasing");
+            gh_comment(
+                ticket,
+                "DISPATCH: implementer produced no changes. Human decision required.",
+            );
+            finish_attempt(state, ledger, idx, "impl_done", 0);
+            remove_worktree(&wt);
+            return TicketOutcome::Done;
+        }
+        let _ = run_git(
+            &[
+                "-c",
+                "user.name=factory-dispatch",
+                "-c",
+                "user.email=factory@local",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                &format!("feat(T{ticket}): {title} [handoff-only]"),
+            ],
+            Some(&wt),
+        );
+        head = git_head(&wt);
+    } else if !staged_clean {
+        let _ = run_git(
+            &[
+                "-c",
+                "user.name=factory-dispatch",
+                "-c",
+                "user.email=factory@local",
+                "commit",
+                "-qm",
+                &format!("feat(T{ticket}): {title}"),
+            ],
+            Some(&wt),
+        );
+        head = git_head(&wt);
+    }
+    ledger.attempts[idx].head_commit = head.clone();
+    ledger.attempts[idx].exit_code = 0;
+    ledger.attempts[idx].status = "impl_done".to_string();
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+    }
+    gh_relabel(ticket, Some("ready"), "review");
+
+    // --- review (second detached worktree, reviewer output parsed, posted) ---
+    let short = head.chars().take(8).collect::<String>();
+    let rwt = state.join("worktrees").join(format!("review-{short}"));
+    let rwt_s = rwt.to_string_lossy().to_string();
+    if run_git(&["worktree", "add", "--detach", &rwt_s, &head], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        // worktree ready
+    } else {
+        println!("  review worktree failed — routing back to ready");
+        gh_relabel(ticket, Some("review"), "ready");
+        finish_attempt(state, ledger, idx, "review_failed", 1);
+        remove_worktree(&wt);
+        return TicketOutcome::Done;
+    }
+    ledger.attempts[idx].status = "review_running".to_string();
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+    }
+    let rlog = state
+        .join("logs")
+        .join(format!("T{ticket}-a{attempt_no}-review.log"));
+    let report_path = state
+        .join("logs")
+        .join(format!("T{ticket}-a{attempt_no}-report.md"));
+    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with: VERDICT: accept|changes_requested\n\n", report_path.display());
+    let review_prompt = PathBuf::from(".pi/prompts/review.md");
+    if review_prompt.is_file() {
+        if let Ok(suffix) = std::fs::read_to_string(&review_prompt) {
+            review_brief.push_str(&suffix);
+        }
+    }
+    let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
+    println!("  review: pi -p");
+    let (_, rout) = run_phase(
+        &pi_bin(),
+        &["-p", &review_brief],
+        &rwt,
+        &slot,
+        &tmpdir,
+        &rlog,
+        "review",
+        id,
+        ticket,
+    );
+    let _ = std::fs::remove_file(rwt.join(".factory-review-brief.md"));
+    let verdict = parse_verdict(&rout);
+    if report_path.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&report_path) {
+            gh_comment(ticket, &text);
+        }
+    } else {
+        gh_comment(
+            ticket,
+            &format!(
+                "DISPATCH: reviewer verdict: {}. Review log kept in dispatcher state.",
+                verdict.as_deref().unwrap_or("none")
+            ),
+        );
+    }
+    remove_worktree(&rwt);
+    remove_worktree(&wt);
+    if verdict.as_deref() == Some("accept") {
+        // Accepted: human owns the land. Record base→head, never merge/push.
+        gh_relabel(ticket, Some("review"), "accepted");
+        gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
+        println!("  ACCEPTED — #{ticket} awaiting human land");
+        finish_attempt(state, ledger, idx, "review_done", 0);
+    } else {
+        println!("  changes_requested (or unreadable verdict) — back to ready");
+        gh_relabel(ticket, Some("review"), "ready");
+        finish_attempt(state, ledger, idx, "review_failed", 0);
+    }
+    TicketOutcome::Done
+}
+
+fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
+    let state = dispatch_state_dir();
+    if state.join("STOP").is_file() {
+        println!("dispatch: STOP file present — exiting");
+        if json {
+            println!("{{\"stopped\":true,\"attempted\":0}}");
+        }
+        return 0;
+    }
+    for sub in ["logs", "worktrees", "tmp"] {
+        if let Err(e) = std::fs::create_dir_all(state.join(sub)) {
+            eprintln!("dispatch: cannot create {}: {e}", state.join(sub).display());
+            return 1;
+        }
+    }
+    let Some(_lock) = DispatchLock::acquire(state.join(".lock")) else {
+        println!("dispatch: another dispatcher holds the lock — exiting");
+        return 0;
+    };
+    let mut ledger = load_ledger(&state);
+    let max_concurrent = dispatch_max_concurrent();
+    let max_attempts = dispatch_max_attempts();
+    if dispatch_active(&ledger) >= max_concurrent {
+        println!(
+            "dispatch: {} active, at capacity — exiting",
+            dispatch_active(&ledger)
+        );
+        return 0;
+    }
+    let list_text = match dgh(&[
+        "issue", "list", "--state", "open", "--label", "ticket", "--limit", "30", "--json",
+        "number",
+    ]) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("dispatch: {e}");
+            return 1;
+        }
+    };
+    let list: Vec<serde_json::Value> = serde_json::from_str(&list_text).unwrap_or_default();
+    if list.is_empty() {
+        println!("dispatch: no open tickets");
+        return 0;
+    }
+    let mut attempted = 0u64;
+    for item in &list {
+        if dispatch_active(&ledger) >= max_concurrent {
+            println!("dispatch: capacity reached");
+            break;
+        }
+        let ticket = item
+            .get("number")
+            .and_then(|n| n.as_u64())
+            .or_else(|| item.as_u64())
+            .unwrap_or(0);
+        if ticket == 0 {
+            continue;
+        }
+        match cmd_dispatch_ticket(&state, &mut ledger, ticket, max_attempts, dry_run) {
+            TicketOutcome::Done => {
+                attempted += 1;
+                if let Err(e) = save_ledger(&state, &ledger) {
+                    eprintln!("dispatch: {e}");
+                    return 1;
+                }
+            }
+            TicketOutcome::Skipped => {}
+        }
+    }
+    println!("dispatch: pass complete ({attempted} attempted)");
+    if json {
+        println!(
+            "{{\"stopped\":false,\"attempted\":{attempted}}}",
+            attempted = attempted
+        );
+    }
+    0
+}
+
+fn cmd_dispatch_status(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let worktrees = run_git(&["worktree", "list"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let stopped = state.join("STOP").is_file();
+    if json {
+        let wt_lines: Vec<&str> = worktrees.lines().collect();
+        println!(
+            "{}",
+            serde_json::json!({"attempts": ledger.attempts, "worktrees": wt_lines, "stopped": stopped})
+        );
+    } else {
+        println!("== dispatch attempts ==");
+        if ledger.attempts.is_empty() {
+            println!("(none)");
+        }
+        for a in &ledger.attempts {
+            let base8: String = a.base_commit.chars().take(8).collect();
+            let head8: String = a.head_commit.chars().take(8).collect();
+            println!(
+                "#{} T{} a{} {} base={} head={} {}",
+                a.id, a.ticket, a.attempt_no, a.status, base8, head8, a.started_at
+            );
+        }
+        println!();
+        println!("== worktrees ==");
+        print!("{worktrees}");
+        if !worktrees.ends_with('\n') {
+            println!();
+        }
+        if stopped {
+            println!("STOPPED (STOP file present)");
+        } else {
+            println!("running (no STOP file)");
+        }
+    }
+    0
+}
+
+fn cmd_dispatch_stop(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    if let Err(e) = std::fs::create_dir_all(&state) {
+        eprintln!("dispatch: cannot create {}: {e}", state.display());
+        return 1;
+    }
+    match std::fs::write(state.join("STOP"), "stopped\n") {
+        Ok(()) => {
+            println!("stopped");
+            if json {
+                println!("{{\"stopped\":true}}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("dispatch: cannot write STOP: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_dispatch_resume(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let stop = state.join("STOP");
+    if stop.is_file() {
+        if let Err(e) = std::fs::remove_file(&stop) {
+            eprintln!("dispatch: cannot remove STOP: {e}");
+            return 1;
+        }
+    }
+    println!("resumed");
+    if json {
+        println!("{{\"stopped\":false}}");
+    }
+    0
+}
+
 fn main() {
     std::process::exit(run());
 }
@@ -654,6 +1661,20 @@ fn run() -> i32 {
         Commands::Start { ticket, worktree } => {
             std::process::exit(cmd_start(&ticket, worktree.as_ref(), cli.json));
         }
+        Commands::Dispatch { action } => match action {
+            DispatchAction::Once { dry_run } => {
+                std::process::exit(cmd_dispatch_once(cli.json, dry_run));
+            }
+            DispatchAction::Status => {
+                std::process::exit(cmd_dispatch_status(cli.json));
+            }
+            DispatchAction::Stop => {
+                std::process::exit(cmd_dispatch_stop(cli.json));
+            }
+            DispatchAction::Resume => {
+                std::process::exit(cmd_dispatch_resume(cli.json));
+            }
+        },
     }
 }
 
