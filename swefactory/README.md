@@ -22,6 +22,26 @@ factory version --json     # same shape; --json is a global flag
 `--json` is a global output mode: every command that produces output
 emits machine-parseable JSON when it is set.
 
+## Check runner
+
+`factory check` executes the check-adapter contract (format, then lint,
+then test) as a subprocess. Adapters stay plain scripts; the runner only
+discovers the adapter, forwards the slot, streams its output, and
+propagates its exit code — so green keeps meaning green.
+
+```sh
+factory check                          # nearest scripts/factory-check upward
+factory check --adapter ./my-adapter   # explicit adapter script
+factory check --slot worker-1          # slot isolation (sets FACTORY_SLOT)
+factory check -- arg1 arg2              # extra args forwarded to the adapter
+factory --json check                   # same run + a JSON summary as the last line
+```
+
+Adapter resolution: `--adapter`, else `$FACTORY_CHECK_ADAPTER`, else the
+nearest `scripts/factory-check` walking up from the current directory.
+On success the adapter prints `FACTORY-CHECK PASSED`; any stage failure
+fails the run with a non-zero exit and no marker.
+
 ## Checks
 
 ```sh
