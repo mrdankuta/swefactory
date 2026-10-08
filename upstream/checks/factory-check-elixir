@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Factory gate: one deterministic command humans and agents run before handoff.
 # Contract (all stack adapters): format check → lint/compile → tests; non-zero exit on failure.
+# Concurrency: factory-dispatch exports FACTORY_SLOT (1..N) per attempt —
+# concurrent workers MUST NOT share mutable resources (test DBs, ports).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export MIX_TEST_PARTITION="$FACTORY_SLOT"  # separate test DB per slot
+  echo "(slot $FACTORY_SLOT → MIX_TEST_PARTITION=$FACTORY_SLOT)"
+fi
 
 echo "== format =="
 mix format --check-formatted

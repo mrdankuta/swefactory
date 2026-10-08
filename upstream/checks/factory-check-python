@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Factory gate (python adapter). Contract: format check → lint → tests; non-zero exit on failure.
+# Concurrency: FACTORY_SLOT (1..N) is set per dispatcher worker — offset any
+# ports/tmpdirs/test DBs with it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

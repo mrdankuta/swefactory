@@ -46,9 +46,12 @@ outcome on the train ticket/issue thread.
 
 ## Verdict
 
-- Accept: merge train → `dev` yourself (human land), mark the `releases`
-  row `merged`, close member tickets.
+- Accept: merge train → `dev` yourself (human land), then
+  `factory-dispatch release finish` (verifies the merge, marks the
+  `releases` row `merged`, removes the train worktree), close member
+  tickets.
 - Reject a member: `factory-dispatch release drop <ticket>`, re-run the
   combined gate, continue with the reduced train.
-- Abandon: mark the `releases` row `abandoned` (a new train can only start
-  after the old one is merged or abandoned — never two open).
+- Abandon: `factory-dispatch release abandon` (marks the `releases` row
+  `abandoned`, removes the train worktree — a new train can only start
+  after the old one is merged or abandoned, never two open).

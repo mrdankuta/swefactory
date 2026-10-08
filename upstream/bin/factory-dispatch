@@ -12,15 +12,20 @@
 #   factory-dispatch release status           show open train + member branches + head
 #   factory-dispatch release merge <ticket>   merge an accepted ticket branch into the train (clean only)
 #   factory-dispatch release drop <ticket>    revert a ticket's merge from the train
+#   factory-dispatch release finish           close the train after the human merged it into dev (verifies, marks merged)
+#   factory-dispatch release abandon           close the train unmerged (marks abandoned)
 #   factory-dispatch self-test               hermetic release-mechanics proof (temp bare origin, no gh, no spend)
 #
 # State: factory/.state/dispatch.db (sqlite, gitignored) + factory/.state/logs/
-# Env knobs: MAX_CONCURRENT=1 MAX_ATTEMPTS=2 TIMEOUT_IMPL=1800 TIMEOUT_REVIEW=1200
+# Env knobs: MAX_CONCURRENT=3 MAX_ATTEMPTS=2 TIMEOUT_IMPL=1800 TIMEOUT_REVIEW=1200
 #            PI_BIN=pi PI_MODEL="" (appended as --model when set)
+# Concurrency is real: each attempt holds a FACTORY_SLOT (1..MAX_CONCURRENT)
+# exported to the implementer and the check step. Stacks MUST isolate per
+# slot (separate test DBs/ports/tmpdirs) — see docs/DISPATCHER.md.
 # Requires: gh (authed), git, sqlite3, timeout, pi (authed, non-interactive ok).
 set -euo pipefail
 
-MAX_CONCURRENT="${MAX_CONCURRENT:-1}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-3}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 TIMEOUT_IMPL="${TIMEOUT_IMPL:-1800}"
 TIMEOUT_REVIEW="${TIMEOUT_REVIEW:-1200}"
@@ -38,7 +43,7 @@ LOG_DIR="$STATE_DIR/logs"
 STOP_FILE="$STATE_DIR/STOP"
 REPO_NAME="$(basename "$ROOT")"
 
-usage() { sed -n '2,18p' "$0"; }
+usage() { sed -n '2,20p' "$0"; }
 
 db_init() {
   mkdir -p "$STATE_DIR" "$LOG_DIR"
@@ -51,16 +56,35 @@ db_init() {
     id INTEGER PRIMARY KEY, branch TEXT NOT NULL, base_commit TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     created_at TEXT DEFAULT (datetime('now')));"
-  # Guarded migration: old rows are unaffected (new column is nullable).
+  # Guarded migration: old rows are unaffected (new columns are nullable).
   if [ -z "$(sqlite3 "$DB" "SELECT name FROM pragma_table_info('attempts') WHERE name='train_branch';")" ]; then
     sqlite3 "$DB" "ALTER TABLE attempts ADD COLUMN train_branch TEXT;"
   fi
+  if [ -z "$(sqlite3 "$DB" "SELECT name FROM pragma_table_info('attempts') WHERE name='slot';")" ]; then
+    sqlite3 "$DB" "ALTER TABLE attempts ADD COLUMN slot INTEGER;"
+  fi
+  # One holder per slot among live attempts — the atomicity behind slot
+  # claims (overlapping `once` passes cannot double-book a slot).
+  sqlite3 "$DB" "CREATE UNIQUE INDEX IF NOT EXISTS active_slot ON attempts(slot) WHERE status IN ('reserving','impl_running','review_running');"
 }
 
-active_count() { sqlite3 "$DB" "SELECT COUNT(*) FROM attempts WHERE status IN ('impl_running','review_running');"; }
-ticket_active() { sqlite3 "$DB" "SELECT COUNT(*) FROM attempts WHERE ticket=$1 AND status IN ('impl_running','review_running');"; }
+active_count() { sqlite3 "$DB" "SELECT COUNT(*) FROM attempts WHERE status IN ('reserving','impl_running','review_running');"; }
+ticket_active() { sqlite3 "$DB" "SELECT COUNT(*) FROM attempts WHERE ticket=$1 AND status IN ('reserving','impl_running','review_running');"; }
 ticket_attempts() { sqlite3 "$DB" "SELECT COUNT(*) FROM attempts WHERE ticket=$1 AND status LIKE '%_done' OR ticket=$1 AND status LIKE '%_failed';"; }
-new_attempt() { sqlite3 "$DB" "INSERT INTO attempts(ticket,attempt_no,base_commit,branch,worktree,status,log_path) VALUES($1,$2,'$3','$4','$5','impl_running','$6'); SELECT last_insert_rowid();"; }
+# claim_slot <ticket> <attempt_no> <log>: atomically claim the lowest free
+# slot (1..MAX_CONCURRENT). Echoes "<id> <slot>" or fails. The partial
+# unique index makes concurrent `once` passes mutually exclusive per slot.
+claim_slot() {
+  local t="$1" a="$2" s
+  for s in $(seq 1 "$MAX_CONCURRENT"); do
+    if sqlite3 "$DB" "INSERT INTO attempts(ticket,attempt_no,slot,status,log_path) VALUES($t,$a,$s,'reserving','$3');" 2>/dev/null; then
+      echo "$(sqlite3 "$DB" "SELECT id FROM attempts WHERE ticket=$t AND slot=$s AND status='reserving';") $s"
+      return 0
+    fi
+  done
+  return 1
+}
+activate_attempt() { sqlite3 "$DB" "UPDATE attempts SET base_commit='$2',branch='$3',worktree='$4',status='impl_running' WHERE id=$1;"; }
 set_status() { sqlite3 "$DB" "UPDATE attempts SET status='$2', finished_at=datetime('now') WHERE id=$1;"; }
 set_head() { sqlite3 "$DB" "UPDATE attempts SET head_commit='$2', exit_code=$3 WHERE id=$1;"; }
 set_train() { sqlite3 "$DB" "UPDATE attempts SET train_branch='$2' WHERE id=$1;"; }
@@ -205,6 +229,56 @@ cmd_release_drop() {
   echo "release: ticket #$ticket dropped from $train (revert $(git -C "$twt" rev-parse --short HEAD))"
 }
 
+# release_cleanup_reminder <train>: branch deletes stay human — the
+# dispatcher never deletes branches (local or remote).
+release_cleanup_reminder() {
+  local train="$1"
+  echo "release: human cleanup (dispatcher never deletes branches):"
+  echo "  git branch -d $train"
+  echo "  git push origin --delete $train"
+}
+
+# remove_train_worktree: drop the train worktree; a missing worktree is a
+# note, not an error (the releases row is still closed).
+remove_train_worktree() {
+  local twt; twt="$(train_worktree)"
+  if git worktree list --porcelain 2>/dev/null | grep -qF "worktree $twt"; then
+    git worktree remove --force "$twt" && echo "release: train worktree $twt removed"
+  else
+    echo "release: no train worktree at $twt — nothing to remove"
+  fi
+}
+
+cmd_release_finish() {
+  db_init
+  local train; train="$(open_train)"
+  [ -n "$train" ] || { echo "release: no open train" >&2; exit 1; }
+  # Read-only fetch so the check sees the pushed human merge; the
+  # dispatcher itself never merges into, commits to, or pushes dev.
+  git fetch origin dev --quiet 2>/dev/null || true
+  local dev_ref="dev"
+  git rev-parse --verify --quiet origin/dev >/dev/null && dev_ref="origin/dev"
+  local train_head; train_head="$(git rev-parse "$train")"
+  if ! git merge-base --is-ancestor "$train_head" "$dev_ref" 2>/dev/null; then
+    echo "release: train $train ($(git rev-parse --short "$train_head")) is NOT merged into $dev_ref ($(git rev-parse --short "$dev_ref" 2>/dev/null)) — human must merge train into dev first" >&2
+    exit 1
+  fi
+  sqlite3 "$DB" "UPDATE releases SET status='merged' WHERE branch='$train' AND status='open';"
+  echo "release: train $train marked merged"
+  remove_train_worktree
+  release_cleanup_reminder "$train"
+}
+
+cmd_release_abandon() {
+  db_init
+  local train; train="$(open_train)"
+  [ -n "$train" ] || { echo "release: no open train" >&2; exit 1; }
+  sqlite3 "$DB" "UPDATE releases SET status='abandoned' WHERE branch='$train' AND status='open';"
+  echo "release: train $train marked abandoned (no merge check)"
+  remove_train_worktree
+  release_cleanup_reminder "$train"
+}
+
 cmd_once() {
   [ -f "$STOP_FILE" ] && { echo "dispatch: STOP file present — exiting"; exit 0; }
   db_init
@@ -254,8 +328,16 @@ cmd_once() {
       base="$(git rev-parse origin/dev 2>/dev/null || git rev-parse HEAD)"
     fi
     git worktree add "$wt" -b "$branch" "$base" 2>&1 | tail -n 1
-    id="$(new_attempt "$ticket" "$((att + 1))" "$base" "$branch" "$wt" "$log")"
+    local claim id slot
+    if ! claim="$(claim_slot "$ticket" "$((att + 1))" "$log")"; then
+      echo "dispatch: #$ticket no free slot (concurrency) — releasing worktree, will retry"
+      git worktree remove --force "$wt"
+      continue
+    fi
+    id="${claim%% *}"; slot="${claim##* }"
+    activate_attempt "$id" "$base" "$branch" "$wt"
     [ -n "$train" ] && set_train "$id" "$train"
+    echo "  slot $slot of $MAX_CONCURRENT"
 
     # --- freeze check on linked spec ---
     if [ -n "$spec" ]; then
@@ -275,8 +357,8 @@ cmd_once() {
       echo "$body"
     } > "$wt/.factory-brief.md"
     cat "$ROOT/.pi/prompts/build.md" "$wt/.factory-brief.md" > "$wt/.factory-prompt.md"
-    echo "  implement: $PI_BIN -p (timeout ${TIMEOUT_IMPL}s)"
-    (cd "$wt" && timeout "$TIMEOUT_IMPL" $PI_BIN -p "$(cat .factory-prompt.md)" >>"$log" 2>&1)
+    echo "  implement: $PI_BIN -p slot=$slot (timeout ${TIMEOUT_IMPL}s)"
+    (cd "$wt" && FACTORY_SLOT="$slot" timeout "$TIMEOUT_IMPL" $PI_BIN -p "$(cat .factory-prompt.md)" >>"$log" 2>&1)
     local code=$?
     if [ "$code" -ne 0 ]; then
       echo "  implement exited $code — will retry next pass"
@@ -286,8 +368,8 @@ cmd_once() {
     fi
 
     # --- verify ---
-    echo "  verify: scripts/factory-check"
-    if ! (cd "$wt" && ./scripts/factory-check >>"$log" 2>&1); then
+    echo "  verify: scripts/factory-check (slot $slot)"
+    if ! (cd "$wt" && FACTORY_SLOT="$slot" ./scripts/factory-check >>"$log" 2>&1); then
       echo "  checks FAILED — routing back (log tail posted)"
       set_status "$id" "impl_failed"
       { echo "DISPATCH: factory-check failed (attempt $((att + 1))/$MAX_ATTEMPTS). Tail:"; echo '```'; tail -n 30 "$log"; echo '```'; } > /tmp/disp-fail.md
@@ -395,7 +477,8 @@ cmd_once() {
 cmd_selftest() {
   # Hermetic proof of release mechanics: temp project + bare origin, no gh,
   # no network, no tokens. Exercises: release start, merge, status, drop,
-  # drop-idempotence refusal, conflict-abort, two-open-trains refusal.
+  # drop-idempotence refusal, conflict-abort, two-open-trains refusal,
+  # finish (unmerged-refusal, merged-close, no-train refusal) and abandon.
   local tmp; tmp="$(mktemp -d)/selftest"
   mkdir -p "$tmp/origin.git" "$tmp/proj"
   git init --bare -q "$tmp/origin.git"
@@ -424,6 +507,25 @@ cmd_selftest() {
   (cd "$ROOT" && cmd_release_merge_cli 2 2>/dev/null) && check "conflict aborts" "merged" "aborted" || check "conflict aborts" "aborted" "aborted"
   git -C "$(train_worktree)" status --porcelain | grep -q . && check "train clean after abort" "dirty" "clean" || check "train clean after abort" "clean" "clean"
   (cd "$ROOT" && cmd_release_status >/dev/null) && check "status runs" "ok" "ok" || check "status runs" "broken" "ok"
+  # finish refuses while the train is NOT merged into dev (row stays open)
+  (cd "$ROOT" && cmd_release_finish 2>/dev/null) && check "finish refused unmerged" "finished" "refused" || check "finish refused unmerged" "refused" "refused"
+  check "row still open after refused finish" "$(sqlite3 "$DB" "SELECT status FROM releases WHERE branch='$train';")" "open"
+  # human merges train -> dev (scratch only) and pushes; finish then closes it
+  git -C "$ROOT" checkout -q dev && git -C "$ROOT" merge --no-ff --no-edit -qm "merge train" "$train"
+  git -C "$ROOT" push -q origin dev
+  (cd "$ROOT" && cmd_release_finish >/dev/null) && check "finish after merge" "finished" "finished" || check "finish after merge" "refused" "finished"
+  check "row merged after finish" "$(sqlite3 "$DB" "SELECT status FROM releases WHERE branch='$train';")" "merged"
+  git -C "$ROOT" worktree list --porcelain 2>/dev/null | grep -qF "worktree $(train_worktree)" && check "train worktree removed by finish" "present" "gone" || check "train worktree removed by finish" "gone" "gone"
+  # no open train left: finish and abandon both refuse
+  (cd "$ROOT" && cmd_release_finish 2>/dev/null) && check "finish refused no-train" "finished" "refused" || check "finish refused no-train" "refused" "refused"
+  (cd "$ROOT" && cmd_release_abandon 2>/dev/null) && check "abandon refused no-train" "abandoned" "refused" || check "abandon refused no-train" "refused" "refused"
+  # abandon path: fresh train closes with no merge and no verification
+  (cd "$ROOT" && cmd_release_start second >/dev/null)
+  local train2; train2="$(open_train)"
+  check "second train cut" "$train2" "integration/$(date +%Y%m%d)-second"
+  (cd "$ROOT" && cmd_release_abandon >/dev/null) && check "abandon closes" "abandoned" "abandoned" || check "abandon closes" "refused" "abandoned"
+  check "row abandoned" "$(sqlite3 "$DB" "SELECT status FROM releases WHERE branch='$train2';")" "abandoned"
+  git -C "$ROOT" worktree list --porcelain 2>/dev/null | grep -qF "worktree $(train_worktree)" && check "train worktree removed by abandon" "present" "gone" || check "train worktree removed by abandon" "gone" "gone"
   rm -rf "$tmp"
   [ "$fail" = 0 ] && echo "SELF-TEST ALL PASS" || { echo "SELF-TEST FAILURES"; exit 1; }
 }
@@ -449,7 +551,9 @@ case "${1:-}" in
       status) cmd_release_status ;;
       merge) cmd_release_merge_cli "$arg" ;;
       drop) cmd_release_drop "$arg" ;;
-      *) echo "usage: factory-dispatch release {start [slug]|status|merge <ticket>|drop <ticket>}" >&2; exit 1 ;;
+      finish) cmd_release_finish ;;
+      abandon) cmd_release_abandon ;;
+      *) echo "usage: factory-dispatch release {start [slug]|status|merge <ticket>|drop <ticket>|finish|abandon}" >&2; exit 1 ;;
     esac ;;
   *) usage; exit 1 ;;
 esac

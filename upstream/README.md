@@ -50,6 +50,31 @@ Tag releases (`v0.1.0` …); projects float on `main` or pin via
 `install.sh --pin vX.Y.Z`. `factory update` explains refresh (delete-then-init
 to force a file refresh — init never overwrites).
 
+## Adding a language stack
+
+Stacks are cheap by design — three touch points, no framework changes:
+
+1. **Check adapter** `checks/factory-check-<name>` (executable bash).
+   Contract (enforced by review, not code):
+   - `cd` to the project root first; accept extra args and pass them to the test runner.
+   - Stages in order: format check → lint/compile → tests (→ assets/build if any).
+   - Exit non-zero on ANY failure; print `FACTORY-CHECK PASSED` only on success.
+   - Concurrency: honor `FACTORY_SLOT` (1..N, set per dispatcher worker).
+     Concurrent workers must not share mutable resources — offset test DB
+     names, ports, and tmpdirs by slot (see the elixir adapter's
+     `MIX_TEST_PARTITION` pattern and `docs/DISPATCHER.md`).
+2. **Register it** in `bin/factory` `cmd_init`'s stack case (one line next to
+   elixir/node/python) so `--stack <name>` installs the adapter.
+3. **CI template** `github/workflows/ci-<name>.yml` (copy the generic one):
+   toolchain setup matching local dev versions (formatter/linter output
+   differs per toolchain minor — CI MUST match developers), service
+   containers, then `./scripts/factory-check` and nothing else.
+4. **Smoke it:** `install.sh --stack <name> --dir /tmp/smoke-<name>` must
+   seed cleanly; run the adapter where its toolchain exists.
+
+Prompts, skills, labels, dispatcher, and freeze mechanics are stack-agnostic
+— nothing else changes. Bump `VERSION` and note the stack in this README.
+
 ## L3 dispatcher
 
 `bin/factory-dispatch` drains `ready` tickets mechanically (implement →

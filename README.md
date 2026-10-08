@@ -5,11 +5,11 @@
 
 ## Layout
 
-* `upstream/` — exact mirror of the true source, `github.com/mrdankuta/pi-factory` @ `51df377` (minus `.git`). Pinned commit recorded in `upstream/UPSTREAM-COMMIT`. This is the rewrite reference.
+* `upstream/` — exact mirror of the true source, `github.com/mrdankuta/pi-factory` @ `dc477a7` (minus `.git`; worktree at sync included uncommitted v0.5.1 `release finish`/`abandon` changes). Pinned commit recorded in `upstream/UPSTREAM-COMMIT`. This is the rewrite reference.
   * `bin/` — `factory`, `factory-dispatch` · `checks/` — elixir/node/python adapters
   * `prompts/` (incl. `review-integration.md`), `skills/`, `templates/`,
   * `docs/` (`DISPATCHER`, `HERDR`, `SKILL-PINS`, `USAGE`, `WORKFLOW`),
-  * `github/` (issue templates + labels), `install.sh`, `README.md`
+  * `github/` (issue templates + labels + CI workflows), `install.sh`, `README.md`
 * `factory-v0.4.0/` — installed/adapted instance as deployed in booksbuddy
   (project shim layout: `scripts/` instead of `bin/`, adapted `SKILL.md`
   files, `AGENTS.header.md` merge result, `GLOSSARY` example). Shows how

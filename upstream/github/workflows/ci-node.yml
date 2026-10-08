@@ -1,0 +1,24 @@
+name: factory-check
+# Node template: copy to <project>/.github/workflows/factory-check.yml and
+# adjust the version + lockfile path. CI must run the SAME gate as developers.
+
+on:
+  push:
+    branches: ["main", "dev", "factory/**", "feat/**", "integration/**"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # TODO: add service containers your tests need (postgres/redis/…).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22" # TODO: match local `node --version`
+          cache: npm
+          # TODO: point at your lockfile
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: ./scripts/factory-check

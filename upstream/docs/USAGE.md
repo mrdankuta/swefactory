@@ -40,7 +40,71 @@ and `herdr` and tells you what to do if either is missing
 - **Evidence, not claims.** Handoffs and reviews are issue comments with
   commands + actual output. "Done" is an event; verified criteria are the outcome.
 
+## How the parts fit
+
+```mermaid
+flowchart TB
+    subgraph HUMAN[Human — decisions and acceptance]
+        YOU[You: product calls<br/>spec approval, land]
+    end
+    subgraph TRUTH[Source of truth]
+        ISSUES[(GitHub issues<br/>epic → spec → tickets)]
+        FREEZE[Freeze hash<br/>SPEC-APPROVED]
+    end
+    subgraph WORK[Workspaces — Herdr panes]
+        PLAN[Pi: plan]
+        BUILD[Pi: build<br/>ticket worktree]
+        REV[Pi: review<br/>detached worktree]
+    end
+    subgraph GATES[Machine gates]
+        CHECK[factory-check<br/>format → test → assets]
+        CI[CI — same gate<br/>on every branch]
+        DISP[factory-dispatch<br/>reserve → verify → review → integrate]
+    end
+    DEV[(dev branch)]
+    YOU -->|decide| ISSUES
+    ISSUES --> PLAN
+    PLAN -->|spec issue| ISSUES
+    ISSUES -->|ticket + freeze| BUILD
+    BUILD -->|handoff| ISSUES
+    BUILD --> CHECK
+    CHECK -->|green| REV
+    REV -->|verdict| ISSUES
+    ISSUES -->|ready tickets| DISP
+    DISP -->|drives| BUILD
+    DISP -->|posts evidence| ISSUES
+    DISP -->|accepted| TRAIN[(integration branch)]
+    TRAIN -->|human merge| DEV
+    BUILD -->|human land| DEV
+    CI -->|verifies| TRAIN
+    CI -->|verifies| DEV
+```
+
+- **Issues** hold every decision and state change; nothing authoritative lives in local files.
+- **Herdr panes** hold the agents; **files + commits + issue comments** are the handoffs between them.
+- **Gates** (check, CI, freeze, review) decide mechanically; **humans** decide acceptance and landing.
+- The **dispatcher** never creates authority — it only moves tickets along the rails above, up to (never including) `dev`.
+
 ## The daily loop
+
+End to end, one ticket:
+
+```mermaid
+flowchart LR
+    IDEA([idea / bug]) --> PLAN[plan: grill, specify]
+    PLAN --> SPEC[(spec issue)]
+    SPEC --> SLICE[to-tickets]
+    SLICE --> TICK[(ticket issue<br/>+ ready)]
+    TICK --> FRZ{{freeze<br/>match?}}
+    FRZ -->|drift| SPEC
+    FRZ -->|match| IMPL[implement<br/>worktree + tdd]
+    IMPL --> GATE{{factory-check<br/>green?}}
+    GATE -->|fail| IMPL
+    GATE -->|pass| REV[independent<br/>review]
+    REV -->|changes requested| IMPL
+    REV -->|accept| LAND([human land<br/>→ dev])
+    LAND --> CLOSE[(close ticket)]
+```
 
 ### 1. Plan (`/plan` — no implementation)
 
@@ -89,7 +153,7 @@ One pass per ticket: reserve (sqlite, duplicate-safe) → spec freeze check →
 with handoff summary when side-effect-only) → detached review worktree +
 `pi -p` reviewer → report posted **by the dispatcher**, `VERDICT:` parsed →
 `accepted` (awaiting your land) or back to `ready`. Bounded retries, then
-`blocked` with a human-readable reason. Knobs: `MAX_CONCURRENT=1`,
+`blocked` with a human-readable reason. Knobs: `MAX_CONCURRENT=3`,
 `MAX_ATTEMPTS=2`, `TIMEOUT_IMPL=1800`, `TIMEOUT_REVIEW=1200`, `PI_BIN`,
 `PI_MODEL`.
 
@@ -108,6 +172,35 @@ Your project's land skill (e.g. `.agents/skills/land/`): preflight (scope,
 secrets), gate (`mix precommit` / `factory-check`), linear commit onto dev,
 plain push, confirm on `origin/dev`. Then close the ticket issue.
 
+### 7. Release trains (batching tickets)
+
+Instead of landing tickets one by one, fan them out from an integration
+branch and merge the train once:
+
+```mermaid
+flowchart TB
+    DEV0[(dev)] --> CUT[release start<br/>cut integration branch]
+    CUT --> T1[ticket A<br/>worktree] & T2[ticket B<br/>worktree] & T3[ticket C<br/>worktree]
+    T1 --> R1{review<br/>accept?}
+    T2 --> R2{review<br/>accept?}
+    T3 --> R3{review<br/>accept?}
+    R1 -->|yes, clean| M1[merge → train]
+    R2 -->|yes, clean| M2[merge → train]
+    R3 -->|conflict| BLK([blocked<br/>human])
+    M1 & M2 --> GATE2{{combined gate<br/>check + CI}}
+    GATE2 -->|green| HREV[human integration review<br/>overlap + migrations]
+    GATE2 -->|red| BLK
+    HREV -->|accept| DEV1[(merge train → dev)]
+    HREV -->|drop member| DROP[release drop<br/>revert + re-gate]
+    DROP --> GATE2
+```
+
+- One open train at a time; ticket worktrees base on the train head.
+- Accept-path auto-merge is clean-only — conflicts route to `blocked`, never forced.
+- `release drop` reverts a member; closing the train (mark merged, clean up
+  branches) is a human step after merging to `dev`.
+- Your train→dev review uses `prompts/review-integration.md`: combined gate, overlap scan, migration order, drift check.
+
 ## Workspace layout (Herdr)
 
 ```
@@ -120,6 +213,26 @@ Review (on demand)      — fresh pi, detached-HEAD worktree, read-only
 Unique `pi --session-id` per ticket+role (`impl-T42-<date>`,
 `review-T42-<date>`). One worktree + one branch per ticket. Worktrees isolate
 files, not shells/secrets — keep production credentials out.
+
+## Concurrency
+
+The dispatcher runs up to `MAX_CONCURRENT=3` attempts at once (env knob).
+Each attempt holds a `FACTORY_SLOT` (1..3) exported to the implementer and
+the check step — stacks isolate per slot (separate test DBs, ports,
+tmpdirs). Claims are atomic, so overlapping scheduled and manual passes
+can't double-book. Dial down to `MAX_CONCURRENT=1` until a new stack
+proves slot isolation. See `docs/DISPATCHER.md`.
+
+## Stacks and languages
+
+Elixir, node, and python ship with check adapters (`checks/`) and CI
+templates (`github/workflows/`). Adding one (go, rust, …) is three steps:
+write `checks/factory-check-<name>` honoring the gate contract
+(format → lint → test, non-zero on fail, `FACTORY_SLOT` isolation), register
+it in `factory`'s `--stack` handling, and copy a CI template that runs the
+same `./scripts/factory-check` developers run. Full contract in `README.md`
+("Adding a language stack"). Prompts, skills, dispatcher, and freeze
+mechanics never change per stack.
 
 ## Metrics and improvement
 
@@ -146,4 +259,4 @@ friction into `/retro` — proposals, not auto-applied changes.
 ## Command reference
 
 `factory init|update|freeze|sync|handoff --signal|reconcile|check|verify-freeze|metrics|start [--pane]|version`
-`factory-dispatch once [--dry-run]|daemon [--interval]|status|stop|resume`
+`factory-dispatch once [--dry-run]|daemon [--interval]|status|stop|resume|release {start|status|merge|drop}|self-test`

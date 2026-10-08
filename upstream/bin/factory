@@ -4,7 +4,7 @@
 # Run from the project root. Requires: git, gh (authenticated) for issue ops.
 set -euo pipefail
 
-FACTORY_VERSION="0.4.0"
+FACTORY_VERSION="0.5.1"
 # FACTORY_SRC: when running from a project shim (scripts/factory), this points
 # back at the pi-factory checkout/clone for templates. Resolved at install time.
 FACTORY_SRC="${FACTORY_SRC:-$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)}"

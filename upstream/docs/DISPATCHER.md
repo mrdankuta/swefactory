@@ -38,7 +38,7 @@ L3 shape — no long-lived process to babysit.
 
 ## What one pass does (per ticket)
 
-1. Skip if STOP file, at capacity (`MAX_CONCURRENT`, default 1), already
+1. Skip if STOP file, at capacity (`MAX_CONCURRENT`, default 3), already
    active (sqlite reservation — duplicate-dispatch safe), `blocked` label,
    open deps, or attempt budget exhausted (`MAX_ATTEMPTS`, default 2).
 2. Fetch `origin/dev`, create worktree `../<repo>-T<N>` on
@@ -53,6 +53,25 @@ L3 shape — no long-lived process to babysit.
    the issue comment (reviewer side effects not trusted). `VERDICT: accept`
    → label `accepted` + land-ready comment. Otherwise back to `ready`.
 
+## Concurrency & isolation (default 3 workers)
+
+`MAX_CONCURRENT` (default 3 — raise/lower per project via env) bounds live
+attempts. Each attempt atomically claims a `FACTORY_SLOT` (1..N) backed by a
+partial unique index, so overlapping `once` passes (cron + manual) can never
+double-book a slot; claim failure releases the worktree for a later pass.
+Slots free automatically when the attempt leaves a live status.
+
+The number is only safe because of isolation, which is each stack's
+contract (see "Adding a language stack" in README.md):
+
+- Separate mutable resources per slot: test databases
+  (Elixir: `MIX_TEST_PARTITION=$FACTORY_SLOT`), ports
+  (`PORT=$((3000 + FACTORY_SLOT))`), tmpdirs, caches.
+- Worktrees isolate files; they do NOT isolate shells, env vars, or
+  credentials. No production secrets in worker environments, ever.
+- When in doubt, run `MAX_CONCURRENT=1` until the stack's adapter proves
+  slot isolation (two-slot dry exercise: same suite, different slots, green).
+
 ## Safety notes
 
 - Review runs in a detached worktree, but `pi -p` is not an OS sandbox:
@@ -60,7 +79,7 @@ L3 shape — no long-lived process to babysit.
 - Retries are bounded; exhaustion lands the ticket in `blocked` with a
   human-readable reason — never silent.
 - State is sqlite (`factory/.state/`, gitignored); logs per attempt.
-- Cost control: `MAX_CONCURRENT=1` default, dry-run first, timeouts on
+- Cost control: `MAX_CONCURRENT=3` default, dry-run first, timeouts on
   every agent invocation. Set `PI_MODEL` / `PI_BIN` env to pin the worker model.
 
 ## Release train (multi-ticket integration)
@@ -78,7 +97,7 @@ release start [<slug>] → integration/<yyyymmdd>-<slug> cut from origin/dev
   → review accept auto-merges the ticket branch into the train (clean only)
     → label `integrated` (merged into the train; distinct from `accepted`)
   → human train→dev review → human merges train into dev
-  → releases row `merged` (or `abandoned`)
+  → `release finish` (row `merged`) or `release abandon` (row `abandoned`)
 ```
 
 - `release start [<slug>]`: cut the train (default slug `train`). Refuses
@@ -92,6 +111,15 @@ release start [<slug>] → integration/<yyyymmdd>-<slug> cut from origin/dev
 - `release drop <ticket>`: reverts that ticket's merge (`git revert -m 1`)
   from the train. Fails loudly (nonzero) when the ticket is not merged —
   there is no silent no-op.
+- `release finish`: closes the train after the human merged it into `dev`.
+  Verifies the train head is an ancestor of `dev`
+  (`git merge-base --is-ancestor`, read-only fetch first) and refuses
+  otherwise; marks the `releases` row `merged`, removes the train
+  worktree, and prints the branch-cleanup reminder (local + remote
+  deletes stay human). Refuses when no train is open.
+- `release abandon`: marks the open train `abandoned` with no merge check,
+  removes the train worktree, same cleanup reminder. Refuses when no
+  train is open.
 - Accept-path routing: clean merge → `integrated`; merge failure or red
   checks → `blocked` (human resolves, or drops the ticket and re-runs the
   combined gate).
