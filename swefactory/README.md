@@ -50,10 +50,43 @@ factory freeze 6           # post SPEC-APPROVED <hash> comment + spec-approved l
 factory sync 6             # write factory/.cache/SPEC-6.md, verify vs freeze
 factory verify-freeze 6    # exit 0 iff body still matches the freeze;
                            # else exit 1 with a diff of what changed
+
+factory init [--stack rust|elixir|node|python] [--global-skills]
+                         # seed prompts, skills, check adapter, issue
+                         # templates, and labels into the current project
+factory update [--pin vX.Y.Z]
+                         # refresh from embedded templates (no-op when in place)
 ```
 
 `--json` is a global output mode: every command that produces output
-emits machine-parseable JSON when it is set.
+emits machine-parseable JSON when it is set. `init`/`update` emit
+`{"stack", "installed", "kept", "warnings"}`.
+
+## init / update (embedded templates)
+
+The binary carries its templates compiled in (`swefactory/templates/`, via
+`include_str!`) — no network, no checkout needed. Seeding never overwrites:
+every target prints `install:` (written) or `keep:` (already there, bytes
+untouched), so re-running `init`/`update` is a no-op when in place.
+
+| `--stack` | `scripts/factory-check` adapter |
+|-----------|----------------------------------|
+| `rust` (default) | `cargo fmt --check` → `clippy -D warnings` → `cargo test` |
+| `elixir`  | `mix format --check` → `mix compile --warnings-as-errors` → `mix test` |
+| `node`    | `prettier --check` → `eslint` → `npm test` |
+| `python`  | `ruff format --check` → `ruff check` → `pytest` |
+
+Installed into the project: `.pi/prompts/*`, `.agents/skills/*`
+(`--global-skills` targets `~/.agents/skills` instead), the stack's
+check adapter, `.github/ISSUE_TEMPLATE/{spec,ticket}.yml`, the `AGENTS.md`
+header merge, `GLOSSARY.md` + `docs/README.md` skeletons,
+`factory/.cache/`, and `.factory-version`.
+
+Divergence from bash (documented): the Rust binary *is* `factory`, so no
+`scripts/factory` shim is installed; `update --pin` records the tag but does
+not fetch (network refresh is out of scope at parity). Missing `gh`/`herdr`
+or unauthenticated `gh` only warn (`WARN:`/`skip:` on stderr) — init
+never fails for missing tooling; labels are ensured best-effort via `gh`.
 
 ## Check runner
 

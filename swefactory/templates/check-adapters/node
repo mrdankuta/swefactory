@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# factory-check (node) — check adapter for swefactory.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets concurrent state (e.g.
+# per-worker ports, temp dirs, or test concurrency) so parallel dispatcher
+# workers never share mutable resources.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ ! -f package.json ]; then
+  echo "factory-check: no package.json yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: advertise the worker slot to the toolchain/test runner.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export JEST_WORKER_ID="$FACTORY_SLOT"
+  export VITEST_POOL_ID="$FACTORY_SLOT"
+fi
+
+echo "==> prettier --check"
+npx prettier --check .
+
+echo "==> eslint"
+npx eslint .
+
+echo "==> test"
+npm test -- "$@"
+
+echo "FACTORY-CHECK PASSED"

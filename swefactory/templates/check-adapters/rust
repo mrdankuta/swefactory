@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# factory-check (rust) — check adapter for swefactory.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets the cargo target dir so
+# concurrent dispatcher workers never share build state.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ ! -f swefactory/Cargo.toml ]; then
+  echo "factory-check: no swefactory/Cargo.toml yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: separate target dirs per dispatcher worker.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export CARGO_TARGET_DIR="$PWD/swefactory/target-slot-$FACTORY_SLOT"
+fi
+
+echo "==> cargo fmt --check"
+cargo fmt --manifest-path swefactory/Cargo.toml --check
+
+echo "==> cargo clippy (deny warnings)"
+cargo clippy --manifest-path swefactory/Cargo.toml --all-targets -- -D warnings
+
+echo "==> cargo test"
+cargo test --manifest-path swefactory/Cargo.toml -- "$@"
+
+
+echo "FACTORY-CHECK PASSED"

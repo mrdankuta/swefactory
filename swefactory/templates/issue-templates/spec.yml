@@ -1,0 +1,73 @@
+name: Spec
+description: Product spec — becomes authoritative at the SPEC-APPROVED freeze
+title: "[spec] <title>"
+labels: ["spec"]
+body:
+  - type: input
+    id: epic
+    attributes:
+      label: Epic
+      description: Parent epic issue number (e.g. #1)
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem are we solving?
+    validations:
+      required: true
+  - type: textarea
+    id: users
+    attributes:
+      label: Users and permissions
+      description: Who may perform this action? (roles from GLOSSARY.md)
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Behaviour
+      description: Success path and failure paths
+    validations:
+      required: true
+  - type: textarea
+    id: rules
+    attributes:
+      label: Domain rules
+      description: Invariants that must hold (tenant scoping, authz, money, idempotency)
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Acceptance criteria
+      description: Observable outcomes, each with how to verify
+      value: "- [ ] \n- [ ] "
+    validations:
+      required: true
+  - type: textarea
+    id: nongoals
+    attributes:
+      label: Non-goals
+      description: Explicitly excluded
+  - type: textarea
+    id: design
+    attributes:
+      label: Design
+      description: Affected contexts, interfaces, schema, UI. Preferred seams for tests.
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Tests + manual evidence required (incl. tenant/permission cases)
+  - type: textarea
+    id: release
+    attributes:
+      label: Release
+      description: Migration, compatibility, rollout, rollback
+  - type: textarea
+    id: open
+    attributes:
+      label: Open decisions
+      description: Anything unresolved — do NOT implement past these without human approval

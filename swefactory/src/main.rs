@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// swefactory: the software factory as a product (single static binary).
@@ -24,6 +24,22 @@ struct Cli {
 enum Commands {
     /// Print the factory version.
     Version,
+    /// Seed the factory into the current project (idempotent, never clobbers).
+    Init {
+        /// Check-adapter stack to install.
+        #[arg(long, default_value = "rust")]
+        stack: String,
+        /// Install skills to $HOME/.agents/skills instead of the project.
+        #[arg(long)]
+        global_skills: bool,
+    },
+    /// Refresh prompts/skills/checks in place (idempotent, never clobbers).
+    Update {
+        /// Release tag to refresh from (recorded; network fetch is out of
+        /// scope for the static binary, which carries embedded templates).
+        #[arg(long)]
+        pin: Option<String>,
+    },
     /// Record spec approval as a content hash (SPEC-APPROVED comment + label).
     Freeze {
         /// Issue number (e.g. 6 or #6).
@@ -91,6 +107,428 @@ enum Commands {
 #[derive(Serialize)]
 struct VersionOutput<'a> {
     version: &'a str,
+}
+
+#[derive(Serialize)]
+struct InitOutput {
+    stack: String,
+    installed: Vec<String>,
+    kept: Vec<String>,
+    warnings: Vec<String>,
+}
+
+// --- embedded templates (the binary is hermetic: no network, no checkout) ---
+
+const PROMPT_PLAN: &str = include_str!("../templates/prompts/plan.md");
+const PROMPT_BUILD: &str = include_str!("../templates/prompts/build.md");
+const PROMPT_REVIEW: &str = include_str!("../templates/prompts/review.md");
+const PROMPT_HANDOFF: &str = include_str!("../templates/prompts/handoff.md");
+
+const ISSUE_SPEC: &str = include_str!("../templates/issue-templates/spec.yml");
+const ISSUE_TICKET: &str = include_str!("../templates/issue-templates/ticket.yml");
+
+const ADAPTER_RUST: &str = include_str!("../templates/check-adapters/rust");
+const ADAPTER_ELIXIR: &str = include_str!("../templates/check-adapters/elixir");
+const ADAPTER_NODE: &str = include_str!("../templates/check-adapters/node");
+const ADAPTER_PYTHON: &str = include_str!("../templates/check-adapters/python");
+
+const AGENTS_HEADER: &str = include_str!("../templates/header/AGENTS.header.md");
+const GLOSSARY: &str = include_str!("../templates/glossary/GLOSSARY.md");
+const DOCS_README: &str = include_str!("../templates/docs/README.md");
+
+/// (relative path under a skills dir, content)
+const SKILLS: &[(&str, &str)] = &[
+    (
+        "code-review/SKILL.md",
+        include_str!("../templates/skills/code-review/SKILL.md"),
+    ),
+    (
+        "diagnosing-bugs/SKILL.md",
+        include_str!("../templates/skills/diagnosing-bugs/SKILL.md"),
+    ),
+    (
+        "diagnosing-bugs/scripts/hitl-loop.template.sh",
+        include_str!("../templates/skills/diagnosing-bugs/scripts/hitl-loop.template.sh"),
+    ),
+    (
+        "grill-with-docs/SKILL.md",
+        include_str!("../templates/skills/grill-with-docs/SKILL.md"),
+    ),
+    (
+        "land/SKILL.md",
+        include_str!("../templates/skills/land/SKILL.md"),
+    ),
+    (
+        "pr/CREDITS.md",
+        include_str!("../templates/skills/pr/CREDITS.md"),
+    ),
+    (
+        "pr/SKILL.md",
+        include_str!("../templates/skills/pr/SKILL.md"),
+    ),
+    (
+        "retro/SKILL.md",
+        include_str!("../templates/skills/retro/SKILL.md"),
+    ),
+    (
+        "tdd/SKILL.md",
+        include_str!("../templates/skills/tdd/SKILL.md"),
+    ),
+    (
+        "tdd/mocking.md",
+        include_str!("../templates/skills/tdd/mocking.md"),
+    ),
+    (
+        "tdd/tests.md",
+        include_str!("../templates/skills/tdd/tests.md"),
+    ),
+    (
+        "to-spec/SKILL.md",
+        include_str!("../templates/skills/to-spec/SKILL.md"),
+    ),
+    (
+        "to-tickets/SKILL.md",
+        include_str!("../templates/skills/to-tickets/SKILL.md"),
+    ),
+];
+
+/// Factory protocol labels: (name, color, description).
+const LABELS: &[(&str, &str, &str)] = &[
+    (
+        "spec",
+        "0E8A16",
+        "Product spec (authoritative at SPEC-APPROVED)",
+    ),
+    ("epic", "5319E7", "Epic grouping specs and tickets"),
+    ("ticket", "FBCA04", "Single unit of implementation work"),
+    ("ready", "1D76DB", "Ticket ready for implementation"),
+    ("running", "F9D0C4", "Ticket under implementation"),
+    ("review", "B60205", "Ticket awaiting independent review"),
+    ("accepted", "0E8A16", "Ticket reviewed and accepted"),
+    ("integrated", "5319E7", "Ticket merged into a release train"),
+    (
+        "blocked",
+        "B60205",
+        "Ticket blocked on a decision or dependency",
+    ),
+    (
+        "spec-approved",
+        "0E8A16",
+        "Spec frozen — body hash recorded in SPEC-APPROVED comment",
+    ),
+];
+
+fn adapter_for(stack: &str) -> Option<&'static str> {
+    match stack {
+        "rust" => Some(ADAPTER_RUST),
+        "elixir" => Some(ADAPTER_ELIXIR),
+        "node" => Some(ADAPTER_NODE),
+        "python" => Some(ADAPTER_PYTHON),
+        _ => None,
+    }
+}
+
+fn tool_present(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+struct Installer {
+    dest: PathBuf,
+    installed: Vec<String>,
+    kept: Vec<String>,
+    warnings: Vec<String>,
+    json: bool,
+}
+
+impl Installer {
+    fn say(&self, line: &str) {
+        if !self.json {
+            println!("{line}");
+        }
+    }
+
+    fn warn(&mut self, line: &str) {
+        eprintln!("{line}");
+        self.warnings.push(line.to_string());
+    }
+
+    /// Write `content` to `rel` unless it already exists. Never overwrites.
+    fn seed(&mut self, rel: &str, content: &str) {
+        let target = self.dest.join(rel);
+        if target.exists() {
+            self.kept.push(rel.to_string());
+            self.say(&format!("keep: {rel} exists, not overwriting"));
+            return;
+        }
+        if let Some(parent) = target.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.warn(&format!("WARN: cannot create {}: {e}", parent.display()));
+                return;
+            }
+        }
+        match std::fs::write(&target, content) {
+            Ok(()) => {
+                self.installed.push(rel.to_string());
+                self.say(&format!("install: {rel}"));
+            }
+            Err(e) => self.warn(&format!("WARN: cannot write {rel}: {e}")),
+        }
+    }
+
+    fn seed_executable(&mut self, rel: &str, content: &str) {
+        self.seed(rel, content);
+        #[cfg(unix)]
+        {
+            let target = self.dest.join(rel);
+            if target.exists() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    fn ensure_labels(&mut self, gh_ok: bool) {
+        if !gh_ok {
+            self.say(
+                "skip: gh not authenticated — copy .github/ISSUE_TEMPLATE manually and create labels (spec, epic, ticket, ready, running, review, accepted, integrated, blocked, spec-approved)",
+            );
+            return;
+        }
+        let mut failed = false;
+        for (name, color, desc) in LABELS {
+            let created = std::process::Command::new("gh")
+                .args([
+                    "label",
+                    "create",
+                    name,
+                    "--color",
+                    color,
+                    "--description",
+                    desc,
+                ])
+                .current_dir(&self.dest)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if created {
+                continue;
+            }
+            let edited = std::process::Command::new("gh")
+                .args([
+                    "label",
+                    "edit",
+                    name,
+                    "--color",
+                    color,
+                    "--description",
+                    desc,
+                ])
+                .current_dir(&self.dest)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !edited {
+                failed = true;
+            }
+        }
+        if failed {
+            self.warn("WARN: some labels could not be ensured via gh — create them from the factory protocol set manually");
+        } else {
+            self.say("labels: ensured factory label set");
+        }
+    }
+
+    fn finish_dirs_and_markers(&mut self) {
+        for d in [
+            "factory/.cache",
+            "docs/product",
+            "docs/architecture",
+            "docs/adr",
+            "docs/runbooks",
+            "scripts",
+        ] {
+            let _ = std::fs::create_dir_all(self.dest.join(d));
+        }
+        // gitignore cache entry (only when a .gitignore already exists)
+        let gi = self.dest.join(".gitignore");
+        if gi.is_file() {
+            let body = std::fs::read_to_string(&gi).unwrap_or_default();
+            if !body.contains("factory/.cache/") {
+                let mut body = body;
+                if !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str("factory/.cache/\n");
+                if std::fs::write(&gi, body).is_ok() {
+                    self.say("install: .gitignore (factory/.cache/)");
+                }
+            }
+        }
+        // version marker (always records the running binary's version)
+        let want = env!("CARGO_PKG_VERSION");
+        let vf = self.dest.join(".factory-version");
+        let cur = std::fs::read_to_string(&vf).unwrap_or_default();
+        if cur.trim() != want {
+            if std::fs::write(&vf, format!("{want}\n")).is_ok() {
+                self.say("install: .factory-version");
+            }
+        } else {
+            self.kept.push(".factory-version".to_string());
+        }
+    }
+}
+
+fn run_init(
+    json: bool,
+    stack: &str,
+    global_skills: bool,
+    pin: Option<&str>,
+    cmd: &str,
+) -> InitOutput {
+    let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut ins = Installer {
+        dest: dest.clone(),
+        installed: Vec::new(),
+        kept: Vec::new(),
+        warnings: Vec::new(),
+        json,
+    };
+
+    // --- prerequisites (warn, don't fail) ---
+    let gh_present = tool_present("gh");
+    if !gh_present {
+        ins.warn(
+            "WARN: gh CLI not found — issue templates/labels will be skipped. Install: https://cli.github.com",
+        );
+    }
+    if !tool_present("herdr") {
+        ins.warn(
+            "WARN: herdr not found — install from https://herdr.dev then run: herdr integration install pi",
+        );
+    }
+
+    // --- prompts ---
+    ins.seed(".pi/prompts/plan.md", PROMPT_PLAN);
+    ins.seed(".pi/prompts/build.md", PROMPT_BUILD);
+    ins.seed(".pi/prompts/review.md", PROMPT_REVIEW);
+    ins.seed(".pi/prompts/handoff.md", PROMPT_HANDOFF);
+
+    // --- skills (project-local, hermetic; never overwrite existing) ---
+    let skill_root = if global_skills {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        Path::new(&home).join(".agents/skills")
+    } else {
+        dest.join(".agents/skills")
+    };
+    for (rel, content) in SKILLS {
+        let target = skill_root.join(rel);
+        let display = if global_skills {
+            format!("~/.agents/skills/{rel}")
+        } else {
+            format!(".agents/skills/{rel}")
+        };
+        if target.exists() {
+            ins.kept.push(display.clone());
+            ins.say(&format!("keep: {display} exists, not overwriting"));
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&target, content) {
+            Ok(()) => {
+                ins.installed.push(display.clone());
+                ins.say(&format!("install: {display}"));
+            }
+            Err(e) => ins.warn(&format!("WARN: cannot write {display}: {e}")),
+        }
+    }
+
+    // --- check adapter for the stack ---
+    match adapter_for(stack) {
+        Some(adapter) => {
+            ins.seed_executable("scripts/factory-check", adapter);
+            if cmd == "init" {
+                ins.say(&format!("check adapter: {stack}"));
+            }
+        }
+        None => {
+            ins.warn(&format!(
+                "WARN: no check adapter for '{stack}' (expected one of rust, elixir, node, python) — write scripts/factory-check (contract: format→lint→test, non-zero on fail)"
+            ));
+        }
+    }
+
+    // --- AGENTS.md header (marker-based merge) ---
+    let agents = dest.join("AGENTS.md");
+    match std::fs::read_to_string(&agents) {
+        Ok(body) if body.contains("factory:header:start") => {
+            ins.kept.push("AGENTS.md".to_string());
+            ins.say("keep: AGENTS.md already has factory header");
+        }
+        Ok(body) => {
+            let merged = format!("{AGENTS_HEADER}\n{body}");
+            match std::fs::write(&agents, merged) {
+                Ok(()) => {
+                    ins.installed.push("AGENTS.md".to_string());
+                    ins.say("merged: factory header prepended to AGENTS.md (review the join)");
+                }
+                Err(e) => ins.warn(&format!("WARN: cannot merge AGENTS.md: {e}")),
+            }
+        }
+        Err(_) => ins.seed("AGENTS.md", AGENTS_HEADER),
+    }
+
+    // --- glossary + docs skeleton (only if missing) ---
+    ins.seed("GLOSSARY.md", GLOSSARY);
+    ins.seed("docs/README.md", DOCS_README);
+
+    // --- issue templates (local files; gh only needed for labels) ---
+    ins.seed(".github/ISSUE_TEMPLATE/spec.yml", ISSUE_SPEC);
+    ins.seed(".github/ISSUE_TEMPLATE/ticket.yml", ISSUE_TICKET);
+
+    // --- labels (best effort via gh) ---
+    let authed = gh_present
+        && std::process::Command::new("gh")
+            .args(["auth", "status"])
+            .current_dir(&dest)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    if gh_present && !authed {
+        ins.say(
+            "skip: gh not authenticated — copy .github/ISSUE_TEMPLATE manually and create labels from the factory protocol set",
+        );
+    } else {
+        ins.ensure_labels(authed);
+    }
+
+    ins.finish_dirs_and_markers();
+
+    if let Some(tag) = pin {
+        ins.say(&format!(
+            "pin: {tag} recorded (this binary carries embedded templates; network refresh is out of scope)"
+        ));
+    }
+
+    let done = cmd;
+    ins.say(&format!(
+        "factory {done} done ({stack}). Next: fill GLOSSARY.md, file epic issue, /plan."
+    ));
+    ins.say(
+        "init is idempotent and never overwrites existing files; delete a file to force refresh.",
+    );
+
+    InitOutput {
+        stack: stack.to_string(),
+        installed: ins.installed,
+        kept: ins.kept,
+        warnings: ins.warnings,
+    }
 }
 
 #[derive(Serialize)]
@@ -630,6 +1068,31 @@ fn run() -> i32 {
                 );
             } else {
                 println!("{version}");
+            }
+            0
+        }
+        Commands::Init {
+            stack,
+            global_skills,
+        } => {
+            let out = run_init(cli.json, &stack, global_skills, None, "init");
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&out).expect("init JSON serialization")
+                );
+            }
+            0
+        }
+        Commands::Update { pin } => {
+            // update refreshes from the same embedded templates; because
+            // seeding never overwrites, it is a no-op when in place.
+            let out = run_init(cli.json, "rust", false, pin.as_deref(), "update");
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&out).expect("update JSON serialization")
+                );
             }
             0
         }
