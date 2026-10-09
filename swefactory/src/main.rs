@@ -109,6 +109,40 @@ enum Commands {
         #[command(subcommand)]
         action: DispatchAction,
     },
+    /// Release train: accepted tickets accumulate onto an integration
+    /// branch that only clean merges can join. Never touches dev/main,
+    /// never deletes branches (finish/abandon only print cleanup).
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReleaseAction {
+    /// Cut an integration train from the dev branch (refused while one is open).
+    Start {
+        /// Train slug (e.g. `beta`). Defaults to `train`.
+        #[arg(value_name = "SLUG")]
+        slug: Option<String>,
+    },
+    /// Show the open train + member branches + head.
+    Status,
+    /// Merge an accepted ticket branch into the train (clean only).
+    Merge {
+        /// Ticket issue number (e.g. 11 or #11).
+        ticket: String,
+    },
+    /// Revert a ticket's merge from the train (fails loudly when not merged).
+    Drop {
+        /// Ticket issue number (e.g. 11 or #11).
+        ticket: String,
+    },
+    /// Verify the human merged the train into dev, mark merged, remove the
+    /// train worktree, and print branch cleanup (never deletes).
+    Finish,
+    /// Close an unmerged train with no merge check, remove the worktree.
+    Abandon,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1101,6 +1135,8 @@ struct DispatchAttempt {
     log_path: String,
     started_at: String,
     finished_at: String,
+    #[serde(default)]
+    train_branch: String,
 }
 
 #[derive(Serialize, serde::Deserialize, Default)]
@@ -1587,6 +1623,7 @@ fn cmd_dispatch_ticket(
         .join(format!("T{ticket}-a{attempt_no}-impl.log"));
     let id = ledger.attempts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
 
+    let open_train_branch: String = load_open_train(state).map(|t| t.branch).unwrap_or_default();
     // Spec freeze gate: a drifted spec refuses the ticket before any
     // worktree exists. The refusal itself is a logged failed attempt.
     if let Some(s) = spec {
@@ -1606,6 +1643,7 @@ fn cmd_dispatch_ticket(
                 log_path: log_path.to_string_lossy().into_owned(),
                 started_at: now_stamp(),
                 finished_at: now_stamp(),
+                train_branch: open_train_branch.clone(),
             });
             log_event(&log_path, id, ticket, "spec-gate", 1);
             gh_comment(ticket, &format!("DISPATCH: linked spec #{s} body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs."));
@@ -1613,11 +1651,22 @@ fn cmd_dispatch_ticket(
         }
     }
 
-    let base = git_head(
-        std::env::current_dir()
-            .as_deref()
-            .unwrap_or(std::path::Path::new(".")),
-    );
+    // Worktrees base on the open train head when a train is open
+    // (read-only rev-parse); otherwise HEAD. Never touches dev/main.
+    let base = if open_train_branch.is_empty() {
+        let head = git_head(
+            std::env::current_dir()
+                .as_deref()
+                .unwrap_or(std::path::Path::new(".")),
+        );
+        if head.is_empty() {
+            "HEAD".to_string()
+        } else {
+            head
+        }
+    } else {
+        train_head(&open_train_branch)
+    };
     let base = if base.is_empty() {
         "HEAD".to_string()
     } else {
@@ -1675,6 +1724,7 @@ fn cmd_dispatch_ticket(
         log_path: log_path.to_string_lossy().into_owned(),
         started_at: now_stamp(),
         finished_at: String::new(),
+        train_branch: open_train_branch.clone(),
     });
     let idx = ledger.attempts.len() - 1;
     if let Err(e) = save_ledger(state, ledger) {
@@ -1885,11 +1935,31 @@ fn cmd_dispatch_ticket(
     remove_worktree(&rwt);
     remove_worktree(&wt);
     if verdict.as_deref() == Some("accept") {
-        // Accepted: human owns the land. Record base→head, never merge/push.
-        gh_relabel(ticket, Some("review"), "accepted");
-        gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
-        println!("  ACCEPTED — #{ticket} awaiting human land");
-        finish_attempt(state, ledger, idx, "review_done", 0);
+        // Accept path: with an open train, auto-merge cleanly or route to
+        // blocked on conflict (never forced). Without a train the human
+        // owns the land. Never merges into dev/main, never pushes.
+        if !open_train_branch.is_empty() {
+            match do_train_merge(ticket, &branch, &open_train_branch, state) {
+                Ok(short) => {
+                    gh_relabel(ticket, Some("review"), "integrated");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted; merged into train `{open_train_branch}` ({short}). Human: covered by the train→dev review."));
+                    println!("  ACCEPTED + INTEGRATED into {open_train_branch} — #{ticket}");
+                    finish_attempt(state, ledger, idx, "review_done", 0);
+                }
+                Err(e) => {
+                    println!("  merge into train failed — routing to blocked (never forced)");
+                    gh_relabel(ticket, Some("review"), "blocked");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted but merge into train `{open_train_branch}` failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
+                    finish_attempt(state, ledger, idx, "review_failed", 0);
+                }
+            }
+        } else {
+            // Accepted: human owns the land. Record base→head, never merge/push.
+            gh_relabel(ticket, Some("review"), "accepted");
+            gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
+            println!("  ACCEPTED — #{ticket} awaiting human land");
+            finish_attempt(state, ledger, idx, "review_done", 0);
+        }
     } else {
         println!("  changes_requested (or unreadable verdict) — back to ready");
         gh_relabel(ticket, Some("review"), "ready");
@@ -2057,6 +2127,631 @@ fn cmd_dispatch_resume(json: bool) -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// RELEASE TRAIN (ticket #14)
+//
+// SAFETY CONTRACT (asserted in tests/cli_release.rs, not just documented):
+// Release automation NEVER touches dev/main and NEVER deletes branches.
+// There is deliberately NO code path here that pushes, merges into,
+// checks out-and-commits-to, or branch-forces dev or main, and NO code
+// path that executes `branch -D/-d` or `worktree remove` on anything but
+// the train worktree itself. `git fetch`, `rev-parse`, `merge-base
+// --is-ancestor`, `log`, and `status` are read-only. Train merges use
+// `--no-ff --no-edit` ONLY with `merge --abort` on conflict — nothing is
+// ever forced. `finish`/`abandon` only PRINT branch cleanup for the human;
+// the human owns the train→dev merge and the land. No `git push` appears
+// in this section at all.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct TrainState {
+    branch: String,
+    base_commit: String,
+    #[serde(default = "default_train_status")]
+    status: String,
+    #[serde(default)]
+    created_at: String,
+}
+
+fn default_train_status() -> String {
+    "open".to_string()
+}
+
+fn train_path(state: &std::path::Path) -> PathBuf {
+    state.join("train.json")
+}
+
+fn load_open_train(state: &std::path::Path) -> Option<TrainState> {
+    let text = std::fs::read_to_string(train_path(state)).ok()?;
+    let train: TrainState = serde_json::from_str(&text).ok()?;
+    if train.status == "open" && !train.branch.is_empty() {
+        Some(train)
+    } else {
+        None
+    }
+}
+
+fn save_train(state: &std::path::Path, train: &TrainState) -> Result<(), String> {
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let tmp = state.join("train.json.tmp");
+    let text =
+        serde_json::to_string_pretty(train).map_err(|e| format!("cannot serialize train: {e}"))?;
+    std::fs::write(&tmp, text).map_err(|e| format!("cannot write train: {e}"))?;
+    std::fs::rename(&tmp, train_path(state)).map_err(|e| format!("cannot replace train: {e}"))?;
+    Ok(())
+}
+
+fn clear_train(state: &std::path::Path) {
+    let _ = std::fs::remove_file(train_path(state));
+    let _ = std::fs::remove_file(state.join("train.json.tmp"));
+}
+
+/// YYYYMMDD stamp for `integration/<stamp>-<slug>` (parity with bash
+/// `date +%Y%m%d`; hermetic fallback keeps tests deterministic).
+fn date_stamp() -> String {
+    if let Ok(out) = Command::new("date").arg("+%Y%m%d").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+                return s;
+            }
+        }
+    }
+    "19700101".to_string()
+}
+
+fn rev_parse_ok(rev: &str) -> Option<String> {
+    run_git(&["rev-parse", "--verify", "--quiet", rev], None)
+        .ok()
+        .filter(|o| o.status.success())?;
+    run_git(&["rev-parse", rev], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Read-only base for a new train: origin/dev, else dev, else HEAD.
+/// Never checks out anything.
+fn resolve_train_base() -> String {
+    for candidate in ["origin/dev", "dev"] {
+        if let Some(sha) = rev_parse_ok(candidate) {
+            return sha;
+        }
+    }
+    rev_parse_ok("HEAD").unwrap_or_else(|| "HEAD".to_string())
+}
+
+fn branch_exists(branch: &str) -> bool {
+    run_git(&["rev-parse", "--verify", "--quiet", branch], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    run_git(&["merge-base", "--is-ancestor", ancestor, descendant], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Train worktree lives under the state dir so hermetic tests with an
+/// isolated FACTORY_STATE_DIR never collide (never a sibling ../-train).
+fn train_worktree_path(state: &std::path::Path) -> PathBuf {
+    state.join("train-worktree")
+}
+
+fn ensure_train_worktree(state: &std::path::Path, train: &str) -> Result<PathBuf, String> {
+    let twt = train_worktree_path(state);
+    let listed = run_git(&["worktree", "list", "--porcelain"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if listed.contains(&format!("worktree {}", twt.to_string_lossy())) {
+        return Ok(twt);
+    }
+    if twt.exists() {
+        return Err(format!(
+            "release: {} exists but is not a registered worktree — remove it first",
+            twt.display()
+        ));
+    }
+    if let Some(parent) = twt.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("release: cannot create {}: {e}", parent.display()))?;
+    }
+    match run_git(&["worktree", "add", &twt.to_string_lossy(), train], None) {
+        Ok(o) if o.status.success() => Ok(twt),
+        Ok(o) => Err(format!(
+            "release: git worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("release: {e}")),
+    }
+}
+
+fn remove_train_worktree(state: &std::path::Path) {
+    let twt = train_worktree_path(state);
+    let s = twt.to_string_lossy().to_string();
+    let removed = run_git(&["worktree", "remove", "--force", &s], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !removed {
+        let _ = std::fs::remove_dir_all(&twt);
+    }
+    let _ = run_git(&["worktree", "prune"], None);
+}
+
+/// Latest recorded branch for a ticket: prefer an attempt already on this
+/// train, else the newest attempt with any branch.
+fn ticket_branch_for_merge(ledger: &DispatchLedger, ticket: u64, train: &str) -> Option<String> {
+    let mut best: Option<&DispatchAttempt> = None;
+    for a in &ledger.attempts {
+        if a.ticket != ticket || a.branch.is_empty() {
+            continue;
+        }
+        match best {
+            None => best = Some(a),
+            Some(b) if a.id > b.id => best = Some(a),
+            _ => {}
+        }
+    }
+    best?;
+    let mut same: Option<&DispatchAttempt> = None;
+    for a in &ledger.attempts {
+        if a.ticket == ticket && a.train_branch == train && !a.branch.is_empty() {
+            match same {
+                None => same = Some(a),
+                Some(b) if a.id > b.id => same = Some(a),
+                _ => {}
+            }
+        }
+    }
+    let chosen = same.or(best)?;
+    if chosen.branch.is_empty() {
+        None
+    } else {
+        Some(chosen.branch.clone())
+    }
+}
+
+/// Merge a ticket branch into the train worktree with --no-ff --no-edit
+/// ONLY. On conflict the merge is aborted and Err is returned — nothing
+/// is ever forced and the train stays untouched.
+fn do_train_merge(
+    ticket: u64,
+    tbranch: &str,
+    train: &str,
+    state: &std::path::Path,
+) -> Result<String, String> {
+    let twt = ensure_train_worktree(state, train)?;
+    let found = run_git(&["rev-parse", "--verify", "--quiet", tbranch], Some(&twt))
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !found {
+        return Err(format!("release: ticket branch {tbranch} not found"));
+    }
+    let dirty = run_git(&["status", "--porcelain"], Some(&twt))
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(true);
+    if dirty {
+        return Err(format!(
+            "release: train worktree {} is dirty — refusing",
+            twt.display()
+        ));
+    }
+    let msg = format!("Merge ticket #{ticket} ({tbranch}) into {train}");
+    match run_git(
+        &["merge", "--no-ff", "--no-edit", "-m", &msg, tbranch],
+        Some(&twt),
+    ) {
+        Ok(o) if o.status.success() => {}
+        Ok(_) => {
+            let _ = run_git(&["merge", "--abort"], Some(&twt));
+            return Err(format!(
+                "release: merge of #{ticket} conflicted — aborted, train untouched"
+            ));
+        }
+        Err(e) => {
+            let _ = run_git(&["merge", "--abort"], Some(&twt));
+            return Err(format!("release: {e}"));
+        }
+    }
+    let short = run_git(&["rev-parse", "--short", "HEAD"], Some(&twt))
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    Ok(short)
+}
+
+/// Newest merge of this ticket without a descendant Revert (a merge whose
+/// subject already has a descendant `Revert "<subject>"` was dropped
+/// before — keep looking older). Read-only.
+fn find_unreverted_merge(
+    twt: &std::path::Path,
+    ticket: u64,
+    train: &str,
+) -> Option<(String, String)> {
+    let out = run_git(
+        &[
+            "log",
+            "--format=%H",
+            "--merges",
+            &format!("--grep=Merge ticket #{ticket} "),
+            train,
+        ],
+        Some(twt),
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .unwrap_or_default();
+    for cand in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let subject = run_git(&["log", "-1", "--format=%s", cand], Some(twt))
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if subject.is_empty() {
+            continue;
+        }
+        let reverts = run_git(
+            &[
+                "log",
+                "--format=%H",
+                "--fixed-strings",
+                &format!("--grep=Revert \"{subject}\""),
+            ],
+            Some(twt),
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+        let mut dropped = false;
+        for rsha in reverts.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if run_git(&["merge-base", "--is-ancestor", cand, rsha], Some(twt))
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                dropped = true;
+                break;
+            }
+        }
+        if dropped {
+            continue;
+        }
+        return Some((cand.to_string(), subject));
+    }
+    None
+}
+
+fn member_branches(ledger: &DispatchLedger, train: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for a in &ledger.attempts {
+        if a.train_branch == train && !a.branch.is_empty() && !out.contains(&a.branch) {
+            out.push(a.branch.clone());
+        }
+    }
+    if out.is_empty() {
+        // Back-compat: ledgers written before train_branch existed.
+        for a in &ledger.attempts {
+            if !a.branch.is_empty() && !out.contains(&a.branch) {
+                out.push(a.branch.clone());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn train_head(train: &str) -> String {
+    run_git(&["rev-parse", train], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
+    let state = dispatch_state_dir();
+    if let Err(e) = std::fs::create_dir_all(&state) {
+        eprintln!("release: cannot create {}: {e}", state.display());
+        return 1;
+    }
+    if let Some(existing) = load_open_train(&state) {
+        eprintln!(
+            "release: train already open ({}) — merge or abandon it first; never two open trains",
+            existing.branch
+        );
+        return 1;
+    }
+    let mut slug = slugify(slug_opt.unwrap_or("train"));
+    if slug.is_empty() {
+        slug = "train".to_string();
+    }
+    let stamp = date_stamp();
+    let train = format!("integration/{stamp}-{slug}");
+    if branch_exists(&train) {
+        eprintln!("release: branch {train} already exists — refusing to reuse");
+        return 1;
+    }
+    let base = resolve_train_base();
+    match run_git(&["branch", &train, &base], None) {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "release: git branch failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("release: {e}");
+            return 1;
+        }
+    }
+    let record = TrainState {
+        branch: train.clone(),
+        base_commit: base.clone(),
+        status: "open".to_string(),
+        created_at: now_stamp(),
+    };
+    if let Err(e) = save_train(&state, &record) {
+        eprintln!("release: {e}");
+        return 1;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"train": train, "base": base, "open": true})
+        );
+    } else {
+        println!("release: train {train} cut from {base}");
+    }
+    0
+}
+
+fn cmd_release_status(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        if json {
+            println!("{{\"open\":false}}");
+        } else {
+            println!("release: no open train");
+        }
+        return 0;
+    };
+    let ledger = load_ledger(&state);
+    let members = member_branches(&ledger, &train.branch);
+    let head = train_head(&train.branch);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"open": true, "train": train.branch, "base": train.base_commit, "status": train.status, "head": head, "members": members})
+        );
+    } else {
+        println!(
+            "release: open train {} (base {})",
+            train.branch,
+            train.base_commit.chars().take(8).collect::<String>()
+        );
+        println!("--- member ticket branches ---");
+        if members.is_empty() {
+            println!("(none)");
+        } else {
+            for m in &members {
+                println!("{m}");
+            }
+        }
+        println!("--- train head (CI-relevant) ---");
+        if head.is_empty() {
+            println!("train branch {} not present locally", train.branch);
+        } else {
+            println!("{head}");
+        }
+    }
+    0
+}
+
+fn cmd_release_merge(json: bool, ticket_raw: &str) -> i32 {
+    let ticket = match parse_issue_number(ticket_raw) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("release: {e}");
+            return 1;
+        }
+    };
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        eprintln!("release: no open train");
+        return 1;
+    };
+    let ledger = load_ledger(&state);
+    let Some(tbranch) = ticket_branch_for_merge(&ledger, ticket, &train.branch) else {
+        eprintln!("release: no recorded branch for ticket #{ticket}");
+        return 1;
+    };
+    match do_train_merge(ticket, &tbranch, &train.branch, &state) {
+        Ok(short) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"train": train.branch, "ticket": ticket, "branch": tbranch, "head": short, "merged": true})
+                );
+            } else {
+                println!("release: #{ticket} merged into {} ({short})", train.branch);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+fn cmd_release_drop(json: bool, ticket_raw: &str) -> i32 {
+    let ticket = match parse_issue_number(ticket_raw) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("release: {e}");
+            return 1;
+        }
+    };
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        eprintln!("release: no open train");
+        return 1;
+    };
+    let twt = match ensure_train_worktree(&state, &train.branch) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let found = find_unreverted_merge(&twt, ticket, &train.branch);
+    let Some((merge_sha, _subject)) = found else {
+        eprintln!(
+            "release: ticket #{ticket} is NOT merged into {} (or already dropped) — nothing to drop",
+            train.branch
+        );
+        return 1;
+    };
+    match run_git(&["revert", "-m", "1", "--no-edit", &merge_sha], Some(&twt)) {
+        Ok(o) if o.status.success() => {}
+        Ok(_) => {
+            let _ = run_git(&["revert", "--abort"], Some(&twt));
+            eprintln!("release: revert of #{ticket} conflicted — aborted");
+            return 1;
+        }
+        Err(e) => {
+            let _ = run_git(&["revert", "--abort"], Some(&twt));
+            eprintln!("release: revert failed: {e}");
+            return 1;
+        }
+    }
+    let short = run_git(&["rev-parse", "--short", "HEAD"], Some(&twt))
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"train": train.branch, "ticket": ticket, "dropped": true, "revert": short})
+        );
+    } else {
+        println!(
+            "release: ticket #{ticket} dropped from {} (revert {short})",
+            train.branch
+        );
+    }
+    0
+}
+
+/// Human-merge candidates, in order. Both are read-only checks; the human
+/// may have merged locally (`dev`) or the checkout may only have the
+/// remote (`origin/dev`).
+fn train_merged_into_dev(train: &str) -> bool {
+    for dev in ["dev", "origin/dev"] {
+        if branch_exists(dev) && is_ancestor(train, dev) {
+            return true;
+        }
+    }
+    false
+}
+
+fn cleanup_lines(train: &str, members: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for m in members {
+        lines.push(format!("git branch -d {m}"));
+    }
+    lines.push(format!("git branch -d {train}"));
+    lines.push("git worktree prune".to_string());
+    lines
+}
+
+fn cmd_release_finish(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        eprintln!("release: no open train");
+        return 1;
+    };
+    if !train_merged_into_dev(&train.branch) {
+        eprintln!(
+            "release: train {} not merged into dev — human must merge first",
+            train.branch
+        );
+        return 1;
+    }
+    // An empty train (head == base) is trivially an ancestor but was never
+    // landed: refuse only when dev still points at the same commit (no
+    // human merge happened). After a human `--no-ff` merge of an empty
+    // train, dev has a new merge commit so dev != train and finish succeeds.
+    let head_now = train_head(&train.branch);
+    if head_now.is_empty() {
+        eprintln!(
+            "release: train {} not merged into dev — human must merge first",
+            train.branch
+        );
+        return 1;
+    }
+    let dev_head = rev_parse_ok("dev")
+        .or_else(|| rev_parse_ok("origin/dev"))
+        .unwrap_or_default();
+    if head_now == train.base_commit && head_now == dev_head {
+        eprintln!(
+            "release: train {} not merged into dev — human must merge first",
+            train.branch
+        );
+        return 1;
+    }
+    let ledger = load_ledger(&state);
+    let members = member_branches(&ledger, &train.branch);
+    remove_train_worktree(&state);
+    clear_train(&state);
+    let cleanup = cleanup_lines(&train.branch, &members);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"train": train.branch, "merged": true, "cleanup": cleanup})
+        );
+    } else {
+        println!("release: train {} merged into dev", train.branch);
+        println!("cleanup (human runs these, automation never deletes):");
+        for line in &cleanup {
+            println!("  {line}");
+        }
+    }
+    0
+}
+
+fn cmd_release_abandon(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        eprintln!("release: no open train");
+        return 1;
+    };
+    // No merge check by design: an unmerged train closes cleanly.
+    remove_train_worktree(&state);
+    clear_train(&state);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"train": train.branch, "abandoned": true})
+        );
+    } else {
+        println!("release: train {} abandoned (unmerged)", train.branch);
+    }
+    0
+}
+
 fn main() {
     std::process::exit(run());
 }
@@ -2136,6 +2831,26 @@ fn run() -> i32 {
             }
             DispatchAction::Resume => {
                 std::process::exit(cmd_dispatch_resume(cli.json));
+            }
+        },
+        Commands::Release { action } => match action {
+            ReleaseAction::Start { slug } => {
+                std::process::exit(cmd_release_start(cli.json, slug.as_deref()));
+            }
+            ReleaseAction::Status => {
+                std::process::exit(cmd_release_status(cli.json));
+            }
+            ReleaseAction::Merge { ticket } => {
+                std::process::exit(cmd_release_merge(cli.json, &ticket));
+            }
+            ReleaseAction::Drop { ticket } => {
+                std::process::exit(cmd_release_drop(cli.json, &ticket));
+            }
+            ReleaseAction::Finish => {
+                std::process::exit(cmd_release_finish(cli.json));
+            }
+            ReleaseAction::Abandon => {
+                std::process::exit(cmd_release_abandon(cli.json));
             }
         },
     }
