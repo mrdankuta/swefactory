@@ -115,6 +115,33 @@ factory start 11                                # worktree + branch + brief
 factory --json reconcile                        # machine-parseable drift report
 ```
 
+## Dispatch loop
+
+`factory dispatch` runs single scheduling passes that move a ready ticket
+through implement, verify, and review. It never lands and never touches
+`dev`/`main` — accepted tickets wait for a human land; worktrees are cut
+from `HEAD` and removed afterwards.
+
+```sh
+factory dispatch once          # implement → verify → review one pass
+factory dispatch once --dry-run # survey only: no worktrees, subprocesses, or writes
+factory dispatch status        # attempts + worktrees + STOP state
+factory dispatch stop          # halt the loop (later `once` exits 0)
+factory dispatch resume        # restart the loop after a stop
+factory --json dispatch status # machine-parseable ledger
+```
+
+State lives in `factory/.state/` (`dispatch.json` attempt ledger,
+`logs/` per-attempt structured logs, `worktrees/` isolated per-attempt
+worktrees, `STOP` halt flag). Every attempt runs with its own
+`FACTORY_SLOT` and private `TMPDIR`, forwarded to the implementer, the
+check adapter, and the reviewer — concurrent workers share no databases,
+ports, or temp dirs. Attempt statuses:
+`impl_running → impl_done|impl_failed → review_running →
+review_done|review_failed`. Knobs: `MAX_CONCURRENT=1`,
+`MAX_ATTEMPTS=2`, `PI_BIN`/`FACTORY_PI_BIN` (implementer binary),
+`FACTORY_CHECK_ADAPTER`, `FACTORY_STATE_DIR` (state root override).
+
 All GitHub access shells out to the `gh` CLI (same as the bash parity
 target); there is no API client code. `FACTORY_GH_BIN` / `FACTORY_GIT_BIN`
 override the binaries under test. `reconcile` never writes: no issue
