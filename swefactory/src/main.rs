@@ -159,6 +159,10 @@ enum DispatchAction {
     Stop,
     /// Restart the loop after a stop.
     Resume,
+    /// Hermetic proof of the release mechanics (temp bare origin, no gh,
+    /// no network, no tokens, no spend). Every failure names the mechanics
+    /// that broke and exits non-zero.
+    SelfTest,
 }
 
 #[derive(Serialize)]
@@ -2128,6 +2132,522 @@ fn cmd_dispatch_resume(json: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// HERMETIC SELF-TEST (ticket #15)
+//
+// The parity oracle: a hermetic proof of the release mechanics — temp bare
+// origin, no gh, no network, no tokens, no spend. It drives the real
+// `release` subcommands as child processes of this binary against a scratch
+// clone, so green here is what parity means. Every step names the mechanics
+// it proves; any failure prints FAIL with want/got and the run exits
+// non-zero with SELF-TEST FAILURES. A gh-bomb script (records any call,
+// exits 1) stands in for `gh`: a clean run proves the mechanics never
+// needed it.
+// ---------------------------------------------------------------------------
+
+struct SelfTest {
+    exe: PathBuf,
+    proj: PathBuf,
+    state: PathBuf,
+    gh_bomb: PathBuf,
+    gh_log: PathBuf,
+    json: bool,
+    checks: Vec<(String, bool)>,
+}
+
+impl SelfTest {
+    fn pass(&mut self, name: &str) {
+        self.checks.push((name.to_string(), true));
+        if self.json {
+            eprintln!("PASS: {name}");
+        } else {
+            println!("PASS: {name}");
+        }
+    }
+
+    fn fail(&mut self, name: &str, want: &str, got: &str) {
+        self.checks.push((name.to_string(), false));
+        if self.json {
+            eprintln!("FAIL: {name} (want [{want}] got [{got}])");
+        } else {
+            println!("FAIL: {name} (want [{want}] got [{got}])");
+        }
+    }
+
+    fn check(&mut self, name: &str, ok: bool, want: &str, got: String) {
+        if ok {
+            self.pass(name);
+        } else {
+            self.fail(name, want, &got);
+        }
+    }
+
+    fn base_env(&self, cmd: &mut Command) {
+        cmd.env("FACTORY_STATE_DIR", &self.state)
+            .env("FACTORY_GH_BIN", &self.gh_bomb)
+            .env("GH_BOMB_LOG", &self.gh_log)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "selftest")
+            .env("GIT_AUTHOR_EMAIL", "selftest@local")
+            .env("GIT_COMMITTER_NAME", "selftest")
+            .env("GIT_COMMITTER_EMAIL", "selftest@local")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_HOST")
+            .env_remove("GITHUB_API_URL");
+    }
+
+    /// Run `factory <args...>` as a child with cwd=proj + hermetic env.
+    fn factory(&self, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new(&self.exe);
+        cmd.args(args).current_dir(&self.proj);
+        self.base_env(&mut cmd);
+        cmd.output().expect("self-test child factory must spawn")
+    }
+
+    /// Run `git <args...>` in `dir` with hermetic env.
+    fn git(&self, dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new(git_bin());
+        cmd.args(args).current_dir(dir);
+        self.base_env(&mut cmd);
+        cmd.output().expect("self-test git must spawn")
+    }
+}
+
+fn selftest_text(out: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// One-line failure evidence: exit code + first stderr line.
+fn selftest_got(out: &std::process::Output, stderr: &str) -> String {
+    let code = out
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or("?".to_string());
+    let first = stderr.lines().next().unwrap_or("");
+    format!("exit={code} err={first}")
+}
+
+/// Parse `release: train <branch> cut from <base>` from start output.
+fn selftest_train(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("release: train "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Ledger with the DispatchLedger shape recording ticket branches on a train.
+fn write_selftest_ledger(state: &std::path::Path, entries: &[(u64, &str, &str)]) {
+    let _ = std::fs::create_dir_all(state);
+    let attempts: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (ticket, branch, train))| {
+            serde_json::json!({
+                "id": i as u64 + 1,
+                "ticket": ticket,
+                "attempt_no": 1,
+                "base_commit": "selftest",
+                "head_commit": "selftest",
+                "branch": branch,
+                "worktree": "",
+                "status": "review_done",
+                "exit_code": 0,
+                "log_path": "",
+                "started_at": "selftest",
+                "finished_at": "selftest",
+                "train_branch": train,
+            })
+        })
+        .collect();
+    let _ = std::fs::write(
+        state.join("dispatch.json"),
+        serde_json::json!({"attempts": attempts}).to_string(),
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_dispatch_selftest(json: bool) -> i32 {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("factory"));
+    let tmp = std::env::temp_dir().join(format!(
+        "swefactory-selftest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let origin = tmp.join("origin.git");
+    let proj = tmp.join("proj");
+    let state = tmp.join("state");
+    let gh_bomb = tmp.join("gh-bomb.sh");
+    let gh_log = tmp.join("gh-bomb.log");
+
+    // Summary + cleanup: exactly one stdout shape per mode, temp dir always
+    // removed before returning.
+    let finish = |st: &SelfTest, tmp: &std::path::Path| -> i32 {
+        let failed = st.checks.iter().filter(|(_, ok)| !ok).count();
+        if json {
+            let checks: Vec<serde_json::Value> = st
+                .checks
+                .iter()
+                .map(|(name, ok)| serde_json::json!({"name": name, "ok": ok}))
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({"passed": failed == 0, "checks": checks})
+            );
+            if failed == 0 {
+                eprintln!("SELF-TEST ALL PASS");
+            } else {
+                eprintln!("SELF-TEST FAILURES ({failed} mechanics broke)");
+            }
+        } else if failed == 0 {
+            println!("SELF-TEST ALL PASS");
+        } else {
+            println!("SELF-TEST FAILURES ({failed} mechanics broke)");
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+        if failed == 0 {
+            0
+        } else {
+            1
+        }
+    };
+
+    let mut st = SelfTest {
+        exe,
+        proj: proj.clone(),
+        state: state.clone(),
+        gh_bomb: gh_bomb.clone(),
+        gh_log: gh_log.clone(),
+        json,
+        checks: Vec::new(),
+    };
+
+    // --- scratch setup: bare origin + clone on dev, pushed locally ---
+    // (file remote only: no network can be involved).
+    let setup_ok = (|| {
+        std::fs::create_dir_all(&proj).ok()?;
+        std::fs::create_dir_all(&state).ok()?;
+        std::fs::write(
+            &gh_bomb,
+            "#!/bin/sh\necho \"GH CALLED: $*\" >> \"$GH_BOMB_LOG\"\nexit 1\n",
+        )
+        .ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh_bomb, std::fs::Permissions::from_mode(0o755)).ok()?;
+        }
+        let origin_s = origin.to_string_lossy().into_owned();
+        let proj_s = proj.to_string_lossy().into_owned();
+        if !st
+            .git(&tmp, &["init", "--bare", "-q", &origin_s])
+            .status
+            .success()
+        {
+            return None;
+        }
+        if !st
+            .git(&tmp, &["init", "-q", "-b", "dev", &proj_s])
+            .status
+            .success()
+        {
+            return None;
+        }
+        std::fs::write(proj.join("seed.txt"), "seed\n").ok()?;
+        for args in [&["add", "-A"][..], &["commit", "-qm", "seed selftest"][..]] {
+            if !st.git(&proj, args).status.success() {
+                return None;
+            }
+        }
+        if !st
+            .git(&proj, &["remote", "add", "origin", &origin_s])
+            .status
+            .success()
+        {
+            return None;
+        }
+        if !st
+            .git(&proj, &["push", "-q", "origin", "dev"])
+            .status
+            .success()
+        {
+            return None;
+        }
+        Some(())
+    })();
+    if setup_ok.is_none() {
+        st.fail(
+            "scratch setup",
+            "bare origin + dev pushed locally",
+            "git failed",
+        );
+        return finish(&st, &tmp);
+    }
+
+    // --- start cuts the train ---
+    let out = st.factory(&["release", "start", "proof"]);
+    let (stdout, _stderr) = selftest_text(&out);
+    let train = selftest_train(&stdout);
+    st.check(
+        "start cuts train",
+        out.status.success() && train.starts_with("integration/") && train.ends_with("-proof"),
+        "integration/<date>-proof",
+        if train.is_empty() {
+            selftest_got(&out, &stdout)
+        } else {
+            train.clone()
+        },
+    );
+
+    // --- a second train is refused while one is open ---
+    let out = st.factory(&["release", "start", "again"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "second train refused",
+        !out.status.success() && stderr.contains("already open"),
+        "refused (already open)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- status shows the open train ---
+    let out = st.factory(&["release", "status"]);
+    let (stdout, stderr) = selftest_text(&out);
+    st.check(
+        "status shows open train",
+        out.status.success() && !train.is_empty() && stdout.contains(&train),
+        &format!("status listing {train}"),
+        selftest_got(&out, &stderr),
+    );
+
+    // --- clean merge ---
+    st.git(&proj, &["checkout", "-qb", "factory/T1-demo"]);
+    let _ = std::fs::write(proj.join("f.txt"), "eleven\n");
+    st.git(&proj, &["add", "-A"]);
+    st.git(&proj, &["commit", "-qm", "feat(T1): demo"]);
+    st.git(&proj, &["checkout", "-q", "dev"]);
+    write_selftest_ledger(&state, &[(1, "factory/T1-demo", &train)]);
+    let out = st.factory(&["release", "merge", "1"]);
+    let (stdout, stderr) = selftest_text(&out);
+    st.check(
+        "merge clean",
+        out.status.success() && stdout.contains("merged"),
+        "merged",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- merge commit present on the train ---
+    let log = st.git(&proj, &["log", "--oneline", &train]);
+    let (log_out, _) = selftest_text(&log);
+    st.check(
+        "merge commit present",
+        log.status.success() && log_out.contains("Merge ticket #1"),
+        "Merge ticket #1 in train log",
+        log_out.lines().next().unwrap_or("(empty log)").to_string(),
+    );
+
+    // --- drop reverts the merge ---
+    let out = st.factory(&["release", "drop", "1"]);
+    let (stdout, stderr) = selftest_text(&out);
+    st.check(
+        "drop reverts",
+        out.status.success() && stdout.contains("dropped"),
+        "dropped",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- drop idempotence: a second drop fails loudly, never silently ---
+    let out = st.factory(&["release", "drop", "1"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "drop-idempotence refusal",
+        !out.status.success() && stderr.contains("NOT merged"),
+        "refused (NOT merged)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- conflict-abort: ticket and train sides collide on one file ---
+    st.git(&proj, &["checkout", "-qb", "factory/T2-conf"]);
+    let _ = std::fs::write(proj.join("c.txt"), "ticket-side\n");
+    st.git(&proj, &["add", "-A"]);
+    st.git(&proj, &["commit", "-qm", "ticket side"]);
+    st.git(&proj, &["checkout", "-q", "dev"]);
+    let twt = state.join("train-worktree");
+    if twt.is_dir() {
+        let _ = std::fs::write(twt.join("c.txt"), "train-side\n");
+        st.git(&twt, &["add", "-A"]);
+        st.git(&twt, &["commit", "-qm", "train-side"]);
+    }
+    let head_before = st.git(&proj, &["rev-parse", &train]);
+    let (head_before_s, _) = selftest_text(&head_before);
+    let head_before_s = head_before_s.trim().to_string();
+    write_selftest_ledger(
+        &state,
+        &[
+            (1, "factory/T1-demo", &train),
+            (2, "factory/T2-conf", &train),
+        ],
+    );
+    let out = st.factory(&["release", "merge", "2"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "conflict-abort refuses merge",
+        !out.status.success() && stderr.contains("conflicted"),
+        "refused (conflicted)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- the aborted conflict leaves head + worktree clean ---
+    let head_after = st.git(&proj, &["rev-parse", &train]);
+    let (head_after_s, _) = selftest_text(&head_after);
+    let head_after_s = head_after_s.trim().to_string();
+    let porcelain = st.git(&twt, &["status", "--porcelain"]);
+    let (porcelain_s, _) = selftest_text(&porcelain);
+    st.check(
+        "train clean after abort",
+        !head_before_s.is_empty()
+            && head_before_s == head_after_s
+            && porcelain.status.success()
+            && porcelain_s.trim().is_empty(),
+        &format!("head={head_before_s} worktree clean"),
+        format!("head={head_after_s} porcelain={}", porcelain_s.trim()),
+    );
+
+    // --- status still runs after the abort ---
+    let out = st.factory(&["release", "status"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "status runs after abort",
+        out.status.success(),
+        "exit 0",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- finish refuses an unmerged train: the human must merge first ---
+    let out = st.factory(&["release", "finish"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "finish unmerged refusal",
+        !out.status.success() && stderr.contains("not merged"),
+        "refused (not merged)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- human merges the train into dev (automation never does this) ---
+    st.git(&proj, &["checkout", "-q", "dev"]);
+    st.git(
+        &proj,
+        &[
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            "human lands train",
+            &train,
+        ],
+    );
+    let out = st.factory(&["release", "finish"]);
+    let (stdout, stderr) = selftest_text(&out);
+    let train_closed = !state.join("train.json").is_file();
+    st.check(
+        "finish merged close",
+        out.status.success()
+            && stdout.contains("merged into dev")
+            && stdout.contains("git branch -d")
+            && train_closed,
+        "merged into dev + cleanup + train closed",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- finish with no open train is refused ---
+    let out = st.factory(&["release", "finish"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "finish no-train refusal",
+        !out.status.success() && stderr.contains("no open train"),
+        "refused (no open train)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- abandon with no open train is refused ---
+    let out = st.factory(&["release", "abandon"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "abandon refuses with no train",
+        !out.status.success() && stderr.contains("no open train"),
+        "refused (no open train)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- a new train starts after the finish ---
+    let out = st.factory(&["release", "start", "proof2"]);
+    let (stdout, _stderr) = selftest_text(&out);
+    let train2 = selftest_train(&stdout);
+    st.check(
+        "train restarts after finish",
+        out.status.success() && train2.starts_with("integration/") && train2.ends_with("-proof2"),
+        "integration/<date>-proof2",
+        if train2.is_empty() {
+            selftest_got(&out, &stdout)
+        } else {
+            train2.clone()
+        },
+    );
+
+    // --- abandon closes the unmerged train without a merge check ---
+    let out = st.factory(&["release", "abandon"]);
+    let (stdout, stderr) = selftest_text(&out);
+    let abandoned_closed = !state.join("train.json").is_file();
+    st.check(
+        "abandon closes unmerged train",
+        out.status.success() && stdout.contains("abandoned") && abandoned_closed,
+        "abandoned + train closed",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- abandon prints cleanup but never deletes the branch ---
+    let branch = st.git(&proj, &["rev-parse", "--verify", "--quiet", &train2]);
+    st.check(
+        "abandon never deletes branches",
+        !train2.is_empty() && branch.status.success(),
+        &format!("{train2} still exists"),
+        if train2.is_empty() {
+            "(no train2)".to_string()
+        } else {
+            format!("{train2} deleted")
+        },
+    );
+
+    // --- a second abandon is refused ---
+    let out = st.factory(&["release", "abandon"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    st.check(
+        "second abandon refused",
+        !out.status.success() && stderr.contains("no open train"),
+        "refused (no open train)",
+        selftest_got(&out, &stderr),
+    );
+
+    // --- the gh bomb never fired: the mechanics needed no gh ---
+    let bomb = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    st.check(
+        "no gh invoked",
+        bomb.trim().is_empty(),
+        "gh never called",
+        bomb.lines().next().unwrap_or("(empty)").to_string(),
+    );
+
+    finish(&st, &tmp)
+}
+
+// ---------------------------------------------------------------------------
 // RELEASE TRAIN (ticket #14)
 //
 // SAFETY CONTRACT (asserted in tests/cli_release.rs, not just documented):
@@ -2831,6 +3351,9 @@ fn run() -> i32 {
             }
             DispatchAction::Resume => {
                 std::process::exit(cmd_dispatch_resume(cli.json));
+            }
+            DispatchAction::SelfTest => {
+                std::process::exit(cmd_dispatch_selftest(cli.json));
             }
         },
         Commands::Release { action } => match action {
