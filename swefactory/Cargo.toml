@@ -28,6 +28,11 @@ resolver = "2"
 # cargo-dist release pipeline (ticket #12): a pushed v* tag ships
 # per-platform tarballs plus shell/PowerShell installers and a Homebrew
 # formula. Linux builds target musl for a fully static binary.
+# Release profile for cargo-dist builds (what `dist init` generates).
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [workspace.metadata.dist]
 cargo-dist-version = "0.33.0"
 # CI is hand-maintained (product lives in swefactory/, not repo root,
