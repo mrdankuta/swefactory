@@ -629,3 +629,246 @@ fn no_api_client_dependency_for_dispatch() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// DAEMON MODE (ticket #16): `dispatch daemon [--interval N]` loops single
+// passes until the STOP file appears — the Rust port of the bash
+// `factory-dispatch daemon` loop. Same seams as above; the fake `gh` gains
+// a STOP-after-N-lists hook (via $GH_STOP_AFTER_LISTS) so the loop always
+// terminates hermetically with --interval 0.
+// ---------------------------------------------------------------------------
+
+/// Fake `gh` for daemon tests: identical survey behaviour to `write_fake_gh`,
+/// plus creates $FACTORY_STATE_DIR/STOP after the Nth `issue list` call
+/// (when $GH_STOP_AFTER_LISTS is set), so `daemon --interval 0` terminates.
+fn write_daemon_gh(dir: &Path) -> PathBuf {
+    write_exe(
+        dir,
+        "gh",
+        r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done >> "$GH_LOG"
+printf -- '---\n' >> "$GH_LOG"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  count_file="$STATE_COUNT_DIR/list.count"
+  n=0; [ -f "$count_file" ] && n=$(cat "$count_file")
+  n=$((n + 1)); echo "$n" > "$count_file"
+  if [ -n "${GH_STOP_AFTER_LISTS:-}" ] && [ "$n" -ge "$GH_STOP_AFTER_LISTS" ]; then
+    mkdir -p "$FACTORY_STATE_DIR"
+    touch "$FACTORY_STATE_DIR/STOP"
+  fi
+  printf '%s' "$GH_LIST_JSON"; exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then cat "$GH_VIEWS_DIR/$3.json"; exit 0; fi
+exit 0
+"#,
+    )
+}
+
+struct DaemonHarness {
+    inner: Harness,
+    count_dir: PathBuf,
+}
+
+fn setup_daemon(name: &str) -> DaemonHarness {
+    let root = tmpdir(name);
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git_repo(&repo);
+    let views = root.join("views");
+    fs::create_dir_all(&views).unwrap();
+    let count_dir = root.join("counts");
+    fs::create_dir_all(&count_dir).unwrap();
+    let gh_log = root.join("gh.log");
+    let git_log = root.join("git.log");
+    let pi_log = root.join("pi.log");
+    let adapter_log = root.join("adapter.log");
+    let gh = write_daemon_gh(&root);
+    let git_shim = write_git_shim(&root);
+    let pi = write_fake_pi(&root);
+    let adapter = write_fake_adapter(&root);
+    for p in [&gh_log, &git_log, &pi_log, &adapter_log] {
+        fs::write(p, "").unwrap();
+    }
+    let state = root.join("state");
+    let inner = Harness {
+        repo,
+        state,
+        views,
+        gh_log,
+        git_log,
+        pi_log,
+        adapter_log,
+        gh,
+        git_shim,
+        pi,
+        adapter,
+    };
+    DaemonHarness { inner, count_dir }
+}
+
+fn daemon_cmd(h: &DaemonHarness, args: &[&str]) -> Command {
+    let mut cmd = dispatch_cmd(&h.inner, args);
+    cmd.env("STATE_COUNT_DIR", &h.count_dir);
+    cmd
+}
+
+#[test]
+fn dispatch_daemon_halts_on_stop_and_resumes() {
+    let h = setup_daemon("daemon-stop");
+    write_view(
+        &h.inner,
+        11,
+        "Demo widget",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    // STOP present: daemon exits 0 without work (same semantics as bash).
+    dispatch_cmd(&h.inner, &["dispatch", "stop"])
+        .assert()
+        .success();
+    assert!(h.inner.state.join("STOP").is_file());
+    fs::write(&h.inner.gh_log, "").unwrap();
+    daemon_cmd(&h, &["dispatch", "daemon", "--interval", "0"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("STOP"));
+    assert!(
+        !h.inner.state.join("dispatch.json").is_file(),
+        "halted daemon records nothing"
+    );
+    assert!(
+        !gh_log(&h.inner).contains("view"),
+        "halted daemon must not read tickets:\n{}",
+        gh_log(&h.inner)
+    );
+    // Resume restarts the loop: one pass lands in the ledger.
+    dispatch_cmd(&h.inner, &["dispatch", "resume"])
+        .assert()
+        .success();
+    assert!(!h.inner.state.join("STOP").is_file());
+    let mut go = daemon_cmd(&h, &["dispatch", "daemon", "--interval", "0"]);
+    go.env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("GH_STOP_AFTER_LISTS", "1");
+    go.assert().success();
+    assert!(
+        h.inner.state.join("dispatch.json").is_file(),
+        "resumed daemon processes tickets"
+    );
+}
+
+#[test]
+fn dispatch_daemon_pass_matches_once_ledger() {
+    let h = setup_daemon("daemon-parity");
+    write_view(
+        &h.inner,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = daemon_cmd(&h, &["dispatch", "daemon", "--interval", "0"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("GH_STOP_AFTER_LISTS", "1");
+    cmd.assert().success();
+    // Indistinguishable from a manual `once`: same ledger shape + logs.
+    let ledger = fs::read_to_string(h.inner.state.join("dispatch.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "ledger:\n{ledger}");
+    let a = &attempts[0];
+    assert_eq!(a.get("ticket").and_then(|v| v.as_u64()), Some(11));
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{ledger}"
+    );
+    let head = a.get("head_commit").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(!head.is_empty(), "head commit must be recorded");
+    assert_ne!(
+        head,
+        a.get("base_commit").and_then(|v| v.as_str()).unwrap_or(""),
+        "head must advance past base"
+    );
+    let gh = gh_log(&h.inner);
+    assert!(gh.contains("comment"), "must post progress comments:\n{gh}");
+    assert!(gh.contains("accepted"), "must apply accepted label:\n{gh}");
+    let logs: Vec<_> = fs::read_dir(h.inner.state.join("logs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(!logs.is_empty(), "per-attempt logs must exist");
+    let leftover: Vec<_> = fs::read_dir(h.inner.state.join("worktrees"))
+        .map(|rd| rd.filter_map(|e| e.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "worktrees must be cleaned up: {leftover:?}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h.inner), &gh);
+}
+
+#[test]
+fn dispatch_daemon_loops_back_to_back_honoring_capacity() {
+    let h = setup_daemon("daemon-loop");
+    write_view(
+        &h.inner,
+        11,
+        "First widget",
+        "Build one.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    write_view(
+        &h.inner,
+        12,
+        "Second widget",
+        "Build two.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    // NOTE: one `once` pass drains every ready ticket sequentially (capacity
+    // only caps *concurrent active* attempts), so MAX_ATTEMPTS=1 pins the
+    // ledger at 2 attempts while the list-count proves two passes ran.
+    let mut cmd = daemon_cmd(&h, &["dispatch", "daemon", "--interval", "0"]);
+    cmd.env("MAX_CONCURRENT", "1")
+        .env("MAX_ATTEMPTS", "1")
+        .env("GH_LIST_JSON", r#"[{"number":11},{"number":12}]"#)
+        .env("GH_STOP_AFTER_LISTS", "2");
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("STOP"));
+    let lists = fs::read_to_string(h.count_dir.join("list.count")).unwrap_or_default();
+    assert_eq!(
+        lists.trim(),
+        "2",
+        "daemon must loop a second pass back-to-back before halting"
+    );
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(h.inner.state.join("dispatch.json")).unwrap())
+            .unwrap();
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 2, "both tickets attempted:\n{ledger}");
+    let mut tickets: Vec<u64> = attempts
+        .iter()
+        .filter_map(|a| a.get("ticket").and_then(|v| v.as_u64()))
+        .collect();
+    tickets.sort();
+    assert_eq!(tickets, vec![11, 12]);
+    // Slots are per-pass: the same single slot is reused across passes.
+    let pi = fs::read_to_string(&h.inner.pi_log).unwrap();
+    assert!(
+        pi.contains("slot:T11") && pi.contains("slot:T12"),
+        "each pass owns its slot:\n{pi}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h.inner), &gh_log(&h.inner));
+}
+
+#[test]
+fn dispatch_daemon_rejects_bad_interval() {
+    let h = setup_daemon("daemon-interval");
+    daemon_cmd(&h, &["dispatch", "daemon", "--interval", "abc"])
+        .assert()
+        .failure();
+}
