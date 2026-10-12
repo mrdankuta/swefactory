@@ -134,10 +134,17 @@ enum Commands {
     /// closes member tickets with the release note, removes the train
     /// worktree, and prints branch cleanup (never executed). With
     /// --dry-run, prints the full mutation plan and changes nothing.
+    /// With --train, lands the named branch instead of the open train;
+    /// an already-merged branch is verified (merged-elsewhere check) and
+    /// not re-merged. Land never runs under automation: a dispatcher
+    /// context refuses with a plain-English error before anything else.
     Land {
         /// Preview every mutation without changing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Land this train branch instead of the open train.
+        #[arg(long, value_name = "BRANCH")]
+        train: Option<String>,
     },
 }
 
@@ -3906,8 +3913,8 @@ fn run() -> i32 {
                 std::process::exit(cmd_release_abandon(cli.json));
             }
         },
-        Commands::Land { dry_run } => {
-            std::process::exit(cmd_land(cli.json, dry_run));
+        Commands::Land { dry_run, train } => {
+            std::process::exit(cmd_land(cli.json, dry_run, train));
         }
     }
 }
@@ -4120,39 +4127,122 @@ fn land_release_note(train: &str) -> String {
     )
 }
 
-fn cmd_land(json: bool, dry_run: bool) -> i32 {
+/// Dispatcher-context detector: land is human-owned and must never run
+/// under automation. Dispatch attempt phases export FACTORY_SLOT for
+/// isolation (see run_phase), so its presence marks a dispatcher-owned
+/// process tree. FACTORY_DISPATCHER / FACTORY_DISPATCH are explicit
+/// overrides for future automation callers.
+fn land_under_automation() -> bool {
+    for key in ["FACTORY_SLOT", "FACTORY_DISPATCHER", "FACTORY_DISPATCH"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn land_refusal() -> String {
+    "land: refusing to run under automation — landing is human-owned. The dispatcher must never invoke `factory land`; ask a human to run it."
+        .to_string()
+}
+
+fn cmd_land(json: bool, dry_run: bool, train_opt: Option<String>) -> i32 {
     let state = dispatch_state_dir();
-    let Some(train) = load_open_train(&state) else {
-        eprintln!("land: no open train — cut one with `release start` first");
-        return 1;
-    };
-    if !land_working_tree_clean() {
-        eprintln!(
-            "land: working tree is dirty — commit or stash before landing {}",
-            train.branch
-        );
+
+    // Human-owned invariant: automation must never invoke land, not even
+    // --dry-run (invoking it IS the approval). Refuse before anything else.
+    if land_under_automation() {
+        let msg = land_refusal();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": train_opt.clone().unwrap_or_default(),
+                    "dry_run": dry_run,
+                    "steps": [{"step": "preflight", "status": "refused", "detail": msg}],
+                })
+            );
+        }
+        eprintln!("{msg}");
         return 1;
     }
-    if let Err(e) = land_run_checks(&train.branch) {
+
+    // Target train: explicit --train wins, else the open train. A named
+    // branch outside the open record must still exist locally.
+    let open = load_open_train(&state);
+    let target: String = match train_opt.clone() {
+        Some(b) => b,
+        None => match &open {
+            Some(t) => t.branch.clone(),
+            None => {
+                eprintln!("land: no open train — cut one with `release start` first");
+                return 1;
+            }
+        },
+    };
+    if open.as_ref().map(|t| t.branch.as_str()) != Some(target.as_str()) && !branch_exists(&target)
+    {
+        eprintln!("land: train branch {target} not found — cut one with `release start` first");
+        return 1;
+    }
+    if !land_working_tree_clean() {
+        let msg = format!("land: working tree is dirty — commit or stash before landing {target}");
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": target,
+                    "dry_run": dry_run,
+                    "steps": [{"step": "preflight", "status": "failed", "detail": msg}],
+                })
+            );
+        }
+        eprintln!("{msg}");
+        return 1;
+    }
+    if let Err(e) = land_run_checks(&target) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": target,
+                    "dry_run": dry_run,
+                    "steps": [{"step": "preflight", "status": "failed", "detail": e}],
+                })
+            );
+        }
         eprintln!("{e}");
         return 1;
     }
     if !land_remote_reachable() {
-        eprintln!("land: remote origin unreachable — refusing before any mutation");
+        let msg = "land: remote origin unreachable — refusing before any mutation".to_string();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": target,
+                    "dry_run": dry_run,
+                    "steps": [{"step": "preflight", "status": "failed", "detail": msg}],
+                })
+            );
+        }
+        eprintln!("{msg}");
         return 1;
     }
     let ledger = load_ledger(&state);
-    let tickets = member_tickets(&ledger, &train.branch);
-    let members = member_branches(&ledger, &train.branch);
-    let cleanup = cleanup_lines(&train.branch, &members);
-    let merge_msg = format!("Merge {} into dev", train.branch);
-    let note = land_release_note(&train.branch);
+    let tickets = member_tickets(&ledger, &target);
+    let members = member_branches(&ledger, &target);
+    let cleanup = cleanup_lines(&target, &members);
+    let merge_msg = format!("Merge {target} into dev");
+    let note = land_release_note(&target);
     if dry_run {
         if json {
             println!(
                 "{}",
                 serde_json::json!({
-                    "train": train.branch,
+                    "train": target,
                     "dry_run": true,
                     "preflight": "ok",
                     "merge": merge_msg,
@@ -4160,15 +4250,19 @@ fn cmd_land(json: bool, dry_run: bool) -> i32 {
                     "close": tickets,
                     "note": note,
                     "cleanup": cleanup,
+                    "steps": [
+                        {"step": "preflight", "status": "ok"},
+                        {"step": "merge", "status": "planned", "detail": merge_msg},
+                        {"step": "push", "status": "planned", "detail": "origin dev"},
+                        {"step": "closes", "status": "planned", "closed": tickets},
+                        {"step": "cleanup", "status": "planned", "cleanup": cleanup},
+                    ],
                 })
             );
         } else {
-            println!("land: dry-run plan for {} (no changes made)", train.branch);
+            println!("land: dry-run plan for {target} (no changes made)");
             println!("  git checkout dev");
-            println!(
-                "  git merge --no-ff --no-edit -m \"{merge_msg}\" {}",
-                train.branch
-            );
+            println!("  git merge --no-ff --no-edit -m \"{merge_msg}\" {target}");
             println!("  git push origin dev");
             for t in &tickets {
                 println!("  gh issue close {t} --comment \"{note}\"");
@@ -4186,17 +4280,66 @@ fn cmd_land(json: bool, dry_run: bool) -> i32 {
     }
     // --- sequence: merge train→dev --no-ff → push dev → close members ---
     if let Err(e) = land_checkout_dev() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": target,
+                    "dry_run": false,
+                    "steps": [
+                        {"step": "preflight", "status": "ok"},
+                        {"step": "merge", "status": "failed", "detail": e},
+                    ],
+                })
+            );
+        }
         eprintln!("{e}");
         return 1;
     }
-    let dev_short = match land_merge_train(&train.branch, &merge_msg) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return 1;
+    // Merged-elsewhere / retry safety: a train already inside dev needs no
+    // new merge commit. Verify (same ancestor check `release finish` uses)
+    // and continue to push → closes → cleanup.
+    let already_merged = train_merged_into_dev(&target);
+    let (dev_short, merge_status) = if already_merged {
+        (land_short(&train_head("dev")), "already-merged")
+    } else {
+        match land_merge_train(&target, &merge_msg) {
+            Ok(s) => (s, "ok"),
+            Err(e) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "train": target,
+                            "dry_run": false,
+                            "steps": [
+                                {"step": "preflight", "status": "ok"},
+                                {"step": "merge", "status": "failed", "detail": e},
+                            ],
+                        })
+                    );
+                }
+                eprintln!("{e}");
+                return 1;
+            }
         }
     };
     if let Err(e) = land_push_dev() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": target,
+                    "dry_run": false,
+                    "merge": dev_short,
+                    "steps": [
+                        {"step": "preflight", "status": "ok"},
+                        {"step": "merge", "status": merge_status, "detail": dev_short},
+                        {"step": "push", "status": "failed", "detail": e},
+                    ],
+                })
+            );
+        }
         eprintln!("{e}");
         return 1;
     }
@@ -4207,22 +4350,59 @@ fn cmd_land(json: bool, dry_run: bool) -> i32 {
             Ok(true) => closed.push(*t),
             Ok(false) => skipped.push(*t),
             Err(e) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "train": target,
+                            "dry_run": false,
+                            "merge": dev_short,
+                            "pushed": true,
+                            "closed": closed,
+                            "skipped": skipped,
+                            "steps": [
+                                {"step": "preflight", "status": "ok"},
+                                {"step": "merge", "status": merge_status, "detail": dev_short},
+                                {"step": "push", "status": "ok"},
+                                {"step": "closes", "status": "failed", "detail": e, "closed": closed, "skipped": skipped},
+                            ],
+                        })
+                    );
+                }
                 eprintln!("{e}");
                 return 1;
             }
         }
     }
     // Same state path `release finish` uses: drop the train worktree,
-    // close the train record, print cleanup (never execute it).
+    // close the train record, print cleanup (never execute it). A named
+    // --train that is not the open train leaves the open record alone.
     remove_train_worktree(&state);
-    clear_train(&state);
+    if open.as_ref().map(|t| t.branch.as_str()) == Some(target.as_str()) {
+        clear_train(&state);
+    }
     if json {
         println!(
             "{}",
-            serde_json::json!({"train": train.branch, "dry_run": false, "merge": dev_short, "pushed": true, "closed": closed, "skipped": skipped, "cleanup": cleanup})
+            serde_json::json!({
+                "train": target,
+                "dry_run": false,
+                "merge": dev_short,
+                "pushed": true,
+                "closed": closed,
+                "skipped": skipped,
+                "cleanup": cleanup,
+                "steps": [
+                    {"step": "preflight", "status": "ok"},
+                    {"step": "merge", "status": merge_status, "detail": dev_short},
+                    {"step": "push", "status": "ok"},
+                    {"step": "closes", "status": "ok", "closed": closed, "skipped": skipped},
+                    {"step": "cleanup", "status": "ok", "cleanup": cleanup},
+                ],
+            })
         );
-    } else {
-        println!("land: merged {} into dev ({dev_short})", train.branch);
+    } else if already_merged {
+        println!("land: {target} already merged into dev ({dev_short}) — verified merged elsewhere, skipping merge");
         println!("land: pushed dev to origin");
         for t in &closed {
             println!("land: closed #{t}");
@@ -4230,7 +4410,21 @@ fn cmd_land(json: bool, dry_run: bool) -> i32 {
         for t in &skipped {
             println!("land: #{t} already closed, skipping");
         }
-        println!("land: train {} landed into dev", train.branch);
+        println!("land: train {target} landed into dev");
+        println!("cleanup (human runs these, automation never deletes):");
+        for line in &cleanup {
+            println!("  {line}");
+        }
+    } else {
+        println!("land: merged {target} into dev ({dev_short})");
+        println!("land: pushed dev to origin");
+        for t in &closed {
+            println!("land: closed #{t}");
+        }
+        for t in &skipped {
+            println!("land: #{t} already closed, skipping");
+        }
+        println!("land: train {target} landed into dev");
         println!("cleanup (human runs these, automation never deletes):");
         for line in &cleanup {
             println!("  {line}");
