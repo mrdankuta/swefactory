@@ -153,6 +153,13 @@ enum DispatchAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Loop single passes on the interval until the STOP file appears
+    /// (Rust port of the bash `factory-dispatch daemon` loop).
+    Daemon {
+        /// Seconds to sleep between passes.
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+    },
     /// Show attempts + worktrees + STOP state.
     Status,
     /// Halt the loop: later `once` runs exit 0 without work.
@@ -2051,6 +2058,34 @@ fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
     0
 }
 
+fn cmd_dispatch_daemon(json: bool, interval: u64) -> i32 {
+    let state = dispatch_state_dir();
+    println!("dispatch daemon every {interval}s (STOP with: factory dispatch stop)");
+    if json {
+        println!(r#"{{"daemon":true,"interval":{interval}}}"#);
+    }
+    loop {
+        // Each pass is exactly `dispatch once`: same ledger, same logs,
+        // same MAX_CONCURRENT slots. The lock is per-pass (acquired and
+        // released inside `cmd_dispatch_once`), so concurrent `once`
+        // processes share slots with the daemon exactly as they do today.
+        let code = cmd_dispatch_once(json, false);
+        if code != 0 {
+            // Transient failure: report and retry next interval instead of
+            // killing autonomous operation (bash `set -e` would abort here;
+            // continuing is the load-bearing choice for daemon mode).
+            eprintln!("dispatch daemon: pass exited {code} — retrying in {interval}s");
+        }
+        if state.join("STOP").is_file() {
+            println!("dispatch: STOP file present — daemon halting");
+            return 0;
+        }
+        if interval > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(interval));
+        }
+    }
+}
+
 fn cmd_dispatch_status(json: bool) -> i32 {
     let state = dispatch_state_dir();
     let ledger = load_ledger(&state);
@@ -3342,6 +3377,9 @@ fn run() -> i32 {
         Commands::Dispatch { action } => match action {
             DispatchAction::Once { dry_run } => {
                 std::process::exit(cmd_dispatch_once(cli.json, dry_run));
+            }
+            DispatchAction::Daemon { interval } => {
+                std::process::exit(cmd_dispatch_daemon(cli.json, interval));
             }
             DispatchAction::Status => {
                 std::process::exit(cmd_dispatch_status(cli.json));
