@@ -20,10 +20,19 @@ struct Cli {
     command: Commands,
 }
 
+/// Project files `factory status` treats as project presence.
+const STATUS_PROJECT_FILES: &[&str] = &["AGENTS.md", "GLOSSARY.md", "scripts/factory-check"];
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Print the factory version.
     Version,
+    /// One-screen factory health: version, project files, open train,
+    /// live attempts, STOP state. Read-only: observing changes nothing.
+    /// Exit 0 whenever the state was read successfully (even when empty);
+    /// nonzero only on unreadable state (missing/corrupt ledger) with the
+    /// cause named. The global --json flag selects machine output.
+    Status,
     /// Seed the factory into the current project (idempotent, never clobbers).
     Init {
         /// Check-adapter stack to install.
@@ -2582,6 +2591,174 @@ fn cmd_dispatch_daemon(json: bool, interval: u64) -> i32 {
     }
 }
 
+/// Strict ledger read for `factory status`: unlike the dispatch loop's
+/// lenient default-empty load, an observer must say loudly when there is
+/// nothing readable to observe. Missing file and corrupt JSON both fail
+/// with the ledger path and the cause named. Never writes.
+fn load_ledger_strict(state: &std::path::Path) -> Result<DispatchLedger, String> {
+    let path = ledger_path(state);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("status: cannot read ledger {}: {e}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("status: cannot parse ledger {}: {e}", path.display()))
+}
+
+fn cmd_status(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let ledger = match load_ledger_strict(&state) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut files_present = Vec::new();
+    let mut files_missing = Vec::new();
+    for rel in STATUS_PROJECT_FILES {
+        if dest.join(rel).is_file() {
+            files_present.push(rel.to_string());
+        } else {
+            files_missing.push(rel.to_string());
+        }
+    }
+    let project_present = files_missing.is_empty();
+    let train = load_open_train(&state);
+    let stopped = state.join("STOP").is_file();
+
+    // Per-attempt facts: exactly what the dispatcher tracks, with the slot
+    // derived the same way the dispatcher derives it (T<ticket>-a<attempt>).
+    let attempts: Vec<serde_json::Value> = ledger
+        .attempts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "ticket": a.ticket,
+                "attempt": a.attempt_no,
+                "slot": format!("T{}-a{}", a.ticket, a.attempt_no),
+                "status": a.status,
+                "base": a.base_commit,
+                "head": a.head_commit,
+                "started": a.started_at,
+                "finished": a.finished_at,
+            })
+        })
+        .collect();
+    let train_value = match &train {
+        None => serde_json::json!({"open": false}),
+        Some(t) => {
+            let head = train_head(&t.branch);
+            let members = member_branches(&ledger, &t.branch);
+            serde_json::json!({
+                "open": true,
+                "train": t.branch,
+                "base": t.base_commit,
+                "status": t.status,
+                "head": head,
+                "members": members,
+            })
+        }
+    };
+
+    if json {
+        let mut files_map = serde_json::Map::new();
+        for rel in STATUS_PROJECT_FILES {
+            files_map.insert(
+                rel.to_string(),
+                serde_json::Value::Bool(!files_missing.iter().any(|m| m == rel)),
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": version,
+                "project": {
+                    "present": project_present,
+                    "files": files_map,
+                    "missing": files_missing,
+                },
+                "train": train_value,
+                "attempts": attempts,
+                "stopped": stopped,
+            })
+        );
+        return 0;
+    }
+
+    println!("factory {version}");
+    if project_present {
+        println!(
+            "project: factory project files present ({}).",
+            files_present.join(", ")
+        );
+    } else {
+        println!(
+            "project: not a fully seeded factory project (missing: {}).",
+            files_missing.join(", ")
+        );
+    }
+    match &train {
+        None => println!("train: no open train."),
+        Some(t) => {
+            let head = train_value
+                .get("head")
+                .and_then(|h| h.as_str())
+                .unwrap_or("");
+            let members = train_value
+                .get("members")
+                .and_then(|m| m.as_array())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let head_words = if head.is_empty() {
+                "head not present locally".to_string()
+            } else {
+                format!("head {}", head.chars().take(8).collect::<String>())
+            };
+            println!(
+                "train: release train {} is open and waiting for your merge ({head_words}, {members} member branches).",
+                t.branch
+            );
+        }
+    }
+    if ledger.attempts.is_empty() {
+        println!("attempts: no attempts yet.");
+    } else {
+        for a in &ledger.attempts {
+            let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+            match a.status.as_str() {
+                "impl_running" => println!(
+                    "Ticket {} attempt {} is being implemented (slot {}, started {}).",
+                    a.ticket, a.attempt_no, slot, a.started_at
+                ),
+                "review_running" => println!(
+                    "Ticket {} attempt {} is being reviewed (slot {}, started {}).",
+                    a.ticket, a.attempt_no, slot, a.started_at
+                ),
+                other => {
+                    if a.finished_at.is_empty() {
+                        println!(
+                            "Ticket {} attempt {} finished: {other} (slot {}, started {}).",
+                            a.ticket, a.attempt_no, slot, a.started_at
+                        );
+                    } else {
+                        println!(
+                            "Ticket {} attempt {} finished: {other} (slot {}, started {}, finished {}).",
+                            a.ticket, a.attempt_no, slot, a.started_at, a.finished_at
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if stopped {
+        println!("STOP: dispatch loop is halted (STOP file present).");
+    } else {
+        println!("STOP: dispatch loop running (no STOP file).");
+    }
+    0
+}
+
 fn cmd_dispatch_status(json: bool) -> i32 {
     let state = dispatch_state_dir();
     let ledger = load_ledger(&state);
@@ -3823,6 +4000,9 @@ fn run() -> i32 {
                 println!("{version}");
             }
             0
+        }
+        Commands::Status => {
+            std::process::exit(cmd_status(cli.json));
         }
         Commands::Init {
             stack,
