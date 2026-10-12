@@ -81,6 +81,11 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Pre-flight check: probe every prerequisite, report each in plain
+    /// English with its fix, exit nonzero when anything blocks.
+    /// Read-only: diagnosing never changes anything (safe repair is a
+    /// separate ticket). The global --json flag selects machine output.
+    Doctor,
     /// Post a handoff record to the ticket issue via the gh CLI.
     Handoff {
         /// Ticket issue number (e.g. 11 or #11).
@@ -717,6 +722,329 @@ fn run_check(json: bool, adapter: Option<PathBuf>, slot: Option<String>, args: V
         );
     }
     std::process::exit(if passed { 0 } else { code.max(1) })
+}
+
+// ---------------------------------------------------------------------------
+// DOCTOR (ticket #18: diagnose — checks + report + JSON)
+//
+// Pre-flight check over the catalogue in DOCTOR_ORDER. Every probe reads
+// the real environment through the existing shell-out seams (gh/git/pi
+// binaries, adapter discovery, state dir, PATH toolchain) — no API
+// client, no new seam. Doctor is read-only: it never writes files,
+// issues, pushes, or starts auth flows; failures carry the exact fix
+// command instead. `--fix` (safe local repair) is a separate ticket and
+// deliberately has no flag here. The catalogue lives in this one module
+// so later tickets (daemon supervision, policy files) extend DOCTOR_ORDER
+// without touching the runner.
+// ---------------------------------------------------------------------------
+
+/// Catalogue order. Stable machine names; automation may allowlist them.
+const DOCTOR_ORDER: &[&str] = &[
+    "gh-installed",
+    "gh-auth",
+    "gh-repo-access",
+    "git-identity",
+    "state-dirs",
+    "adapter-present",
+    "adapter-executable",
+    "toolchain",
+    "model-runner",
+];
+
+#[derive(Serialize, Clone)]
+struct DoctorCheck {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+    hint: String,
+}
+
+#[derive(Serialize)]
+struct DoctorOutput {
+    ok: bool,
+    checks: Vec<DoctorCheck>,
+}
+
+fn doctor_pass(name: &'static str, detail: String) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        ok: true,
+        detail,
+        hint: String::new(),
+    }
+}
+
+fn doctor_fail(name: &'static str, detail: String, hint: String) -> DoctorCheck {
+    DoctorCheck {
+        name,
+        ok: false,
+        detail,
+        hint,
+    }
+}
+
+/// Run `program args`, returning trimmed stdout on exit 0, None otherwise
+/// (including spawn failure, e.g. binary missing from PATH).
+fn probe_stdout(program: &str, args: &[&str]) -> Option<String> {
+    Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Resolve the check adapter exactly as the `check` runner does.
+fn doctor_adapter() -> Option<PathBuf> {
+    std::env::var_os("FACTORY_CHECK_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(discover_adapter)
+}
+
+#[cfg(unix)]
+fn path_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn path_is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn doctor_checks() -> Vec<DoctorCheck> {
+    let mut checks = Vec::with_capacity(DOCTOR_ORDER.len());
+
+    // gh-installed: the gh shell-out seam must answer.
+    let gh_version = probe_stdout(&gh_bin(), &["--version"]);
+    checks.push(match gh_version {
+        Some(v) => doctor_pass(
+            "gh-installed",
+            format!(
+                "GitHub CLI found ({}).",
+                v.split('\n').next().unwrap_or("gh")
+            ),
+        ),
+        None => doctor_fail(
+            "gh-installed",
+            format!("GitHub CLI not found (looked for `{}` on PATH).", gh_bin()),
+            "Install the GitHub CLI: https://cli.github.com — then re-run: factory doctor"
+                .to_string(),
+        ),
+    });
+
+    // gh-auth: login must be live.
+    let auth = probe_stdout(&gh_bin(), &["auth", "status"]);
+    checks.push(match auth {
+        Some(_) => doctor_pass(
+            "gh-auth",
+            "GitHub login works — gh commands can authenticate.".to_string(),
+        ),
+        None => doctor_fail(
+            "gh-auth",
+            "GitHub login is missing or expired — gh cannot authenticate.".to_string(),
+            "Run: gh auth login — then re-run: factory doctor".to_string(),
+        ),
+    });
+
+    // gh-repo-access: the current repo must be readable via gh.
+    let repo = probe_stdout(&gh_bin(), &["repo", "view", "--json", "nameWithOwner"]);
+    checks.push(match repo {
+        Some(v) => doctor_pass(
+            "gh-repo-access",
+            format!(
+                "Can read this repo through gh ({}).",
+                serde_json::from_str::<serde_json::Value>(&v)
+                    .ok()
+                    .and_then(|j| j
+                        .get("nameWithOwner")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()))
+                    .unwrap_or_else(|| "repo view works".to_string())
+            ),
+        ),
+        None => doctor_fail(
+            "gh-repo-access",
+            "Cannot read this repo through gh — wrong directory, no access, or login expired."
+                .to_string(),
+            "Run: gh repo view — to see the cause; for access ask a maintainer, for login run: gh auth login".to_string(),
+        ),
+    });
+
+    // git-identity: dispatcher commits need name + email.
+    let name = probe_stdout(&git_bin(), &["config", "user.name"]).unwrap_or_default();
+    let email = probe_stdout(&git_bin(), &["config", "user.email"]).unwrap_or_default();
+    checks.push(if !name.is_empty() && !email.is_empty() {
+        doctor_pass(
+            "git-identity",
+            format!("Git identity is set ({name} <{email}>)."),
+        )
+    } else {
+        doctor_fail(
+            "git-identity",
+            "Git name/email is not configured — dispatcher commits would fail.".to_string(),
+            "Run: git config --global user.name \"Your Name\" && git config --global user.email \"you@example.com\""
+                .to_string(),
+        )
+    });
+
+    // state-dirs: state/cache dir must exist, be a dir, and be writable.
+    // Read-only probe: existence + dir + permission bits, never creates.
+    let state = dispatch_state_dir();
+    checks.push(match std::fs::metadata(&state) {
+        Ok(m) if !m.is_dir() => doctor_fail(
+            "state-dirs",
+            format!(
+                "State path {} exists but is not a directory.",
+                state.display()
+            ),
+            format!(
+                "Run: mv {} {}.bak && mkdir -p {}",
+                state.display(),
+                state.display(),
+                state.display()
+            ),
+        ),
+        Ok(m) if m.permissions().readonly() => doctor_fail(
+            "state-dirs",
+            format!("State directory {} is not writable.", state.display()),
+            format!("Run: chmod u+rwX {}", state.display()),
+        ),
+        Ok(_) => doctor_pass(
+            "state-dirs",
+            format!(
+                "State directory {} exists and is writable.",
+                state.display()
+            ),
+        ),
+        Err(_) => doctor_fail(
+            "state-dirs",
+            format!("State directory {} does not exist yet.", state.display()),
+            format!("Run: mkdir -p {}", state.display()),
+        ),
+    });
+
+    // adapter-present: discovered exactly as the `check` runner discovers it.
+    let adapter = doctor_adapter();
+    checks.push(match &adapter {
+        Some(p) if p.is_file() => doctor_pass(
+            "adapter-present",
+            format!("Check adapter found at {}.", p.display()),
+        ),
+        Some(p) => doctor_fail(
+            "adapter-present",
+            format!("Check adapter path {} does not exist.", p.display()),
+            "Run: factory init --stack rust — to re-seed scripts/factory-check".to_string(),
+        ),
+        None => doctor_fail(
+            "adapter-present",
+            "No check adapter found — verification has nothing to run.".to_string(),
+            "Run: factory init --stack rust — to seed scripts/factory-check (or set FACTORY_CHECK_ADAPTER)".to_string(),
+        ),
+    });
+
+    // adapter-executable: the adapter must run.
+    checks.push(match &adapter {
+        Some(p) if p.is_file() && path_is_executable(p) => doctor_pass(
+            "adapter-executable",
+            format!("Check adapter {} is executable.", p.display()),
+        ),
+        Some(p) if p.is_file() => doctor_fail(
+            "adapter-executable",
+            format!("Check adapter {} is not executable.", p.display()),
+            format!("Run: chmod +x {}", p.display()),
+        ),
+        _ => doctor_fail(
+            "adapter-executable",
+            "No check adapter to execute.".to_string(),
+            "Run: factory init --stack rust — to seed scripts/factory-check".to_string(),
+        ),
+    });
+
+    // toolchain: the rust adapter's toolchain must answer via PATH.
+    let cargo = probe_stdout("cargo", &["--version"]);
+    let rustc = probe_stdout("rustc", &["--version"]);
+    checks.push(match (cargo, rustc) {
+        (Some(c), Some(r)) => doctor_pass(
+            "toolchain",
+            format!("Rust toolchain answers ({c}; {r})."),
+        ),
+        (Some(c), None) => doctor_fail(
+            "toolchain",
+            format!("cargo answers ({c}) but rustc does not — toolchain incomplete."),
+            "Install Rust via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh — then re-run: factory doctor".to_string(),
+        ),
+        _ => doctor_fail(
+            "toolchain",
+            "Rust toolchain (cargo) not found on PATH — checks would fail after model spend."
+                .to_string(),
+            "Install Rust via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh — then re-run: factory doctor".to_string(),
+        ),
+    });
+
+    // model-runner: the configured runner binary must respond.
+    let runner =
+        probe_stdout(&pi_bin(), &["--version"]).or_else(|| probe_stdout(&pi_bin(), &["--help"]));
+    checks.push(match runner {
+        Some(v) => doctor_pass(
+            "model-runner",
+            format!(
+                "Model runner answers ({}).",
+                v.split('\n').next().unwrap_or(&pi_bin())
+            ),
+        ),
+        None => doctor_fail(
+            "model-runner",
+            format!(
+                "Model runner `{}` does not respond — implement/review steps cannot run.",
+                pi_bin()
+            ),
+            "Install the runner on PATH as `pi` (or point FACTORY_PI_BIN at it) — then re-run: factory doctor".to_string(),
+        ),
+    });
+
+    debug_assert_eq!(
+        checks.iter().map(|c| c.name).collect::<Vec<_>>(),
+        DOCTOR_ORDER,
+        "doctor catalogue drifted from DOCTOR_ORDER"
+    );
+    checks
+}
+
+/// Exit 0 iff every check passes, else 1 — the green/red answer.
+fn cmd_doctor(json: bool) -> i32 {
+    let checks = doctor_checks();
+    let ok = checks.iter().all(|c| c.ok);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&DoctorOutput { ok, checks }).expect("doctor JSON serialization")
+        );
+    } else {
+        println!("== factory doctor ==");
+        for c in &checks {
+            if c.ok {
+                println!("[ok] {}: {}", c.name, c.detail);
+            } else {
+                println!("[FAIL] {}: {}", c.name, c.detail);
+                println!("       fix: {}", c.hint);
+            }
+        }
+        if ok {
+            println!("doctor: ready — all {} checks pass", checks.len());
+        } else {
+            let failing: Vec<&str> = checks.iter().filter(|c| !c.ok).map(|c| c.name).collect();
+            println!(
+                "doctor: blocked — {} of {} checks failing ({}) — apply the fix commands above, then re-run: factory doctor",
+                failing.len(),
+                checks.len(),
+                failing.join(", ")
+            );
+        }
+    }
+    i32::from(!ok)
 }
 
 /// Valid handoff verdicts (parity with the bash `factory handoff --signal`).
@@ -3361,6 +3689,9 @@ fn run() -> i32 {
             slot,
             args,
         } => run_check(cli.json, adapter, slot, args),
+        Commands::Doctor => {
+            std::process::exit(cmd_doctor(cli.json));
+        }
         Commands::Handoff {
             issue,
             signal,
