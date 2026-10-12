@@ -23,6 +23,11 @@ struct Cli {
 /// Project files `factory status` treats as project presence.
 const STATUS_PROJECT_FILES: &[&str] = &["AGENTS.md", "GLOSSARY.md", "scripts/factory-check"];
 
+/// Default transcript tail (lines) for `factory log` when --tail is absent.
+/// 50 lines bounds a context window (~a few KB) while keeping enough story;
+/// --tail 0 opts into the full transcript.
+const LOG_DEFAULT_TAIL: usize = 50;
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Print the factory version.
@@ -33,6 +38,21 @@ enum Commands {
     /// nonzero only on unreadable state (missing/corrupt ledger) with the
     /// cause named. The global --json flag selects machine output.
     Status,
+    /// Ticket history: per-attempt entries newest-first with outcome
+    /// summaries before bounded transcripts. Read-only: observing changes
+    /// nothing. Exit 0 whenever the state was read successfully (even when
+    /// the ticket has no attempts); nonzero only on unreadable state (bad
+    /// ticket number, missing/corrupt ledger) with the cause named.
+    /// --tail N shows the last N transcript lines (default 50); --tail 0
+    /// means the full transcript. The global --json flag selects machine
+    /// output carrying the same facts structurally.
+    Log {
+        /// Ticket issue number (e.g. 98 or #98).
+        ticket: String,
+        /// Transcript lines shown per attempt (0 means full).
+        #[arg(long, default_value_t = LOG_DEFAULT_TAIL)]
+        tail: usize,
+    },
     /// Seed the factory into the current project (idempotent, never clobbers).
     Init {
         /// Check-adapter stack to install.
@@ -2591,16 +2611,21 @@ fn cmd_dispatch_daemon(json: bool, interval: u64) -> i32 {
     }
 }
 
-/// Strict ledger read for `factory status`: unlike the dispatch loop's
-/// lenient default-empty load, an observer must say loudly when there is
-/// nothing readable to observe. Missing file and corrupt JSON both fail
-/// with the ledger path and the cause named. Never writes.
-fn load_ledger_strict(state: &std::path::Path) -> Result<DispatchLedger, String> {
+/// Strict ledger read shared by the read-only observers (`status`, `log`):
+/// unlike the dispatch loop's lenient default-empty load, an observer must
+/// say loudly when there is nothing readable to observe. Missing file and
+/// corrupt JSON both fail with the ledger path and the cause named. Never
+/// writes.
+fn load_ledger_strict_for(cmd: &str, state: &std::path::Path) -> Result<DispatchLedger, String> {
     let path = ledger_path(state);
     let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("status: cannot read ledger {}: {e}", path.display()))?;
+        .map_err(|e| format!("{cmd}: cannot read ledger {}: {e}", path.display()))?;
     serde_json::from_str(&text)
-        .map_err(|e| format!("status: cannot parse ledger {}: {e}", path.display()))
+        .map_err(|e| format!("{cmd}: cannot parse ledger {}: {e}", path.display()))
+}
+
+fn load_ledger_strict(state: &std::path::Path) -> Result<DispatchLedger, String> {
+    load_ledger_strict_for("status", state)
 }
 
 fn cmd_status(json: bool) -> i32 {
@@ -2755,6 +2780,195 @@ fn cmd_status(json: bool) -> i32 {
         println!("STOP: dispatch loop is halted (STOP file present).");
     } else {
         println!("STOP: dispatch loop running (no STOP file).");
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// LOG (ticket #25, spec #23 slice: ticket history on demand)
+//
+// Per-attempt entries newest-first with the outcome summary (the story)
+// before the transcript tail (the evidence). Transcripts are the same
+// logs-dir files the dispatcher writes: the ledger's implement log path
+// plus the sibling per-attempt review log, which the ledger does not
+// record. Strictly read-only: fs::read only, no writes, no git/gh calls.
+// ---------------------------------------------------------------------------
+
+/// Bea-readable one-line outcome for an attempt: the cause before evidence.
+/// Shared by human and JSON modes so no fact lives only in prose.
+fn log_summary(a: &DispatchAttempt) -> String {
+    let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+    match a.status.as_str() {
+        "impl_running" => format!(
+            "Ticket {} attempt {} is being implemented (slot {}, started {}).",
+            a.ticket, a.attempt_no, slot, a.started_at
+        ),
+        "review_running" => format!(
+            "Ticket {} attempt {} is being reviewed (slot {}, started {}).",
+            a.ticket, a.attempt_no, slot, a.started_at
+        ),
+        "impl_done" => format!(
+            "Ticket {} attempt {} finished implement, awaiting review (slot {}).",
+            a.ticket, a.attempt_no, slot
+        ),
+        "impl_failed" => format!(
+            "Ticket {} attempt {} failed during implement (exit {}).",
+            a.ticket, a.attempt_no, a.exit_code
+        ),
+        "review_done" => format!(
+            "Ticket {} attempt {} passed review (slot {}).",
+            a.ticket, a.attempt_no, slot
+        ),
+        "review_failed" => format!(
+            "Ticket {} attempt {} failed review: changes requested or merge blocked.",
+            a.ticket, a.attempt_no
+        ),
+        other => format!(
+            "Ticket {} attempt {} finished: {other} (slot {}).",
+            a.ticket, a.attempt_no, slot
+        ),
+    }
+}
+
+/// Combined transcript for one attempt: the ledger's implement log plus the
+/// sibling review log (same T<ticket>-a<attempt> stem). Missing files read
+/// as empty — a running attempt may not have flushed one yet. Read-only.
+fn log_read_transcript(state: &std::path::Path, a: &DispatchAttempt) -> String {
+    let mut out = String::new();
+    if !a.log_path.is_empty() {
+        if let Ok(text) = std::fs::read_to_string(Path::new(&a.log_path)) {
+            out.push_str(&text);
+        }
+    }
+    let review = state
+        .join("logs")
+        .join(format!("T{}-a{}-review.log", a.ticket, a.attempt_no));
+    if Path::new(&a.log_path) != review {
+        if let Ok(text) = std::fs::read_to_string(&review) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&text);
+        }
+    }
+    out
+}
+
+/// Last `tail` lines of `text` (`tail == 0` means full). Returns the shown
+/// text plus whether older lines were dropped.
+fn log_tail(text: &str, tail: usize) -> (String, bool) {
+    if tail == 0 {
+        return (text.to_string(), false);
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= tail {
+        return (text.to_string(), false);
+    }
+    (lines[lines.len() - tail..].join("\n") + "\n", true)
+}
+
+fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
+    let ticket = match parse_issue_number(ticket_raw) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("log: {e}");
+            return 1;
+        }
+    };
+    let state = dispatch_state_dir();
+    let ledger = match load_ledger_strict_for("log", &state) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let mut entries: Vec<&DispatchAttempt> = ledger
+        .attempts
+        .iter()
+        .filter(|a| a.ticket == ticket)
+        .collect();
+    entries.sort_by(|a, b| b.attempt_no.cmp(&a.attempt_no).then(b.id.cmp(&a.id)));
+    if entries.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"ticket": ticket, "attempts": []}));
+        } else {
+            println!("Ticket {ticket}: no attempts yet.");
+        }
+        return 0;
+    }
+
+    // Read every transcript first so JSON mode carries the same facts.
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
+    for a in &entries {
+        let full = log_read_transcript(&state, a);
+        let (shown, truncated) = log_tail(&full, tail);
+        rows.push(serde_json::json!({
+            "ticket": a.ticket,
+            "attempt": a.attempt_no,
+            "slot": format!("T{}-a{}", a.ticket, a.attempt_no),
+            "status": a.status,
+            "summary": log_summary(a),
+            "base": a.base_commit,
+            "head": a.head_commit,
+            "started": a.started_at,
+            "finished": a.finished_at,
+            "exit_code": a.exit_code,
+            "transcript": shown,
+            "truncated": truncated,
+        }));
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"ticket": ticket, "attempts": rows})
+        );
+        return 0;
+    }
+
+    println!(
+        "Ticket {ticket} — {} attempt(s) (newest first).",
+        rows.len()
+    );
+    for (i, row) in rows.iter().enumerate() {
+        let attempt = row.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+        let summary = row.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        let base = row.get("base").and_then(|v| v.as_str()).unwrap_or("");
+        let head = row.get("head").and_then(|v| v.as_str()).unwrap_or("");
+        let started = row.get("started").and_then(|v| v.as_str()).unwrap_or("");
+        let finished = row.get("finished").and_then(|v| v.as_str()).unwrap_or("");
+        let transcript = row.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
+        let span = if finished.is_empty() {
+            format!("started {started}")
+        } else {
+            format!("started {started}, finished {finished}")
+        };
+        let head_words = if head.is_empty() {
+            "head (none yet)".to_string()
+        } else {
+            format!("head {head}")
+        };
+        println!("Attempt {attempt}: {summary}");
+        println!("Base {base} -> {head_words}, {span}.");
+        if transcript.is_empty() {
+            println!("(no transcript yet)");
+        } else if tail == 0 {
+            println!("Transcript (full):");
+            print!("{transcript}");
+            if !transcript.ends_with('\n') {
+                println!();
+            }
+        } else {
+            println!("Transcript (last {tail} lines):");
+            print!("{transcript}");
+            if !transcript.ends_with('\n') {
+                println!();
+            }
+        }
+        if i + 1 < rows.len() {
+            println!("---");
+        }
     }
     0
 }
@@ -4003,6 +4217,9 @@ fn run() -> i32 {
         }
         Commands::Status => {
             std::process::exit(cmd_status(cli.json));
+        }
+        Commands::Log { ticket, tail } => {
+            std::process::exit(cmd_log(&ticket, tail, cli.json));
         }
         Commands::Init {
             stack,
