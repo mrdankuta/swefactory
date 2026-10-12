@@ -128,6 +128,7 @@ factory dispatch once --dry-run # survey only: no worktrees, subprocesses, or wr
 factory dispatch status        # attempts + worktrees + STOP state
 factory dispatch stop          # halt the loop (later `once` exits 0)
 factory dispatch resume        # restart the loop after a stop
+factory dispatch self-test     # hermetic release-mechanics proof (no gh, no network, no tokens)
 factory --json dispatch status # machine-parseable ledger
 ```
 
