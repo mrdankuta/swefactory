@@ -11,6 +11,207 @@
 //! cleanup printed never executed), red-head and dirty-tree refusals
 //! before any mutation, and dry-run plans with zero state changes.
 //! What they miss: real remote pushes and real CI on the train head.
+//!
+//! Land hardening CLI boundary tests (ticket #22, spec #20).
+//!
+//! Same seam as above. What these tests catch: dispatcher-context
+//! refusal before any mutation, retry-after-interruption completing
+//! closes without duplicates, per-step --json reports, and --train
+//! landing a named branch with merged-elsewhere verification.
+
+#[test]
+fn land_refuses_under_dispatcher_context_before_any_mutation() {
+    let h = setup("dispatcher");
+    let train = cut_train(&h);
+    let mut cmd = land_cmd(&h, &["land"]);
+    // Dispatch attempt phases export FACTORY_SLOT for isolation: its
+    // presence marks a dispatcher-owned process tree.
+    cmd.env("FACTORY_SLOT", "T11-a1");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("automation"))
+        .stderr(predicates::str::contains("human"));
+    assert_no_mutations(&h);
+    assert_eq!(
+        open_train_branch(&h),
+        train,
+        "refused land must leave the open train untouched"
+    );
+    assert!(
+        fs::read_to_string(&h.adapter_log).unwrap().is_empty(),
+        "dispatcher refusal must come before running checks"
+    );
+}
+
+#[test]
+fn land_rerun_after_interruption_completes_closes_without_duplicates() {
+    let h = setup("retry");
+    let train = cut_train(&h);
+
+    for (n, body) in [(11u64, "eleven\n"), (12u64, "twelve\n")] {
+        git_real(&h.repo, &["checkout", "-qb", &format!("factory/T{n}-work")]);
+        fs::write(h.repo.join(format!("w{n}.txt")), body).unwrap();
+        git_real(&h.repo, &["add", "-A"]);
+        git_real(&h.repo, &["commit", "-qm", &format!("feat(T{n}): work")]);
+        git_real(&h.repo, &["checkout", "-q", "dev"]);
+    }
+    write_ledger(&h, &train, &[11, 12]);
+    write_view(&h, 11, "Eleven", "Build eleven.", "OPEN");
+    write_view(&h, 12, "Twelve", "Build twelve.", "OPEN");
+    land_cmd(&h, &["release", "merge", "11"]).assert().success();
+    land_cmd(&h, &["release", "merge", "12"]).assert().success();
+
+    // Simulate a kill mid-land after the first close: #11 already closed
+    // on the server, #12 still open, train record still open.
+    write_view(&h, 11, "Eleven", "Build eleven.", "CLOSED");
+
+    land_cmd(&h, &["land"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("already closed"))
+        .stdout(predicates::str::contains("closed"))
+        .stdout(predicates::str::contains("cleanup"));
+
+    // Exactly one close ran in this run (for #12); #11 was skipped.
+    let gh = gh_log_text(&h);
+    let lines: Vec<&str> = gh.lines().collect();
+    let mut closes = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim() == "close" {
+            closes.push(lines.get(i + 1).map(|s| s.trim()).unwrap_or(""));
+        }
+    }
+    assert_eq!(
+        closes,
+        vec!["12"],
+        "re-run must close only the still-open ticket:\n{gh}"
+    );
+    assert!(
+        !h.state.join("train.json").is_file(),
+        "re-run must finish cleanup (train record closed)"
+    );
+}
+
+#[test]
+fn land_json_reports_each_step() {
+    let h = setup("json-steps");
+    let train = cut_train(&h);
+
+    git_real(&h.repo, &["checkout", "-qb", "factory/T11-work"]);
+    fs::write(h.repo.join("w11.txt"), "eleven\n").unwrap();
+    git_real(&h.repo, &["add", "-A"]);
+    git_real(&h.repo, &["commit", "-qm", "feat(T11): widget"]);
+    git_real(&h.repo, &["checkout", "-q", "dev"]);
+    write_ledger(&h, &train, &[11]);
+    write_view(&h, 11, "Demo widget", "Build the widget.", "OPEN");
+    land_cmd(&h, &["release", "merge", "11"]).assert().success();
+
+    let assert = land_cmd(&h, &["--json", "land"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone())
+        .expect("land --json stdout must be UTF-8");
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).expect("land --json must print one JSON document");
+    let steps = v
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .expect("land --json must carry a steps array");
+    for want in ["preflight", "merge", "push", "closes", "cleanup"] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.get("step").and_then(|x| x.as_str()) == Some(want)),
+            "steps must report {want}: {steps:?}"
+        );
+    }
+    assert_eq!(
+        v.get("train").and_then(|t| t.as_str()),
+        Some(train.as_str()),
+        "json must name the landed train"
+    );
+}
+
+#[test]
+fn land_train_lands_named_branch_with_merged_elsewhere_verification() {
+    let h = setup("named-train");
+    let train = cut_train(&h);
+
+    git_real(&h.repo, &["checkout", "-qb", "factory/T11-work"]);
+    fs::write(h.repo.join("w11.txt"), "eleven\n").unwrap();
+    git_real(&h.repo, &["add", "-A"]);
+    git_real(&h.repo, &["commit", "-qm", "feat(T11): widget"]);
+    git_real(&h.repo, &["checkout", "-q", "dev"]);
+    write_ledger(&h, &train, &[11]);
+    write_view(&h, 11, "Demo widget", "Build the widget.", "OPEN");
+    land_cmd(&h, &["release", "merge", "11"]).assert().success();
+
+    // The human merged elsewhere (outside land) and the train record is
+    // gone: the named branch is already inside dev.
+    git_real(&h.repo, &["checkout", "-q", "dev"]);
+    git_real(
+        &h.repo,
+        &[
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            &format!("Merge {train} into dev"),
+            &train,
+        ],
+    );
+    git_real(&h.repo, &["push", "-q", "origin", "dev"]);
+    fs::remove_file(h.state.join("train.json")).unwrap();
+
+    let assert = land_cmd(&h, &["--json", "land", "--train", &train])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone())
+        .expect("land --train --json stdout must be UTF-8");
+    let v: serde_json::Value =
+        serde_json::from_str(out.trim()).expect("land --train --json must print one JSON document");
+    let steps = v
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .expect("land --train --json must carry a steps array");
+    let merge = steps
+        .iter()
+        .find(|s| s.get("step").and_then(|x| x.as_str()) == Some("merge"))
+        .expect("steps must report merge");
+    assert_eq!(
+        merge.get("status").and_then(|s| s.as_str()),
+        Some("already-merged"),
+        "merged-elsewhere branch must verify instead of re-merging: {steps:?}"
+    );
+
+    // The still-open ticket closed with the release note, exactly once.
+    let gh = gh_log_text(&h);
+    let lines: Vec<&str> = gh.lines().collect();
+    let mut closes = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim() == "close" {
+            closes.push(lines.get(i + 1).map(|s| s.trim()).unwrap_or(""));
+        }
+    }
+    assert_eq!(closes, vec!["11"], "named land must close #11:\n{gh}");
+    assert!(
+        gh.contains("Landed"),
+        "close must carry the release note:\n{gh}"
+    );
+
+    // No duplicate merge commit for the already-merged train.
+    let log = std::process::Command::new("/usr/bin/git")
+        .args(["log", "--oneline", "dev"])
+        .current_dir(&h.repo)
+        .output()
+        .unwrap();
+    let log = String::from_utf8(log.stdout).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains(&format!("Merge {train} into dev")))
+            .count(),
+        1,
+        "already-merged train must not gain a second merge commit:\n{log}"
+    );
+}
 
 use assert_cmd::Command;
 use std::fs;
