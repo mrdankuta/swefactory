@@ -128,6 +128,17 @@ enum Commands {
         #[command(subcommand)]
         action: ReleaseAction,
     },
+    /// Land the open train: the human's one-command accept-and-land.
+    /// Preflights everything (open train, clean tree, green head,
+    /// reachable remote), then merges train→dev --no-ff, pushes dev,
+    /// closes member tickets with the release note, removes the train
+    /// worktree, and prints branch cleanup (never executed). With
+    /// --dry-run, prints the full mutation plan and changes nothing.
+    Land {
+        /// Preview every mutation without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3895,7 +3906,337 @@ fn run() -> i32 {
                 std::process::exit(cmd_release_abandon(cli.json));
             }
         },
+        Commands::Land { dry_run } => {
+            std::process::exit(cmd_land(cli.json, dry_run));
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LAND (ticket #21, spec #20: one-command human accept-and-land)
+//
+// SAFETY CONTRACT: preflight (train resolves → tree clean → head green →
+// remote reachable) runs before ANY mutation; the first failure stops
+// everything. The sequence then merges train→dev --no-ff, pushes dev,
+// closes member tickets with the release note, removes the train
+// worktree, and PRINTS branch cleanup for the human (never executed:
+// no `branch -d/-D` reaches git). --dry-run runs the same preflight
+// and prints the full mutation plan with zero state changes.
+// ---------------------------------------------------------------------------
+
+/// True when the current checkout has no staged or unstaged changes.
+/// Read-only; the first mutation guard after train resolution.
+fn land_working_tree_clean() -> bool {
+    run_git(&["status", "--porcelain"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn land_check_adapter() -> Option<PathBuf> {
+    std::env::var_os("FACTORY_CHECK_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(discover_adapter)
+}
+
+/// Stage the train head in an ephemeral detached worktree so the check
+/// runner verifies exactly what would land. Removed after the check
+/// (pass or fail) so no state survives preflight.
+fn land_temp_worktree(train: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "swefactory-land-check-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    match run_git(
+        &["worktree", "add", "--detach", &dir.to_string_lossy(), train],
+        None,
+    ) {
+        Ok(o) if o.status.success() => Ok(dir),
+        Ok(o) => Err(format!(
+            "land: cannot stage train head for checks: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("land: {e}")),
+    }
+}
+
+fn land_drop_temp_worktree(path: &Path) {
+    let s = path.to_string_lossy().to_string();
+    let _ = run_git(&["worktree", "remove", "--force", &s], None);
+    let _ = std::fs::remove_dir_all(path);
+    let _ = run_git(&["worktree", "prune"], None);
+}
+
+/// Head-green gate: run the check adapter against the train head.
+/// The error names the failing adapter, its exit code, and its tail.
+fn land_run_checks(train: &str) -> Result<(), String> {
+    let Some(adapter) = land_check_adapter() else {
+        return Err("land: train head checks failed: no check adapter found (set FACTORY_CHECK_ADAPTER or run under a project with scripts/factory-check)".to_string());
+    };
+    let twt = land_temp_worktree(train)?;
+    let out = Command::new(&adapter).current_dir(&twt).output();
+    land_drop_temp_worktree(&twt);
+    let out = out.map_err(|e| {
+        format!(
+            "land: train head checks failed: adapter {} could not run: {e}",
+            adapter.display()
+        )
+    })?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let code = out.status.code().unwrap_or(1);
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    Err(format!(
+        "land: train head checks failed: adapter {} exited {code}:\n{}",
+        adapter.display(),
+        last_lines(&combined, 10)
+    ))
+}
+
+/// Read-only reachability probe: the push must have somewhere to go.
+fn land_remote_reachable() -> bool {
+    run_git(&["ls-remote", "origin", "HEAD"], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Distinct member ticket numbers for this train (newest ledger rule
+/// first, with the same back-compat fallback `member_branches` uses).
+fn member_tickets(ledger: &DispatchLedger, train: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    for a in &ledger.attempts {
+        if a.train_branch == train && !out.contains(&a.ticket) {
+            out.push(a.ticket);
+        }
+    }
+    if out.is_empty() {
+        for a in &ledger.attempts {
+            if !out.contains(&a.ticket) {
+                out.push(a.ticket);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn land_short(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+/// Checkout dev for the release merge. The working tree is clean
+/// (preflight), so the switch carries no unrelated work.
+fn land_checkout_dev() -> Result<(), String> {
+    match run_git(&["checkout", "-q", "dev"], None) {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "land: cannot checkout dev: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("land: {e}")),
+    }
+}
+
+/// Merge train→dev --no-ff with the train name in the message.
+/// Returns the dev head short sha. On conflict the merge is aborted
+/// and nothing is pushed or closed. An already-merged train
+/// (re-run after a half-finished land) succeeds as a no-op.
+fn land_merge_train(train: &str, msg: &str) -> Result<String, String> {
+    match run_git(&["merge", "--no-ff", "--no-edit", "-m", msg, train], None) {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let _ = run_git(&["merge", "--abort"], None);
+            return Err(format!(
+                "land: merge of {train} into dev failed ({}) — aborted, nothing pushed or closed",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Err(e) => {
+            let _ = run_git(&["merge", "--abort"], None);
+            return Err(format!("land: {e}"));
+        }
+    }
+    Ok(land_short(
+        &run_git(&["rev-parse", "HEAD"], None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default(),
+    ))
+}
+
+fn land_push_dev() -> Result<(), String> {
+    match run_git(&["push", "origin", "dev"], None) {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "land: push of dev to origin failed ({}) — merge stays local, re-run land to complete",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("land: {e}")),
+    }
+}
+
+/// Close one member ticket with the release note. Already-closed
+/// tickets skip cleanly so a re-run after a half-finished land
+/// completes closes without duplicates. Returns true when a close ran.
+fn land_close_ticket(ticket: u64, note: &str) -> Result<bool, String> {
+    let view = dgh(&[
+        "issue",
+        "view",
+        &ticket.to_string(),
+        "--json",
+        "number,state",
+    ])?;
+    let v: serde_json::Value = serde_json::from_str(&view)
+        .map_err(|e| format!("land: cannot parse gh issue view {ticket}: {e}"))?;
+    if v.get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("closed")
+    {
+        return Ok(false);
+    }
+    dgh(&["issue", "close", &ticket.to_string(), "--comment", note]).map_err(|e| {
+        format!("land: close of #{ticket} failed: {e} — merge+push done, re-run land to complete")
+    })?;
+    Ok(true)
+}
+
+/// Release note stamped on every member-ticket close. Names the train
+/// and its head (stable across plan and execution: the merge never
+/// moves the train), so the dry-run plan shows the exact note.
+fn land_release_note(train: &str) -> String {
+    format!(
+        "Landed {} into dev (train head {}).",
+        train,
+        land_short(&train_head(train))
+    )
+}
+
+fn cmd_land(json: bool, dry_run: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        eprintln!("land: no open train — cut one with `release start` first");
+        return 1;
+    };
+    if !land_working_tree_clean() {
+        eprintln!(
+            "land: working tree is dirty — commit or stash before landing {}",
+            train.branch
+        );
+        return 1;
+    }
+    if let Err(e) = land_run_checks(&train.branch) {
+        eprintln!("{e}");
+        return 1;
+    }
+    if !land_remote_reachable() {
+        eprintln!("land: remote origin unreachable — refusing before any mutation");
+        return 1;
+    }
+    let ledger = load_ledger(&state);
+    let tickets = member_tickets(&ledger, &train.branch);
+    let members = member_branches(&ledger, &train.branch);
+    let cleanup = cleanup_lines(&train.branch, &members);
+    let merge_msg = format!("Merge {} into dev", train.branch);
+    let note = land_release_note(&train.branch);
+    if dry_run {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "train": train.branch,
+                    "dry_run": true,
+                    "preflight": "ok",
+                    "merge": merge_msg,
+                    "push": "origin dev",
+                    "close": tickets,
+                    "note": note,
+                    "cleanup": cleanup,
+                })
+            );
+        } else {
+            println!("land: dry-run plan for {} (no changes made)", train.branch);
+            println!("  git checkout dev");
+            println!(
+                "  git merge --no-ff --no-edit -m \"{merge_msg}\" {}",
+                train.branch
+            );
+            println!("  git push origin dev");
+            for t in &tickets {
+                println!("  gh issue close {t} --comment \"{note}\"");
+            }
+            println!(
+                "  remove train worktree {}",
+                train_worktree_path(&state).display()
+            );
+            println!("  cleanup (human runs these, automation never deletes):");
+            for line in &cleanup {
+                println!("    {line}");
+            }
+        }
+        return 0;
+    }
+    // --- sequence: merge train→dev --no-ff → push dev → close members ---
+    if let Err(e) = land_checkout_dev() {
+        eprintln!("{e}");
+        return 1;
+    }
+    let dev_short = match land_merge_train(&train.branch, &merge_msg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    if let Err(e) = land_push_dev() {
+        eprintln!("{e}");
+        return 1;
+    }
+    let mut closed = Vec::new();
+    let mut skipped = Vec::new();
+    for t in &tickets {
+        match land_close_ticket(*t, &note) {
+            Ok(true) => closed.push(*t),
+            Ok(false) => skipped.push(*t),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    }
+    // Same state path `release finish` uses: drop the train worktree,
+    // close the train record, print cleanup (never execute it).
+    remove_train_worktree(&state);
+    clear_train(&state);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"train": train.branch, "dry_run": false, "merge": dev_short, "pushed": true, "closed": closed, "skipped": skipped, "cleanup": cleanup})
+        );
+    } else {
+        println!("land: merged {} into dev ({dev_short})", train.branch);
+        println!("land: pushed dev to origin");
+        for t in &closed {
+            println!("land: closed #{t}");
+        }
+        for t in &skipped {
+            println!("land: #{t} already closed, skipping");
+        }
+        println!("land: train {} landed into dev", train.branch);
+        println!("cleanup (human runs these, automation never deletes):");
+        for line in &cleanup {
+            println!("  {line}");
+        }
+    }
+    0
 }
 
 /// Canonical sha256 of an issue body: exactly one trailing newline, matching
