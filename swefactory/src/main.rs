@@ -83,9 +83,16 @@ enum Commands {
     },
     /// Pre-flight check: probe every prerequisite, report each in plain
     /// English with its fix, exit nonzero when anything blocks.
-    /// Read-only: diagnosing never changes anything (safe repair is a
-    /// separate ticket). The global --json flag selects machine output.
-    Doctor,
+    /// Read-only by default: diagnosing never changes anything. With
+    /// --fix, repair safe local state (missing dirs, stale worktree
+    /// metadata, missing project files re-seeded through init's own
+    /// seeding path) — never issues, remotes, toolchains, or auth flows.
+    /// The global --json flag selects machine output.
+    Doctor {
+        /// Repair everything safe to repair locally, then report.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Post a handoff record to the ticket issue via the gh CLI.
     Handoff {
         /// Ticket issue number (e.g. 11 or #11).
@@ -455,48 +462,26 @@ impl Installer {
     }
 }
 
-fn run_init(
-    json: bool,
+/// Seed every project-local file init owns (prompts, skills, adapter,
+/// AGENTS header, glossary, docs, issue templates, dirs + markers).
+/// Shared by `init`/`update` and `doctor --fix` so repair re-seeds through
+/// init's own path. Never overwrites: existing files are kept, which is
+/// what makes both init and --fix idempotent. No gh calls in here — label
+/// management stays in run_init so --fix never touches issues.
+fn seed_project_local(
+    ins: &mut Installer,
     stack: &str,
-    global_skills: bool,
-    pin: Option<&str>,
     cmd: &str,
-) -> InitOutput {
-    let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut ins = Installer {
-        dest: dest.clone(),
-        installed: Vec::new(),
-        kept: Vec::new(),
-        warnings: Vec::new(),
-        json,
-    };
-
-    // --- prerequisites (warn, don't fail) ---
-    let gh_present = tool_present("gh");
-    if !gh_present {
-        ins.warn(
-            "WARN: gh CLI not found — issue templates/labels will be skipped. Install: https://cli.github.com",
-        );
-    }
-    if !tool_present("herdr") {
-        ins.warn(
-            "WARN: herdr not found — install from https://herdr.dev then run: herdr integration install pi",
-        );
-    }
-
+    skill_root: &Path,
+    global_skills: bool,
+) {
     // --- prompts ---
     ins.seed(".pi/prompts/plan.md", PROMPT_PLAN);
     ins.seed(".pi/prompts/build.md", PROMPT_BUILD);
     ins.seed(".pi/prompts/review.md", PROMPT_REVIEW);
     ins.seed(".pi/prompts/handoff.md", PROMPT_HANDOFF);
 
-    // --- skills (project-local, hermetic; never overwrite existing) ---
-    let skill_root = if global_skills {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        Path::new(&home).join(".agents/skills")
-    } else {
-        dest.join(".agents/skills")
-    };
+    // --- skills (hermetic; never overwrite existing) ---
     for (rel, content) in SKILLS {
         let target = skill_root.join(rel);
         let display = if global_skills {
@@ -537,7 +522,7 @@ fn run_init(
     }
 
     // --- AGENTS.md header (marker-based merge) ---
-    let agents = dest.join("AGENTS.md");
+    let agents = ins.dest.join("AGENTS.md");
     match std::fs::read_to_string(&agents) {
         Ok(body) if body.contains("factory:header:start") => {
             ins.kept.push("AGENTS.md".to_string());
@@ -564,6 +549,47 @@ fn run_init(
     ins.seed(".github/ISSUE_TEMPLATE/spec.yml", ISSUE_SPEC);
     ins.seed(".github/ISSUE_TEMPLATE/ticket.yml", ISSUE_TICKET);
 
+    ins.finish_dirs_and_markers();
+}
+
+fn run_init(
+    json: bool,
+    stack: &str,
+    global_skills: bool,
+    pin: Option<&str>,
+    cmd: &str,
+) -> InitOutput {
+    let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut ins = Installer {
+        dest: dest.clone(),
+        installed: Vec::new(),
+        kept: Vec::new(),
+        warnings: Vec::new(),
+        json,
+    };
+
+    // --- prerequisites (warn, don't fail) ---
+    let gh_present = tool_present("gh");
+    if !gh_present {
+        ins.warn(
+            "WARN: gh CLI not found — issue templates/labels will be skipped. Install: https://cli.github.com",
+        );
+    }
+    if !tool_present("herdr") {
+        ins.warn(
+            "WARN: herdr not found — install from https://herdr.dev then run: herdr integration install pi",
+        );
+    }
+
+    // --- local tree: init's own seeding path (shared with doctor --fix) ---
+    let skill_root = if global_skills {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        Path::new(&home).join(".agents/skills")
+    } else {
+        dest.join(".agents/skills")
+    };
+    seed_project_local(&mut ins, stack, cmd, &skill_root, global_skills);
+
     // --- labels (best effort via gh) ---
     let authed = gh_present
         && std::process::Command::new("gh")
@@ -579,8 +605,6 @@ fn run_init(
     } else {
         ins.ensure_labels(authed);
     }
-
-    ins.finish_dirs_and_markers();
 
     if let Some(tag) = pin {
         ins.say(&format!(
@@ -763,6 +787,113 @@ struct DoctorCheck {
 struct DoctorOutput {
     ok: bool,
     checks: Vec<DoctorCheck>,
+    /// Repairs applied by `--fix`, in the order applied. Always present;
+    /// empty without `--fix` or when a `--fix` run had nothing to repair.
+    fixed: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// DOCTOR --fix (ticket #19: safe local repair)
+//
+// Repairs FIRST, then probes with the same doctor_checks() the read-only
+// path uses — so a green post-repair report means the same thing as a
+// green plain report. Only safe local state is ever touched:
+//   R1 dirs: create a missing state dir; restore the write bit when the
+//      readonly bit is set. A path blocked by a non-dir file is left
+//      failing with its hint — never delete or move user data.
+//   R2 worktree metadata: `git worktree prune -n` (dry run) detects stale
+//      entries; only when its stdout is non-empty does the real `git
+//      worktree prune` run. Local git metadata only — never fetch, push,
+//      remotes, branches, or commits.
+//   R3 project files: re-seed missing files through init's own seeding
+//      path (seed_project_local, default rust stack, never overwrites),
+//      plus chmod +x when the discovered adapter exists but is not
+//      executable — exactly the hint's own command.
+// No new `gh` calls happen here (probes already ran or will run around
+// the repairs): no issues, no labels, no auth flows. No toolchain
+// installers, ever — those stay report + hint only.
+// ---------------------------------------------------------------------------
+
+/// Default stack re-seeded when the adapter is missing entirely.
+/// `--fix` takes no --stack flag (spec: `doctor [--fix] [--json]`).
+const DOCTOR_FIX_STACK: &str = "rust";
+
+fn doctor_fix() -> Vec<String> {
+    let mut fixed = Vec::new();
+
+    // R1: state dir.
+    let state = dispatch_state_dir();
+    match std::fs::metadata(&state) {
+        Err(_) => {
+            if std::fs::create_dir_all(&state).is_ok() {
+                fixed.push(format!("state-dirs: created {}", state.display()));
+            }
+        }
+        Ok(m) if m.is_dir() && m.permissions().readonly() => {
+            // Restore owner write without widening to world-writable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = m.permissions().mode() | 0o200;
+                if std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).is_ok() {
+                    fixed.push(format!("state-dirs: made writable {}", state.display()));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = m.permissions();
+                perms.set_readonly(false);
+                if std::fs::set_permissions(&state, perms).is_ok() {
+                    fixed.push(format!("state-dirs: made writable {}", state.display()));
+                }
+            }
+        }
+        Ok(_) => {}
+    }
+
+    // R2: stale worktree metadata (detect via dry run, repair only on signal).
+    if let Some(dry) = probe_stdout(&git_bin(), &["worktree", "prune", "-n"]) {
+        if !dry.is_empty() {
+            let _ = probe_stdout(&git_bin(), &["worktree", "prune"]);
+            let first = dry.lines().next().unwrap_or("stale entries");
+            fixed.push(format!("worktree-metadata: pruned ({first})"));
+        }
+    }
+
+    // R3: missing project files through init's own seeding path.
+    let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut ins = Installer {
+        dest: dest.clone(),
+        installed: Vec::new(),
+        kept: Vec::new(),
+        warnings: Vec::new(),
+        json: true, // quiet: repairs are reported by doctor, not init chatter
+    };
+    seed_project_local(
+        &mut ins,
+        DOCTOR_FIX_STACK,
+        "doctor",
+        &dest.join(".agents/skills"),
+        false,
+    );
+    for rel in &ins.installed {
+        fixed.push(format!("project-files: re-seeded {rel}"));
+    }
+
+    // R3b: existing-but-not-executable adapter (fresh seeds are already 755).
+    if let Some(p) = doctor_adapter() {
+        if p.is_file() && !path_is_executable(&p) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).is_ok() {
+                    fixed.push(format!("adapter-executable: chmod +x {}", p.display()));
+                }
+            }
+        }
+    }
+
+    fixed
 }
 
 fn doctor_pass(name: &'static str, detail: String) -> DoctorCheck {
@@ -1014,16 +1145,35 @@ fn doctor_checks() -> Vec<DoctorCheck> {
 }
 
 /// Exit 0 iff every check passes, else 1 — the green/red answer.
-fn cmd_doctor(json: bool) -> i32 {
+/// With `fix`, safe local repairs apply first and both the human report
+/// and JSON list them under `fixed:` / `fixed`.
+fn cmd_doctor(json: bool, fix: bool) -> i32 {
+    let fixed = if fix { doctor_fix() } else { Vec::new() };
     let checks = doctor_checks();
     let ok = checks.iter().all(|c| c.ok);
     if json {
         println!(
             "{}",
-            serde_json::to_string(&DoctorOutput { ok, checks }).expect("doctor JSON serialization")
+            serde_json::to_string(&DoctorOutput { ok, checks, fixed })
+                .expect("doctor JSON serialization")
         );
     } else {
-        println!("== factory doctor ==");
+        if fix {
+            println!("== factory doctor --fix ==");
+            if fixed.is_empty() {
+                if ok {
+                    println!("fix: nothing to repair — already green");
+                } else {
+                    println!("fix: nothing safe to repair automatically");
+                }
+            } else {
+                for f in &fixed {
+                    println!("fixed: {f}");
+                }
+            }
+        } else {
+            println!("== factory doctor ==");
+        }
         for c in &checks {
             if c.ok {
                 println!("[ok] {}: {}", c.name, c.detail);
@@ -3689,8 +3839,8 @@ fn run() -> i32 {
             slot,
             args,
         } => run_check(cli.json, adapter, slot, args),
-        Commands::Doctor => {
-            std::process::exit(cmd_doctor(cli.json));
+        Commands::Doctor { fix } => {
+            std::process::exit(cmd_doctor(cli.json, fix));
         }
         Commands::Handoff {
             issue,
