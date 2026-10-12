@@ -9,9 +9,14 @@
 
 name: Installer smoke
 
+# NOTE: releases here are created by the Release workflow itself using
+# GITHUB_TOKEN, and token-triggered events never start new workflow runs —
+# so `release: [published]` alone would never fire. Chain off the Release
+# workflow's completion instead.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -25,6 +30,8 @@ permissions:
 jobs:
   smoke:
     name: smoke (${{ matrix.runner }})
+    # Only smoke successful releases; manual dispatches always run.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
