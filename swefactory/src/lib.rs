@@ -650,7 +650,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
 <title>Factory board</title></head>\
 <body><header><h1>Factory board</h1>\
 <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -1200,7 +1200,7 @@ pub fn dispatcher_page_html(data: &DispatcherData) -> String {
 <title>Factory dispatcher</title></head>\
 <body><header><h1>Factory dispatcher</h1>\
 <p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -1235,6 +1235,365 @@ pub async fn dispatcher_resume_handler() -> axum::response::Redirect {
     axum::response::Redirect::to("/dispatch")
 }
 
+// --- train review + land button (ticket #32, spec #27) --------------------
+//
+// The human land ritual as a screen: the open train with its members,
+// each member's review verdict and diff, the train-head checks, and a
+// one-click land button. Same-binary Axum, server-rendered HTML,
+// polling fragment, no websockets.
+//
+// Reads flow through the existing seams: the open train + ledger via
+// `dispatch_state_dir` (FACTORY_STATE_DIR-overridable), verdicts via the
+// review transcripts the dispatcher writes (same `VERDICT:` parser the
+// dispatcher uses), diffs via `run_git` (FACTORY_GIT_BIN-overridable).
+// Writes flow only through the land command: the POST handler below
+// calls `cmd_land`, the same function the CLI calls, guarded by the
+// same shared preflight (`train_land_preflight`). GETs never mutate
+// (snapshot-tested like the board and dispatcher screens).
+
+/// Poll interval for the train fragment: live enough to watch merges
+/// land, calm enough to never hammer the check adapter (the fragment
+/// itself never runs checks — they run at land time, like the CLI).
+pub const TRAIN_POLL_MS: u64 = 5_000;
+
+/// Diff lines shown per member before the calm truncation note.
+pub const TRAIN_DIFF_LINES: usize = 30;
+
+/// One train member as the review screen sees it: which ticket, which
+/// branch, the review ritual's word, and what changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainMemberView {
+    pub ticket: u64,
+    pub branch: String,
+    pub verdict: Option<String>,
+    pub verdict_text: String,
+    pub diff_stat: String,
+    pub diff_truncated: bool,
+}
+
+/// The review screen: the open train (or its absence) + members +
+/// an optional notice (land refusal or hint) rendered once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainReviewData {
+    pub open: bool,
+    pub train: String,
+    pub base: String,
+    pub head: String,
+    pub members: Vec<TrainMemberView>,
+    pub notice: String,
+}
+
+/// Calm sentence when no train is open (ready, not broken).
+pub fn train_no_train_sentence() -> &'static str {
+    "No train is open right now \u{2014} cut one with `release start` and it will appear here for review."
+}
+
+/// Calm sentence when the review has not reported a verdict yet.
+pub fn train_no_verdict_sentence() -> &'static str {
+    "No review verdict yet \u{2014} the review attempt has not reported one."
+}
+
+/// Calm sentence when a member carries no file changes.
+pub fn train_no_diff_sentence() -> &'static str {
+    "No file changes recorded for this member."
+}
+
+/// Calm sentence when git cannot describe a member (never a 500).
+pub fn train_diff_unavailable_sentence() -> &'static str {
+    "Diff unavailable \u{2014} git could not describe this member."
+}
+
+/// Bea-readable verdict for one member. `None` reads as a calm
+/// sentence, never blank.
+pub fn train_verdict_text(verdict: Option<&str>) -> String {
+    match verdict {
+        Some("accept") => "Accepted \u{2014} the review passed this member.".to_string(),
+        Some("changes_requested") => {
+            "Changes requested \u{2014} the review asked for fixes.".to_string()
+        }
+        Some(other) => format!("Review said: {other}."),
+        None => train_no_verdict_sentence().to_string(),
+    }
+}
+
+/// Shared land preflight (ticket #32): the exact gate `cmd_land` runs
+/// before any mutation — clean working tree, green train head, reachable
+/// remote. The UI POST handler calls this same function first so the
+/// land button refuses red/dirty exactly like the CLI by construction.
+/// Read-only: the head check stages the train in an ephemeral worktree
+/// and removes it, mutating nothing (same as the CLI preflight).
+pub fn train_land_preflight(target: &str) -> Result<(), String> {
+    if !land_working_tree_clean() {
+        return Err(format!(
+            "land: working tree is dirty \u{2014} commit or stash before landing {target}"
+        ));
+    }
+    land_run_checks(target)?;
+    if !land_remote_reachable() {
+        return Err(
+            "land: remote origin unreachable \u{2014} refusing before any mutation".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Newest attempt for one ticket, preferring an attempt already on this
+/// train (the member's word), else the newest attempt overall.
+fn train_member_attempt(
+    ledger: &DispatchLedger,
+    ticket: u64,
+    train: &str,
+) -> Option<DispatchAttempt> {
+    let mut same: Option<&DispatchAttempt> = None;
+    let mut any: Option<&DispatchAttempt> = None;
+    for a in &ledger.attempts {
+        if a.ticket != ticket {
+            continue;
+        }
+        match any {
+            Some(b) if a.id <= b.id => {}
+            _ => any = Some(a),
+        }
+        if a.train_branch == train {
+            match same {
+                Some(b) if a.id <= b.id => {}
+                _ => same = Some(a),
+            }
+        }
+    }
+    same.or(any).cloned()
+}
+
+/// Read-only per-member diff: `git diff --stat base...branch`, bounded
+/// to TRAIN_DIFF_LINES with a calm note when truncated. Empty diffs and
+/// git failures read as sentences, never errors.
+fn train_member_diff(base: &str, branch: &str) -> (String, bool) {
+    if base.is_empty() || branch.is_empty() {
+        return (train_diff_unavailable_sentence().to_string(), false);
+    }
+    let range = format!("{base}...{branch}");
+    let out = match run_git(&["diff", "--stat", &range], None) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return (train_diff_unavailable_sentence().to_string(), false),
+    };
+    if out.trim().is_empty() {
+        return (train_no_diff_sentence().to_string(), false);
+    }
+    let lines: Vec<&str> = out.lines().collect();
+    if lines.len() <= TRAIN_DIFF_LINES {
+        return (out, false);
+    }
+    (lines[..TRAIN_DIFF_LINES].join("\n") + "\n", true)
+}
+
+/// Read-only review assembly: open train x members x verdicts x diffs.
+/// No open train reads as closed (`open: false`); callers attach a
+/// `notice` (land refusal or hint) rendered once. Read-only.
+pub fn train_review_data() -> TrainReviewData {
+    let state = dispatch_state_dir();
+    let Some(train) = load_open_train(&state) else {
+        return TrainReviewData {
+            open: false,
+            train: String::new(),
+            base: String::new(),
+            head: String::new(),
+            members: Vec::new(),
+            notice: String::new(),
+        };
+    };
+    let ledger = load_ledger(&state);
+    let head = train_head(&train.branch);
+    let mut members = Vec::new();
+    for ticket in member_tickets(&ledger, &train.branch) {
+        let branch = ticket_branch_for_merge(&ledger, ticket, &train.branch).unwrap_or_default();
+        let verdict = train_member_attempt(&ledger, ticket, &train.branch)
+            .map(|a| log_read_transcript(&state, &a))
+            .and_then(|t| parse_verdict(&t));
+        let verdict_text = train_verdict_text(verdict.as_deref());
+        let (diff_stat, diff_truncated) = train_member_diff(&train.base_commit, &branch);
+        members.push(TrainMemberView {
+            ticket,
+            branch,
+            verdict,
+            verdict_text,
+            diff_stat,
+            diff_truncated,
+        });
+    }
+    TrainReviewData {
+        open: true,
+        train: train.branch,
+        base: train.base_commit,
+        head,
+        members,
+        notice: String::new(),
+    }
+}
+
+/// Fragment HTML for the review screen (the polling unit). Pure over
+/// data so tests assert markers without a server.
+pub fn train_review_fragment_html(data: &TrainReviewData) -> String {
+    let mut html = String::new();
+    html.push_str("<section data-train-review>");
+    if !data.notice.is_empty() {
+        html.push_str(&format!("<p data-notice>{}</p>", escape_html(&data.notice)));
+    }
+    if !data.open {
+        html.push_str(&format!(
+            "<section data-no-train><p>{}</p></section>",
+            train_no_train_sentence()
+        ));
+        html.push_str("</section>");
+        return html;
+    }
+    html.push_str(&format!(
+        "<h2 data-train=\"{}\">Train {}</h2>",
+        escape_html(&data.train),
+        escape_html(&data.train),
+    ));
+    if data.head.is_empty() {
+        html.push_str("<p data-train-head=\"unknown\">Train head is not present locally.</p>");
+    } else {
+        html.push_str(&format!(
+            "<p data-train-head>Head <code>{}</code> (base <code>{}</code>).</p>",
+            escape_html(&data.head),
+            escape_html(&land_short(&data.base)),
+        ));
+    }
+    if data.members.is_empty() {
+        html.push_str("<section data-members-empty><p>No members merged yet \u{2014} merge accepted tickets with <code>release merge &lt;ticket&gt;</code>.</p></section>");
+    } else {
+        html.push_str("<section data-members>");
+        for m in &data.members {
+            let verdict_attr = m.verdict.as_deref().unwrap_or("none");
+            html.push_str(&format!(
+                "<article data-member=\"{}\" data-verdict=\"{}\" data-ticket=\"{}\"><h3>Member #{} \u{2014} {}</h3><p data-member-verdict>{}</p>",
+                m.ticket,
+                escape_html(verdict_attr),
+                m.ticket,
+                m.ticket,
+                escape_html(&m.branch),
+                escape_html(&m.verdict_text),
+            ));
+            if m.diff_truncated {
+                html.push_str(&format!(
+                    "<p data-diff-truncated>(showing first {} lines)</p>",
+                    TRAIN_DIFF_LINES
+                ));
+            }
+            html.push_str(&format!(
+                "<pre data-diff>{}</pre>",
+                escape_html(&m.diff_stat)
+            ));
+            html.push_str("</article>");
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("<div data-land><form method=\"post\" action=\"/train/land\" data-land-form><button type=\"submit\">Land this train</button></form></div>");
+    html.push_str("<p data-cli>Matches <code>factory land</code> + <code>release status</code>. Landing runs the same preflight as the CLI (clean tree, green head, reachable remote) \u{2014} red or dirty refuses here exactly like there.</p>");
+    html.push_str("</section>");
+    html
+}
+
+/// Full review page: fragment plus the polling hook that refreshes only
+/// the fragment (no full reloads). Pure over data for testing.
+pub fn train_review_page_html(data: &TrainReviewData) -> String {
+    let fragment = train_review_fragment_html(data);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Train review \u{2014} Factory</title></head>\
+<body><header><h1>Train review</h1>\
+<p>Members, verdicts, diffs, and the human land. Matches <code>factory land</code> + <code>release status</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"train\" data-train-fragment=\"/fragments/train\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('train');if(!el)return;var url=el.getAttribute('data-train-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'5000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        TRAIN_POLL_MS,
+    )
+}
+
+/// Release state after a successful land: the train named, its closed
+/// members listed, the stamped release note streaming. Pure for testing.
+pub fn train_landed_page_html(train: &str, closed: &[u64], note: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let members = closed
+        .iter()
+        .map(|t| format!("#{t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Train landed \u{2014} Factory</title></head>\
+<body><header><h1>Train landed</h1>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><section data-released><p>Train {} landed into dev. Closed members: {}.</p><p data-release-note>{}</p>\
+<p>Matches <code>factory land</code>. Cleanup commands were printed to the land log (branches are never deleted by automation).</p></section></main>\
+</body></html>",
+        escape_html(train),
+        escape_html(&members),
+        escape_html(note),
+    )
+}
+
+/// GET /train: the review screen. Read-only observer.
+pub async fn train_review_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(train_review_page_html(&train_review_data()))
+}
+
+/// GET /fragments/train: the polling unit. Read-only observer.
+pub async fn train_review_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(train_review_fragment_html(&train_review_data()))
+}
+
+/// POST /train/land: one-click land through the command function — the
+/// same `cmd_land` the CLI calls, behind the identical shared preflight
+/// (`train_land_preflight`). Refusals re-render the review carrying the
+/// CLI's own message (nothing mutated); success renders the release
+/// state naming the train and its closed members.
+pub async fn train_land_handler() -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let before = train_review_data();
+    if !before.open {
+        let mut data = before;
+        data.notice = "land: no open train \u{2014} cut one with `release start` first".to_string();
+        return (
+            axum::http::StatusCode::OK,
+            axum::response::Html(train_review_page_html(&data)),
+        );
+    }
+    if let Err(e) = train_land_preflight(&before.train) {
+        let mut data = before;
+        data.notice = e;
+        return (
+            axum::http::StatusCode::OK,
+            axum::response::Html(train_review_page_html(&data)),
+        );
+    }
+    let rc = cmd_land(false, false, None);
+    if rc == 0 {
+        let tickets: Vec<u64> = before.members.iter().map(|m| m.ticket).collect();
+        let note = land_release_note(&before.train);
+        (
+            axum::http::StatusCode::OK,
+            axum::response::Html(train_landed_page_html(&before.train, &tickets, &note)),
+        )
+    } else {
+        let mut data = train_review_data();
+        data.notice =
+            "Land did not complete \u{2014} run `factory land` to see each step.".to_string();
+        (
+            axum::http::StatusCode::OK,
+            axum::response::Html(train_review_page_html(&data)),
+        )
+    }
+}
+
 /// Handler shape for UI tickets: board page + polling fragment + health.
 /// All GETs are read-only observers (same contract as `status`/`log`).
 pub fn web_router() -> axum::Router {
@@ -1266,6 +1625,12 @@ pub fn web_router() -> axum::Router {
             "/dispatch/resume",
             axum::routing::post(dispatcher_resume_handler),
         )
+        .route("/train", axum::routing::get(train_review_page_handler))
+        .route(
+            "/fragments/train",
+            axum::routing::get(train_review_fragment_handler),
+        )
+        .route("/train/land", axum::routing::post(train_land_handler))
         .route(
             "/health",
             axum::routing::get(|| async { web_health_response() }),
@@ -5880,22 +6245,7 @@ pub fn cmd_land(json: bool, dry_run: bool, train_opt: Option<String>) -> i32 {
         eprintln!("land: train branch {target} not found — cut one with `release start` first");
         return 1;
     }
-    if !land_working_tree_clean() {
-        let msg = format!("land: working tree is dirty — commit or stash before landing {target}");
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "train": target,
-                    "dry_run": dry_run,
-                    "steps": [{"step": "preflight", "status": "failed", "detail": msg}],
-                })
-            );
-        }
-        eprintln!("{msg}");
-        return 1;
-    }
-    if let Err(e) = land_run_checks(&target) {
+    if let Err(e) = train_land_preflight(&target) {
         if json {
             println!(
                 "{}",
@@ -5907,21 +6257,6 @@ pub fn cmd_land(json: bool, dry_run: bool, train_opt: Option<String>) -> i32 {
             );
         }
         eprintln!("{e}");
-        return 1;
-    }
-    if !land_remote_reachable() {
-        let msg = "land: remote origin unreachable — refusing before any mutation".to_string();
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "train": target,
-                    "dry_run": dry_run,
-                    "steps": [{"step": "preflight", "status": "failed", "detail": msg}],
-                })
-            );
-        }
-        eprintln!("{msg}");
         return 1;
     }
     let ledger = load_ledger(&state);
