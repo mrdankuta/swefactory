@@ -676,7 +676,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
 <title>Factory board</title></head>\
 <body><header><h1>Factory board</h1>\
 <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -1226,7 +1226,7 @@ pub fn dispatcher_page_html(data: &DispatcherData) -> String {
 <title>Factory dispatcher</title></head>\
 <body><header><h1>Factory dispatcher</h1>\
 <p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -1261,6 +1261,783 @@ pub async fn dispatcher_resume_handler() -> axum::response::Redirect {
     axum::response::Redirect::to("/dispatch")
 }
 
+// --- git + files views (ticket #33, spec #27) --------------------------------
+//
+// Code awareness as one polling view: the log graph with diff stats,
+// branches with tracking state, worktrees with ticket links, plus the
+// file tree + highlighted viewer + search from any branch context.
+// Same-binary Axum, server-rendered HTML, polling fragments (~15s),
+// no websockets.
+//
+// Reads flow through the `git` runner seam (`run_git`, overridable with
+// FACTORY_GIT_BIN): `log` + `show --stat`, `branch -vv`,
+// `worktree list --porcelain`, `ls-tree`, `show <ref>:<path>`,
+// `grep -n`. GETs never mutate (snapshot-tested like the board).
+// The viewer is copy-only: a copy button over an escaped `<pre>` block
+// with no forms, no textarea, no contenteditable — edits stay outside
+// the ticket flow (freeze drift), per the spec.
+
+/// Poll interval for the git fragment (board-class panel: ~15s).
+pub const GIT_POLL_MS: u64 = 15_000;
+
+/// Poll interval for the files tree fragment (board-class panel: ~15s).
+pub const FILES_POLL_MS: u64 = 15_000;
+
+/// Commits read per git view render. Bounds `git log` plus the
+/// per-commit `git show --stat` fan-out (one subprocess per commit).
+pub const GIT_LOG_LIMIT: usize = 30;
+
+/// Default ref for the files view; any branch name works as `?ref=`.
+pub const FILE_REF_DEFAULT: &str = "HEAD";
+
+/// File viewer caps: body bytes kept, search hits kept, tree rows kept.
+/// Bounds `git show` / `git grep` / `git ls-tree` output per render.
+pub const FILE_VIEW_MAX_BYTES: usize = 200_000;
+pub const FILE_SEARCH_MAX_HITS: usize = 50;
+pub const FILES_TREE_MAX: usize = 2000;
+
+/// One log row as the git view sees it: ticket links + diff stats.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitCommit {
+    pub hash: String,
+    pub short: String,
+    pub author: String,
+    pub date: String,
+    pub subject: String,
+    pub ticket_refs: Vec<u64>,
+    pub stat: String,
+}
+
+/// One branch as the git view sees it: upstream + tracking state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitBranch {
+    pub name: String,
+    pub upstream: String,
+    pub tracking: String,
+    pub is_current: bool,
+    pub ticket_ref: Option<u64>,
+}
+
+/// One worktree as the git view sees it, with its ticket link.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitWorktree {
+    pub path: String,
+    pub branch: String,
+    pub head: String,
+    pub ticket_ref: Option<u64>,
+}
+
+/// The git view: log graph + branches + worktrees.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitData {
+    pub commits: Vec<GitCommit>,
+    pub branches: Vec<GitBranch>,
+    pub worktrees: Vec<GitWorktree>,
+}
+
+/// Ticket numbers referenced by free text: `#<n>` plus the branch forms
+/// `factory/T<n>` and `(T<n>)` subjects. Deduped, ascending. Pure.
+pub fn extract_ticket_refs(text: &str) -> Vec<u64> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u64> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let is_hash = c == b'#';
+        let is_branch_t = (c == b'T' || c == b't')
+            && i > 0
+            && (bytes[i - 1] == b'/' || bytes[i - 1] == b'(')
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_digit();
+        let start = if is_hash || is_branch_t {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(s) = start {
+            let mut j = s;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > s {
+                if let Ok(n) = text[s..j].parse::<u64>() {
+                    if n > 0 && !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Parse one `git branch -vv` line into name, upstream, and tracking
+/// state (`ahead 1`, `behind 2`, `in sync`, `upstream gone`,
+/// `no upstream`, `detached`). `None` on blank input. Pure.
+pub fn parse_git_branch_vv_line(line: &str) -> Option<GitBranch> {
+    let trimmed = line.trim_end();
+    if trimmed.trim().is_empty() {
+        return None;
+    }
+    let is_current = trimmed.starts_with('*');
+    let rest = trimmed.get(1..)?.trim_start();
+    if rest.starts_with('(') {
+        return Some(GitBranch {
+            name: "(detached)".to_string(),
+            upstream: String::new(),
+            tracking: "detached".to_string(),
+            is_current,
+            ticket_ref: None,
+        });
+    }
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = rest[..name_end].to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after_name = rest[name_end..].trim_start();
+    let mut upstream = String::new();
+    let mut tracking = "no upstream".to_string();
+    if let Some(open) = after_name.find('[') {
+        if let Some(close) = after_name[open..].find(']') {
+            let inside = &after_name[open + 1..open + close];
+            let mut split = inside.splitn(2, ':');
+            upstream = split.next().unwrap_or("").trim().to_string();
+            match split.next() {
+                None => tracking = "in sync".to_string(),
+                Some(state) if state.trim() == "gone" => {
+                    tracking = "upstream gone".to_string();
+                }
+                Some(state) => tracking = state.trim().to_string(),
+            }
+        }
+    }
+    let ticket_ref = extract_ticket_refs(&name).into_iter().next();
+    Some(GitBranch {
+        name,
+        upstream,
+        tracking,
+        is_current,
+        ticket_ref,
+    })
+}
+
+/// Parse `git worktree list --porcelain` into path/branch/HEAD rows
+/// (bare markers ignored, detached heads shown as such). Pure.
+pub fn parse_git_worktree_porcelain(text: &str) -> Vec<GitWorktree> {
+    let mut out = Vec::new();
+    let mut path = String::new();
+    let mut head = String::new();
+    let mut branch = String::new();
+    for line in text.lines().chain(std::iter::once("")) {
+        let line = line.trim();
+        if line.is_empty() {
+            if !path.is_empty() || !head.is_empty() {
+                let display = branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch.as_str())
+                    .to_string();
+                let ticket_ref = extract_ticket_refs(&display).into_iter().next();
+                out.push(GitWorktree {
+                    path: std::mem::take(&mut path),
+                    branch: if display.is_empty() {
+                        "(detached)".to_string()
+                    } else {
+                        display
+                    },
+                    head: std::mem::take(&mut head),
+                    ticket_ref,
+                });
+                branch.clear();
+            }
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = p.trim().to_string();
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            head = h.trim().to_string();
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = b.trim().to_string();
+        } else if line == "detached" {
+            branch.clear();
+        }
+    }
+    out
+}
+
+/// Read-only: newest log rows with per-commit diff stats. Any `git`
+/// failure reads as no commits (calm empty state, never a 500).
+pub fn git_log_data(limit: usize) -> Vec<GitCommit> {
+    let limit = limit.to_string();
+    let out = match run_git(
+        &[
+            "log",
+            "--pretty=format:%H|%h|%an|%ad|%s",
+            "--date=short",
+            "-n",
+            &limit,
+        ],
+        None,
+    ) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
+    };
+    let mut commits = Vec::new();
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut cols = line.splitn(5, '|');
+        let hash = cols.next().unwrap_or("").to_string();
+        let short = cols.next().unwrap_or("").to_string();
+        let author = cols.next().unwrap_or("").to_string();
+        let date = cols.next().unwrap_or("").to_string();
+        let subject = cols.next().unwrap_or("").to_string();
+        if hash.is_empty() {
+            continue;
+        }
+        let ticket_refs = extract_ticket_refs(&subject);
+        let stat = run_git(&["show", "--stat", "--oneline", "--format=", &hash], None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        commits.push(GitCommit {
+            hash,
+            short,
+            author,
+            date,
+            subject,
+            ticket_refs,
+            stat,
+        });
+    }
+    commits
+}
+
+/// Read-only: `git branch -vv` rows. Failures read as none.
+pub fn git_branch_data() -> Vec<GitBranch> {
+    run_git(&["branch", "-vv"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(parse_git_branch_vv_line)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-only: `git worktree list --porcelain` rows. Failures read as none.
+pub fn git_worktree_data() -> Vec<GitWorktree> {
+    run_git(&["worktree", "list", "--porcelain"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_git_worktree_porcelain(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Read-only git assembly: log x branches x worktrees.
+pub fn git_data() -> GitData {
+    GitData {
+        commits: git_log_data(GIT_LOG_LIMIT),
+        branches: git_branch_data(),
+        worktrees: git_worktree_data(),
+    }
+}
+
+/// JSON shape for the git view: the same facts as the prose page, so
+/// machines and the maintainer read one story.
+pub fn git_json(data: &GitData) -> serde_json::Value {
+    serde_json::json!({
+        "commits": data.commits.iter().map(|c| serde_json::json!({
+            "hash": c.hash,
+            "short": c.short,
+            "author": c.author,
+            "date": c.date,
+            "subject": c.subject,
+            "tickets": c.ticket_refs,
+            "stat": c.stat,
+        })).collect::<Vec<_>>(),
+        "branches": data.branches.iter().map(|b| serde_json::json!({
+            "name": b.name,
+            "upstream": b.upstream,
+            "tracking": b.tracking,
+            "current": b.is_current,
+            "ticket": b.ticket_ref,
+        })).collect::<Vec<_>>(),
+        "worktrees": data.worktrees.iter().map(|w| serde_json::json!({
+            "path": w.path,
+            "branch": w.branch,
+            "head": w.head,
+            "ticket": w.ticket_ref,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Calm sentence for a fully empty git view (ready, not broken).
+pub fn git_empty_sentence() -> &'static str {
+    "No git history in view \u{2014} the repo may be fresh, or git may be unavailable."
+}
+
+/// Fragment HTML for the git view (the polling unit). Pure over data so
+/// tests assert markers without a server: `data-git-log` with per-commit
+/// `data-commit` + `data-stat`, `data-branches` with per-branch
+/// `data-branch` + `data-tracking`, `data-worktrees` with per-worktree
+/// `data-worktree`, and `data-ticket` links into the ticket detail.
+pub fn git_fragment_html(data: &GitData) -> String {
+    fn ticket_links(refs: &[u64]) -> String {
+        let mut s = String::new();
+        for t in refs {
+            s.push_str(&format!(
+                "<a data-ticket=\"{t}\" href=\"/tickets/{t}\">#{t}</a> "
+            ));
+        }
+        s
+    }
+    let mut html = String::new();
+    html.push_str("<section data-git>");
+    html.push_str("<p data-cli>Matches <code>git log --graph --decorate</code> + <code>git branch -vv</code> + <code>git worktree list</code>.</p>");
+    if data.commits.is_empty() && data.branches.is_empty() && data.worktrees.is_empty() {
+        html.push_str(&format!(
+            "<section data-git-empty><p>{}</p></section>",
+            git_empty_sentence()
+        ));
+    }
+    html.push_str("<section data-git-log><h2>Log</h2>");
+    if data.commits.is_empty() {
+        html.push_str("<p data-no-commits>No commits in view right now.</p>");
+    } else {
+        for c in &data.commits {
+            html.push_str(&format!(
+                "<article data-commit=\"{}\"><h3>{} {}</h3><p data-meta>{} · {}</p>",
+                escape_html(&c.short),
+                escape_html(&c.short),
+                escape_html(&c.subject),
+                escape_html(&c.author),
+                escape_html(&c.date),
+            ));
+            let links = ticket_links(&c.ticket_refs);
+            if !links.is_empty() {
+                html.push_str(&format!("<p data-tickets>{links}</p>"));
+            }
+            if c.stat.is_empty() {
+                html.push_str("<p data-stat-empty>(no diff stats)</p>");
+            } else {
+                html.push_str(&format!("<pre data-stat>{}</pre>", escape_html(&c.stat)));
+            }
+            html.push_str("</article>");
+        }
+    }
+    html.push_str("</section>");
+    html.push_str("<section data-branches><h2>Branches</h2>");
+    if data.branches.is_empty() {
+        html.push_str("<p data-no-branches>No branches in view right now.</p>");
+    } else {
+        for b in &data.branches {
+            html.push_str(&format!(
+                "<article data-branch=\"{}\" data-current=\"{}\"><code>{}</code> ",
+                escape_html(&b.name),
+                b.is_current,
+                escape_html(&b.name),
+            ));
+            if b.upstream.is_empty() {
+                html.push_str("<span data-upstream>(no upstream)</span> ");
+            } else {
+                html.push_str(&format!(
+                    "<span data-upstream>tracks <code>{}</code></span> ",
+                    escape_html(&b.upstream)
+                ));
+            }
+            html.push_str(&format!(
+                "<span data-tracking>{}</span> ",
+                escape_html(&b.tracking)
+            ));
+            if let Some(t) = b.ticket_ref {
+                html.push_str(&format!(
+                    "<a data-ticket=\"{t}\" href=\"/tickets/{t}\">#{t}</a>"
+                ));
+            }
+            html.push_str("</article>");
+        }
+    }
+    html.push_str("</section>");
+    html.push_str("<section data-worktrees><h2>Worktrees</h2>");
+    if data.worktrees.is_empty() {
+        html.push_str("<p data-no-worktrees>None.</p>");
+    } else {
+        for w in &data.worktrees {
+            html.push_str(&format!(
+                "<article data-worktree=\"{}\"><code>{}</code> <span data-branch-name>branch <code>{}</code></span> <span data-head>at <code>{}</code></span> ",
+                escape_html(&w.path),
+                escape_html(&w.path),
+                escape_html(&w.branch),
+                escape_html(&w.head),
+            ));
+            if let Some(t) = w.ticket_ref {
+                html.push_str(&format!(
+                    "<a data-ticket=\"{t}\" href=\"/tickets/{t}\">#{t}</a>"
+                ));
+            }
+            html.push_str("</article>");
+        }
+    }
+    html.push_str("</section>");
+    html.push_str("</section>");
+    html
+}
+
+/// Full git page: the fragment plus the polling hook that refreshes only
+/// the fragment (no full reloads). Pure over data for testing.
+pub fn git_page_html(data: &GitData) -> String {
+    let fragment = git_fragment_html(data);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory git</title></head>\
+<body><header><h1>Factory git</h1>\
+<p>Log, branches, and worktrees with ticket links. Matches <code>git log --graph --decorate</code> + <code>git branch -vv</code> + <code>git worktree list</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"git\" data-git-fragment=\"/fragments/git\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('git');if(!el)return;var url=el.getAttribute('data-git-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        GIT_POLL_MS,
+    )
+}
+
+/// GET /git: the code-awareness screen. Read-only observer.
+pub async fn git_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(git_page_html(&git_data()))
+}
+
+/// GET /fragments/git: the polling unit. Read-only observer.
+pub async fn git_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(git_fragment_html(&git_data()))
+}
+
+/// GET /api/git: machines read the same facts as JSON.
+pub async fn git_api_handler() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(git_json(&git_data())),
+    )
+}
+
+// --- files view (ticket #33, spec #27) --------------------------------------
+//
+// View-only file awareness from any branch context (`?ref=`, default
+// HEAD): the tree (`git ls-tree`), the viewer (`git show <ref>:<path>`
+// as escaped HTML with a copy button, never an editor), and search
+// (`git grep -n`). Same read-only contract as the git view: failures
+// render calm sentences, never 500s.
+
+/// Query: `?ref=<branch>` (default HEAD) for the tree and the page.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FilesTreeQuery {
+    #[serde(alias = "ref")]
+    pub gitref: Option<String>,
+}
+
+/// Query: `?ref=<branch>&path=<repo-path>` for the viewer.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FilesViewQuery {
+    #[serde(alias = "ref")]
+    pub gitref: Option<String>,
+    pub path: String,
+}
+
+/// Query: `?ref=<branch>&q=<text>` for search.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FilesSearchQuery {
+    #[serde(alias = "ref")]
+    pub gitref: Option<String>,
+    pub q: String,
+}
+
+fn clean_ref(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        None | Some("") => FILE_REF_DEFAULT.to_string(),
+        Some(r) => r.to_string(),
+    }
+}
+
+fn ref_is_safe(gitref: &str) -> bool {
+    !gitref.is_empty()
+        && !gitref.starts_with('-')
+        && !gitref.bytes().any(|b| b.is_ascii_whitespace() || b == 0)
+}
+
+/// Keep a viewer path inside the repo: reject absolute paths, parent
+/// escapes, and empty selections. Returns the cleaned path. Pure.
+pub fn sanitize_repo_path(path: &str) -> Result<String, String> {
+    let t = path.trim();
+    if t.is_empty() {
+        return Err(
+            "invalid path: no file selected \u{2014} pick a file from the tree.".to_string(),
+        );
+    }
+    if t.starts_with('/') {
+        return Err(format!(
+            "invalid path {t}: paths must stay inside the repo."
+        ));
+    }
+    if t.contains('\\') {
+        return Err(format!(
+            "invalid path {t}: paths must stay inside the repo."
+        ));
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in t.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return Err(format!(
+                "invalid path {t}: paths must stay inside the repo."
+            ));
+        }
+        parts.push(seg);
+    }
+    if parts.is_empty() {
+        return Err(
+            "invalid path: no file selected \u{2014} pick a file from the tree.".to_string(),
+        );
+    }
+    Ok(parts.join("/"))
+}
+
+/// Highlight hint for the viewer `<code>` block, by file extension.
+pub fn file_language(path: &str) -> &'static str {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => "rust",
+        "md" | "markdown" => "markdown",
+        "toml" => "toml",
+        "json" => "json",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" => "typescript",
+        "py" => "python",
+        "sh" | "bash" => "bash",
+        "html" => "html",
+        "css" => "css",
+        "yml" | "yaml" => "yaml",
+        "xml" => "xml",
+        "rb" => "ruby",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "hpp" => "cpp",
+        _ => "text",
+    }
+}
+
+/// Calm sentence for an empty file tree.
+pub fn files_empty_sentence() -> &'static str {
+    "No files listed for this branch \u{2014} the tree may be empty or git may be unavailable."
+}
+
+/// Read-only: `git ls-tree` rows at one ref. Failures read as none.
+pub fn files_tree(gitref: &str) -> Vec<String> {
+    if !ref_is_safe(gitref) {
+        return Vec::new();
+    }
+    run_git(&["ls-tree", "-r", "--name-only", gitref], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.trim().is_empty())
+                .take(FILES_TREE_MAX)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-only: file body at `<ref>:<path>` with a truncation flag.
+/// Binary files read as a calm note; missing files and bad paths are
+/// `Err` sentences (the fragment renders them, never a 500).
+pub fn file_view(gitref: &str, path: &str) -> Result<(String, bool), String> {
+    let clean = sanitize_repo_path(path)?;
+    if !ref_is_safe(gitref) {
+        return Err(format!(
+            "There is no ref {gitref} that the factory can show."
+        ));
+    }
+    let spec = format!("{gitref}:{clean}");
+    let out = match run_git(&["show", &spec], None) {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            return Err(format!(
+                "There is no file {clean} at {gitref} that the factory can see."
+            ));
+        }
+    };
+    if out.contains(&0) {
+        return Ok(("(binary file: preview not shown.)".to_string(), false));
+    }
+    let body = String::from_utf8_lossy(&out).into_owned();
+    if body.len() > FILE_VIEW_MAX_BYTES {
+        let mut end = FILE_VIEW_MAX_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Ok((body[..end].to_string(), true));
+    }
+    Ok((body, false))
+}
+
+/// Read-only: `git grep -n` hits at one ref (capped). Empty queries and
+/// failures read as no hits.
+pub fn files_search(gitref: &str, q: &str) -> Vec<String> {
+    if q.trim().is_empty() || !ref_is_safe(gitref) {
+        return Vec::new();
+    }
+    run_git(&["grep", "-n", "-I", "-e", q, gitref, "--"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.trim().is_empty())
+                .take(FILE_SEARCH_MAX_HITS)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"._~/-".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Fragment HTML for the file tree (a polling unit). Pure over the tree
+/// so tests assert markers without a server.
+pub fn files_tree_fragment_html(tree: &[String], gitref: &str) -> String {
+    let mut html = format!(
+        "<section data-files-tree data-ref=\"{}\"><h2>Files at {}</h2>",
+        escape_html(gitref),
+        escape_html(gitref),
+    );
+    if tree.is_empty() {
+        html.push_str(&format!(
+            "<p data-empty-tree>{}</p>",
+            files_empty_sentence()
+        ));
+    } else {
+        html.push_str("<ul>");
+        for p in tree {
+            html.push_str(&format!(
+                "<li><a data-file=\"{}\" href=\"/fragments/files/view?ref={}&amp;path={}\">{}</a></li>",
+                escape_html(p),
+                url_encode(gitref),
+                url_encode(p),
+                escape_html(p),
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</section>");
+    html
+}
+
+/// Fragment HTML for the viewer: copy button over escaped code, never an
+/// editor (no forms, no textarea, no contenteditable). Pure for testing.
+pub fn file_view_fragment_html(gitref: &str, path: &str, body: &str, truncated: bool) -> String {
+    let mut html = format!(
+        "<section data-file-view data-ref=\"{}\" data-path=\"{}\"><h3>{}</h3>\
+<p data-cli>Matches <code>git show {}:{}</code>. View-only \u{2014} copy what you need.</p>\
+<button type=\"button\" data-copy-button data-copy-target=\"file-body\">Copy</button>",
+        escape_html(gitref),
+        escape_html(path),
+        escape_html(path),
+        escape_html(gitref),
+        escape_html(path),
+    );
+    html.push_str(&format!(
+        "<pre data-file-body id=\"file-body\"><code class=\"language-{}\">{}</code></pre>",
+        file_language(path),
+        escape_html(body),
+    ));
+    if truncated {
+        html.push_str(&format!(
+            "<p data-truncated>Showing the first {} bytes \u{2014} the rest is hidden. Full file: <code>git show {}:{}</code>.</p>",
+            FILE_VIEW_MAX_BYTES,
+            escape_html(gitref),
+            escape_html(path),
+        ));
+    }
+    html.push_str("</section>");
+    html
+}
+
+/// Calm missing-file fragment (a sentence, never a bare 500).
+pub fn file_view_missing_fragment_html(gitref: &str, path: &str, reason: &str) -> String {
+    format!(
+        "<section data-file-missing data-ref=\"{}\"><p>There is no file {} at {} that the factory can show \u{2014} {}</p></section>",
+        escape_html(gitref),
+        escape_html(path),
+        escape_html(gitref),
+        escape_html(reason),
+    )
+}
+
+/// Fragment HTML for search hits at one ref. Pure for testing.
+pub fn files_search_fragment_html(gitref: &str, q: &str, hits: &[String]) -> String {
+    let mut html = format!(
+        "<section data-files-search data-ref=\"{}\"><h2>Search &quot;{}&quot; at {}</h2>",
+        escape_html(gitref),
+        escape_html(q),
+        escape_html(gitref),
+    );
+    if hits.is_empty() {
+        html.push_str(&format!(
+            "<p data-no-matches>No matches for &quot;{}&quot; in {} \u{2014} try another search.</p>",
+            escape_html(q),
+            escape_html(gitref),
+        ));
+    } else {
+        html.push_str("<ol>");
+        for h in hits {
+            html.push_str(&format!(
+                "<li data-search-hit><code>{}</code></li>",
+                escape_html(h)
+            ));
+        }
+        html.push_str("</ol>");
+    }
+    html.push_str("</section>");
+    html
+}
 // --- train review + land button (ticket #32, spec #27) --------------------
 //
 // The human land ritual as a screen: the open train with its members,
@@ -1521,6 +2298,88 @@ pub fn train_review_fragment_html(data: &TrainReviewData) -> String {
     html
 }
 
+/// Full files page: tree plus search plus the viewer hook, with the ref
+/// context echoed and polling on the tree. Pure for testing.
+pub fn files_page_html(tree: &[String], gitref: &str) -> String {
+    let tree_html = files_tree_fragment_html(tree, gitref);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory files</title></head>\
+<body><header><h1>Factory files</h1>\
+<p>Tree, viewer, and search from any branch. Matches <code>git ls-tree</code> + <code>git show &lt;ref&gt;:&lt;path&gt;</code> + <code>git grep</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"files\" data-files-fragment=\"/fragments/files/tree?ref={}\" data-poll-ms=\"{}\">\
+{tree_html}</div>\
+<section data-files-search data-ref=\"{}\"><h2>Search</h2>\
+<form method=\"get\" action=\"/fragments/files/search\" data-search-form>\
+<input type=\"hidden\" name=\"ref\" value=\"{}\">\
+<input name=\"q\" placeholder=\"Search this branch...\">\
+<button type=\"submit\">Search</button></form></section>\
+<div id=\"file-view\" data-view-fragment=\"/fragments/files/view\">\
+<section data-file-view-empty><p>Pick a file from the tree to read it here. Files are view-only \u{2014} copy what you need.</p></section></div></main>\
+<script>(function(){{var el=document.getElementById('files');if(!el)return;var url=el.getAttribute('data-files-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+<script>document.addEventListener('click',function(e){{var b=e.target&&e.target.closest?e.target.closest('[data-copy-button]'):null;if(!b)return;\
+var t=document.getElementById(b.getAttribute('data-copy-target'));if(!t)return;\
+var text=t.innerText||t.textContent||'';\
+if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(text).then(function(){{b.textContent='Copied';}}).catch(function(){{}});}}}});</script>\
+</body></html>",
+        url_encode(gitref),
+        FILES_POLL_MS,
+        escape_html(gitref),
+        escape_html(gitref),
+    )
+}
+
+/// GET /files: tree + search + viewer hook for one ref. Read-only observer.
+pub async fn files_page_handler(
+    axum::extract::Query(q): axum::extract::Query<FilesTreeQuery>,
+) -> axum::response::Html<String> {
+    let gitref = clean_ref(q.gitref.as_deref());
+    axum::response::Html(files_page_html(&files_tree(&gitref), &gitref))
+}
+
+/// GET /fragments/files/tree?ref=: the tree polling unit. Read-only observer.
+pub async fn files_tree_fragment_handler(
+    axum::extract::Query(q): axum::extract::Query<FilesTreeQuery>,
+) -> axum::response::Html<String> {
+    let gitref = clean_ref(q.gitref.as_deref());
+    axum::response::Html(files_tree_fragment_html(&files_tree(&gitref), &gitref))
+}
+
+/// GET /fragments/files/view?ref=&path=: the viewer. Read-only and
+/// copy-only; unknown files and bad paths render a calm sentence.
+pub async fn file_view_fragment_handler(
+    axum::extract::Query(q): axum::extract::Query<FilesViewQuery>,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let gitref = clean_ref(q.gitref.as_deref());
+    match file_view(&gitref, &q.path) {
+        Ok((body, truncated)) => (
+            axum::http::StatusCode::OK,
+            axum::response::Html(file_view_fragment_html(&gitref, &q.path, &body, truncated)),
+        ),
+        Err(reason) => (
+            axum::http::StatusCode::OK,
+            axum::response::Html(file_view_missing_fragment_html(&gitref, &q.path, &reason)),
+        ),
+    }
+}
+
+/// GET /fragments/files/search?ref=&q=: search hits. Read-only observer.
+pub async fn files_search_fragment_handler(
+    axum::extract::Query(q): axum::extract::Query<FilesSearchQuery>,
+) -> axum::response::Html<String> {
+    let gitref = clean_ref(q.gitref.as_deref());
+    axum::response::Html(files_search_fragment_html(
+        &gitref,
+        &q.q,
+        &files_search(&gitref, &q.q),
+    ))
+}
+
 /// Full review page: fragment plus the polling hook that refreshes only
 /// the fragment (no full reloads). Pure over data for testing.
 pub fn train_review_page_html(data: &TrainReviewData) -> String {
@@ -1532,7 +2391,7 @@ pub fn train_review_page_html(data: &TrainReviewData) -> String {
 <title>Train review \u{2014} Factory</title></head>\
 <body><header><h1>Train review</h1>\
 <p>Members, verdicts, diffs, and the human land. Matches <code>factory land</code> + <code>release status</code>.</p>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"train\" data-train-fragment=\"/fragments/train\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -1557,7 +2416,7 @@ pub fn train_landed_page_html(train: &str, closed: &[u64], note: &str) -> String
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <title>Train landed \u{2014} Factory</title></head>\
 <body><header><h1>Train landed</h1>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/train\">Train review</a></nav>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><section data-released><p>Train {} landed into dev. Closed members: {}.</p><p data-release-note>{}</p>\
 <p>Matches <code>factory land</code>. Cleanup commands were printed to the land log (branches are never deleted by automation).</p></section></main>\
@@ -1650,6 +2509,22 @@ pub fn web_router() -> axum::Router {
         .route(
             "/dispatch/resume",
             axum::routing::post(dispatcher_resume_handler),
+        )
+        .route("/git", axum::routing::get(git_page_handler))
+        .route("/fragments/git", axum::routing::get(git_fragment_handler))
+        .route("/api/git", axum::routing::get(git_api_handler))
+        .route("/files", axum::routing::get(files_page_handler))
+        .route(
+            "/fragments/files/tree",
+            axum::routing::get(files_tree_fragment_handler),
+        )
+        .route(
+            "/fragments/files/view",
+            axum::routing::get(file_view_fragment_handler),
+        )
+        .route(
+            "/fragments/files/search",
+            axum::routing::get(files_search_fragment_handler),
         )
         .route("/train", axum::routing::get(train_review_page_handler))
         .route(
