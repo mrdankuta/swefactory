@@ -24,6 +24,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Ticket #29 (spec #27 board): Tokio runtime serves the Axum router from
+# the same binary. Minimal features: multi-thread runtime + macros for
+# `#[tokio::test]` in endpoint tests, net/time for `axum::serve`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 
 [dev-dependencies]
 assert_cmd = "2"
