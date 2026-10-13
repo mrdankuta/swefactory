@@ -2619,8 +2619,10 @@ fn cmd_dispatch_ticket(
     remove_worktree(&wt);
     if verdict.as_deref() == Some("accept") {
         // Accept path: with an open train, auto-merge cleanly or route to
-        // blocked on conflict (never forced). Without a train the human
-        // owns the land. Never merges into dev/main, never pushes.
+        // blocked on conflict (never forced). With no open train, auto-cut
+        // a default-slug train (T35) and merge there instead of waiting;
+        // a concurrently opened train is merged into, never duplicated.
+        // Never merges into dev/main, never pushes.
         if !open_train_branch.is_empty() {
             match do_train_merge(ticket, &branch, &open_train_branch, state) {
                 Ok(short) => {
@@ -2637,11 +2639,65 @@ fn cmd_dispatch_ticket(
                 }
             }
         } else {
-            // Accepted: human owns the land. Record base→head, never merge/push.
-            gh_relabel(ticket, Some("review"), "accepted");
-            gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
-            println!("  ACCEPTED — #{ticket} awaiting human land");
-            finish_attempt(state, ledger, idx, "review_done", 0);
+            // Auto-cut (T35): no open train, so cut one (default slug)
+            // and merge the accepted ticket into it. A concurrent open
+            // refuses the cut — merge into that train instead, never a
+            // second train. Any other cut failure falls back to the old
+            // accepted-only record (base→head, human owns the land).
+            let train = match cut_train(state, None) {
+                Ok(t) => {
+                    println!("  auto-cut train {t} (no open train)");
+                    Some(t)
+                }
+                Err(e) if e.contains("already open") => {
+                    match load_open_train(state) {
+                        Some(t) => {
+                            println!(
+                            "  train opened concurrently ({}) — merging there, never a second train",
+                            t.branch
+                        );
+                            Some(t.branch)
+                        }
+                        None => {
+                            eprintln!("dispatch: auto-cut race ({e}) with no open train — recording accepted");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dispatch: auto-cut failed ({e}) — recording accepted");
+                    None
+                }
+            };
+            match train {
+                Some(t) => {
+                    ledger.attempts[idx].train_branch = t.clone();
+                    if let Err(e) = save_ledger(state, ledger) {
+                        eprintln!("dispatch: {e}");
+                    }
+                    match do_train_merge(ticket, &branch, &t, state) {
+                        Ok(short) => {
+                            gh_relabel(ticket, Some("review"), "integrated");
+                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` and merged into it ({short}). Human: covered by the train→dev review."));
+                            println!("  ACCEPTED + INTEGRATED into {t} (auto-cut) — #{ticket}");
+                            finish_attempt(state, ledger, idx, "review_done", 0);
+                        }
+                        Err(e) => {
+                            println!("  merge into auto-cut train failed — routing to blocked (never forced)");
+                            gh_relabel(ticket, Some("review"), "blocked");
+                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` but merge failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
+                            finish_attempt(state, ledger, idx, "review_failed", 0);
+                        }
+                    }
+                }
+                None => {
+                    // Accepted: human owns the land. Record base→head, never merge/push.
+                    gh_relabel(ticket, Some("review"), "accepted");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
+                    println!("  ACCEPTED — #{ticket} awaiting human land");
+                    finish_attempt(state, ledger, idx, "review_done", 0);
+                }
+            }
         }
     } else {
         println!("  changes_requested (or unreadable verdict) — back to ready");
@@ -2649,6 +2705,58 @@ fn cmd_dispatch_ticket(
         finish_attempt(state, ledger, idx, "review_failed", 0);
     }
     TicketOutcome::Done
+}
+
+/// Auto-finish (T35): when the open train's head is an ancestor of dev,
+/// the human has merged it — finish without the command (row closed,
+/// train worktree removed, branch cleanup printed, branches never
+/// deleted). Starts with a read-only `git fetch origin` (best effort:
+/// a failed fetch never fails the pass) so a human merge pushed
+/// elsewhere is observed. Unmerged trains are left untouched. With
+/// `dry_run`, observes and prints but changes nothing.
+/// Returns true when a train was finished this pass.
+fn maybe_auto_finish(state: &std::path::Path, dry_run: bool) -> bool {
+    let Some(train) = load_open_train(state) else {
+        return false;
+    };
+    // Read-only fetch first: observe the human's merge wherever it landed.
+    let _ = run_git(&["fetch", "origin"], None);
+    if !train_merged_into_dev(&train.branch) {
+        return false;
+    }
+    // Same empty-train guard as `release finish`: an untouched train whose
+    // head still equals both its base and dev was never landed.
+    let head_now = train_head(&train.branch);
+    if head_now.is_empty() {
+        return false;
+    }
+    let dev_head = rev_parse_ok("dev")
+        .or_else(|| rev_parse_ok("origin/dev"))
+        .unwrap_or_default();
+    if head_now == train.base_commit && head_now == dev_head {
+        return false;
+    }
+    if dry_run {
+        println!(
+            "dry-run: would finish merged train {} (row merged, worktree removed, cleanup printed; branches never deleted)",
+            train.branch
+        );
+        return false;
+    }
+    match finish_train_closed(state) {
+        Ok((branch, _members, cleanup)) => {
+            println!("release: train {branch} merged into dev");
+            println!("cleanup (human runs these, automation never deletes):");
+            for line in &cleanup {
+                println!("  {line}");
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("dispatch auto-finish: {e}");
+            false
+        }
+    }
 }
 
 pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
@@ -2671,6 +2779,10 @@ pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
         return 0;
     };
     let mut ledger = load_ledger(&state);
+    // Auto-finish (T35) runs before the ticket survey so a human-merged
+    // train closes even on passes with no open tickets. Read-only fetch
+    // first, unmerged trains untouched, dry-run changes nothing.
+    maybe_auto_finish(&state, dry_run);
     let max_concurrent = dispatch_max_concurrent();
     let max_attempts = dispatch_max_attempts();
     if dispatch_active(&ledger) >= max_concurrent {
@@ -4046,18 +4158,20 @@ fn train_head(train: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
-    let state = dispatch_state_dir();
-    if let Err(e) = std::fs::create_dir_all(&state) {
-        eprintln!("release: cannot create {}: {e}", state.display());
-        return 1;
+/// Cut a new integration train from the dev base and record it open.
+/// Shared by `release start` and dispatch auto-cut (T35): same refusal
+/// when a train is already open (never two open trains), same refusal
+/// when the branch name exists, same dev base. Returns the train branch.
+/// Read-write: creates the branch + train.json. Never touches dev/main.
+fn cut_train(state: &std::path::Path, slug_opt: Option<&str>) -> Result<String, String> {
+    if let Err(e) = std::fs::create_dir_all(state) {
+        return Err(format!("release: cannot create {}: {e}", state.display()));
     }
-    if let Some(existing) = load_open_train(&state) {
-        eprintln!(
+    if let Some(existing) = load_open_train(state) {
+        return Err(format!(
             "release: train already open ({}) — merge or abandon it first; never two open trains",
             existing.branch
-        );
-        return 1;
+        ));
     }
     let mut slug = slugify(slug_opt.unwrap_or("train"));
     if slug.is_empty() {
@@ -4066,22 +4180,21 @@ pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
     let stamp = date_stamp();
     let train = format!("integration/{stamp}-{slug}");
     if branch_exists(&train) {
-        eprintln!("release: branch {train} already exists — refusing to reuse");
-        return 1;
+        return Err(format!(
+            "release: branch {train} already exists — refusing to reuse"
+        ));
     }
     let base = resolve_train_base();
     match run_git(&["branch", &train, &base], None) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
-            eprintln!(
+            return Err(format!(
                 "release: git branch failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return 1;
+            ));
         }
         Err(e) => {
-            eprintln!("release: {e}");
-            return 1;
+            return Err(format!("release: {e}"));
         }
     }
     let record = TrainState {
@@ -4090,19 +4203,36 @@ pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
         status: "open".to_string(),
         created_at: now_stamp(),
     };
-    if let Err(e) = save_train(&state, &record) {
-        eprintln!("release: {e}");
-        return 1;
+    if let Err(e) = save_train(state, &record) {
+        return Err(format!("release: {e}"));
     }
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"train": train, "base": base, "open": true})
-        );
-    } else {
-        println!("release: train {train} cut from {base}");
+    Ok(train)
+}
+
+pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
+    let state = dispatch_state_dir();
+    let base_hint = resolve_train_base();
+    match cut_train(&state, slug_opt) {
+        Ok(train) => {
+            // Base was resolved inside cut_train; re-read for the report.
+            let base = load_open_train(&state)
+                .map(|t| t.base_commit)
+                .unwrap_or(base_hint);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"train": train, "base": base, "open": true})
+                );
+            } else {
+                println!("release: train {train} cut from {base}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
-    0
 }
 
 pub fn cmd_release_status(json: bool) -> i32 {
@@ -4266,18 +4396,21 @@ fn cleanup_lines(train: &str, members: &[String]) -> Vec<String> {
     lines
 }
 
-pub fn cmd_release_finish(json: bool) -> i32 {
-    let state = dispatch_state_dir();
-    let Some(train) = load_open_train(&state) else {
-        eprintln!("release: no open train");
-        return 1;
-    };
+/// Verify the human merged the open train into dev and close it:
+/// remove the train worktree, clear the train row, return the branch,
+/// its member branches, and the human-run cleanup lines (never executed
+/// here — branches are never deleted by automation). Shared by `release
+/// finish` and dispatch auto-finish (T35): identical merge predicate
+/// (ancestor check + empty-train guard), identical effects.
+fn finish_train_closed(
+    state: &std::path::Path,
+) -> Result<(String, Vec<String>, Vec<String>), String> {
+    let train = load_open_train(state).ok_or_else(|| "release: no open train".to_string())?;
     if !train_merged_into_dev(&train.branch) {
-        eprintln!(
+        return Err(format!(
             "release: train {} not merged into dev — human must merge first",
             train.branch
-        );
-        return 1;
+        ));
     }
     // An empty train (head == base) is trivially an ancestor but was never
     // landed: refuse only when dev still points at the same commit (no
@@ -4285,40 +4418,51 @@ pub fn cmd_release_finish(json: bool) -> i32 {
     // train, dev has a new merge commit so dev != train and finish succeeds.
     let head_now = train_head(&train.branch);
     if head_now.is_empty() {
-        eprintln!(
+        return Err(format!(
             "release: train {} not merged into dev — human must merge first",
             train.branch
-        );
-        return 1;
+        ));
     }
     let dev_head = rev_parse_ok("dev")
         .or_else(|| rev_parse_ok("origin/dev"))
         .unwrap_or_default();
     if head_now == train.base_commit && head_now == dev_head {
-        eprintln!(
+        return Err(format!(
             "release: train {} not merged into dev — human must merge first",
             train.branch
-        );
-        return 1;
+        ));
     }
-    let ledger = load_ledger(&state);
+    let ledger = load_ledger(state);
     let members = member_branches(&ledger, &train.branch);
-    remove_train_worktree(&state);
-    clear_train(&state);
+    remove_train_worktree(state);
+    clear_train(state);
     let cleanup = cleanup_lines(&train.branch, &members);
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"train": train.branch, "merged": true, "cleanup": cleanup})
-        );
-    } else {
-        println!("release: train {} merged into dev", train.branch);
-        println!("cleanup (human runs these, automation never deletes):");
-        for line in &cleanup {
-            println!("  {line}");
+    Ok((train.branch, members, cleanup))
+}
+
+pub fn cmd_release_finish(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    match finish_train_closed(&state) {
+        Ok((branch, _members, cleanup)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"train": branch, "merged": true, "cleanup": cleanup})
+                );
+            } else {
+                println!("release: train {branch} merged into dev");
+                println!("cleanup (human runs these, automation never deletes):");
+                for line in &cleanup {
+                    println!("  {line}");
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
         }
     }
-    0
 }
 
 pub fn cmd_release_abandon(json: bool) -> i32 {
