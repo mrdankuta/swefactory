@@ -13,7 +13,12 @@ shell/PowerShell installers and a Homebrew formula via cargo-dist
 (mac, Windows, and musl-static Linux):
 
 ```sh
-# Linux / macOS (one curl-pipe command):
+# macOS (Homebrew tap, one command):
+brew install mrdankuta/tap/factory
+```
+
+```sh
+# Linux (one curl-pipe command):
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/mrdankuta/swefactory/releases/latest/download/factory-installer.sh | sh
 ```
@@ -21,11 +26,6 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 ```powershell
 # Windows PowerShell (one pipe, no toolchain):
 irm https://github.com/mrdankuta/swefactory/releases/latest/download/factory-installer.ps1 | iex
-```
-
-```sh
-# …or via Homebrew from the published formula:
-brew install https://github.com/mrdankuta/swefactory/releases/latest/download/factory.rb
 ```
 
 Verify with `factory version` (or `factory --json version`).
