@@ -202,11 +202,11 @@ pub enum Commands {
     },
     /// Bea's front door (spec #41 backbone, ticket #42): install check,
     /// GitHub auth as a guided tour, repo pick-or-create (private by
-    /// default, identity-only seed for fresh repos). A state machine that
-    /// resumes: rerunning continues where the last run stopped and never
-    /// duplicates created resources. Every step prints in plain words;
-    /// --plain selects the plain transcript explicitly (the visual screen
-    /// is a later ticket; today both paths print the same backbone).
+    /// default, identity-only seed for fresh repos), idea capture, and the
+    /// draft-approve loop (idea in, approved plan out). A state machine
+    /// that resumes: rerunning continues where the last run stopped and
+    /// never duplicates created resources. The `/onboard` screen is
+    /// primary; --plain carries the same facts for SSH and automation.
     /// Choices arrive via flags or FACTORY_ONBOARD_* env so SSH and
     /// automation never hit an interactive wall.
     Onboard {
@@ -225,6 +225,12 @@ pub enum Commands {
         /// The idea in plain sentences, stored verbatim in the seed.
         #[arg(long)]
         idea: Option<String>,
+        /// Approve the current draft version (freezes it with its hash).
+        #[arg(long)]
+        approve: bool,
+        /// Ask for a change in plain words (mints the next version).
+        #[arg(long)]
+        change: Option<String>,
     },
 }
 
@@ -2532,6 +2538,19 @@ pub fn web_router() -> axum::Router {
             axum::routing::get(train_review_fragment_handler),
         )
         .route("/train/land", axum::routing::post(train_land_handler))
+        .route("/onboard", axum::routing::get(onboard_page_handler))
+        .route(
+            "/fragments/onboard",
+            axum::routing::get(onboard_fragment_handler),
+        )
+        .route(
+            "/onboard/approve",
+            axum::routing::post(onboard_approve_handler),
+        )
+        .route(
+            "/onboard/change",
+            axum::routing::post(onboard_change_handler),
+        )
         .route(
             "/health",
             axum::routing::get(|| async { web_health_response() }),
@@ -2618,8 +2637,8 @@ pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
 // (detect, install hint, browser device-flow tour, verify with an API
 // call). Fresh repos are private by default and get the identity-only
 // seed (name README, idea file, ignore file, first commit) — never sample
-// code. `--plain` covers every step: the visual screen is a later ticket,
-// so both paths print the same plain backbone today.
+// code. `--plain` covers every step: the `/onboard` screen is primary
+// (ticket #43) and carries the same facts as the plain transcript.
 // ---------------------------------------------------------------------------
 
 /// Fixed bytes of the identity-only seed README (`{name}` substituted).
@@ -2641,8 +2660,13 @@ pub fn onboard_default_idea() -> &'static str {
 }
 
 /// Resumable onboarding progress. `steps` holds the visited step names in
-/// order (`install`, `auth`, `repo`, `ready`); `created` is true only after
-/// a successful `gh repo create` for `repo`, so resumes skip the create.
+/// order (`install`, `auth`, `repo`, `idea`, `draft`, `approve`, `ready`);
+/// `created` is true only after a successful `gh repo create` for `repo`,
+/// so resumes skip the create. `idea` is her telling verbatim;
+/// `draft_version` counts the approve-loop rounds (v1 kept when v2
+/// lands); `approved_version` + `draft_hash` freeze what she approved
+/// (freeze lineage starts here, per the spec). New fields carry
+/// `#[serde(default)]` so pre-loop state files still parse.
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct OnboardState {
     pub install_ok: bool,
@@ -2652,6 +2676,16 @@ pub struct OnboardState {
     pub created: bool,
     pub seeded: bool,
     pub steps: Vec<String>,
+    #[serde(default)]
+    pub idea: String,
+    #[serde(default)]
+    pub draft_version: u64,
+    #[serde(default)]
+    pub approved_version: u64,
+    #[serde(default)]
+    pub draft_hash: String,
+    #[serde(default)]
+    pub changes: Vec<String>,
 }
 
 impl Default for OnboardState {
@@ -2664,6 +2698,11 @@ impl Default for OnboardState {
             created: false,
             seeded: false,
             steps: Vec::new(),
+            idea: String::new(),
+            draft_version: 0,
+            approved_version: 0,
+            draft_hash: String::new(),
+            changes: Vec::new(),
         }
     }
 }
@@ -2676,6 +2715,8 @@ pub struct OnboardOpts {
     pub new: Option<String>,
     pub visibility: Option<String>,
     pub idea: Option<String>,
+    pub approve: bool,
+    pub change: Option<String>,
 }
 
 fn onboard_state_path(state: &std::path::Path) -> PathBuf {
@@ -2896,7 +2937,446 @@ fn onboard_step_repo(
     if let Err(e) = onboard_save(&dispatch_state_dir(), progress) {
         return Err(format!("factory onboard: {e}"));
     }
+    Ok("idea")
+}
+
+/// Split Bea's idea into sentences (her own words, kept in order).
+/// Splits on `.`, `!`, `?`; empty pieces are dropped. Pure: the draft
+/// renderer and its readers share it, so the CLI and the screen agree.
+pub fn onboard_sentences(idea: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in idea.chars() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            let s = cur.trim().to_string();
+            if !s.is_empty() {
+                out.push(s);
+            }
+            cur.clear();
+        }
+    }
+    let tail = cur.trim().to_string();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Epic title in her own words: the repo plus her first sentence.
+pub fn onboard_epic_title(repo: &str, idea: &str) -> String {
+    match onboard_sentences(idea).into_iter().next() {
+        Some(first) => format!("{repo}: {first}"),
+        None => format!("{repo}: Bea's idea"),
+    }
+}
+
+/// Ticket beginnings in her own words: capture the verbatim idea, shape
+/// it into an approvable plan, build the approved plan onto the board.
+pub fn onboard_tickets(repo: &str, idea: &str) -> Vec<String> {
+    let sentences = onboard_sentences(idea);
+    let first = sentences
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Bea's idea.".to_string());
+    let second = sentences.get(1).cloned().unwrap_or_else(|| first.clone());
+    vec![
+        format!("Capture \u{2014} keep Bea's idea verbatim: \"{first}\""),
+        format!(
+            "Shape \u{2014} turn \"{second}\" into an epic, a spec, and tickets for approval."
+        ),
+        format!(
+            "Build \u{2014} put the approved {repo} plan on the board with moving cards (`factory ui`)."
+        ),
+    ]
+}
+
+/// Render draft vN: her idea verbatim first, then the epic/spec/tickets
+/// phrased from her sentences, then the change history. Pure over inputs
+/// so the CLI transcript, the stored file, and the `/onboard` screen
+/// print one story. Deterministic: re-rendering the same inputs yields
+/// the same bytes (the approval hash covers exactly these bytes).
+pub fn onboard_draft_text(repo: &str, idea: &str, version: u64, changes: &[String]) -> String {
+    let clean = format!("{}\n", idea.trim_end());
+    let mut text = format!(
+        "# Draft v{version} \u{2014} {repo}\n\n## Your idea, in your words\n\n{clean}\n## Epic\n\n{}\n\n## Spec\n\nBea wants: {clean}\n## Tickets\n\n",
+        onboard_epic_title(repo, idea)
+    );
+    for (i, ticket) in onboard_tickets(repo, idea).iter().enumerate() {
+        text.push_str(&format!("{}. {ticket}\n", i + 1));
+    }
+    text.push_str("\n## Change history\n\n- v1: first draft.\n");
+    for change in changes {
+        text.push_str(&format!("- you asked: \"{}\"\n", change.trim()));
+    }
+    text
+}
+
+fn onboard_draft_path(state: &std::path::Path, version: u64) -> PathBuf {
+    state.join(format!("onboard-draft-v{version}.md"))
+}
+
+fn onboard_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Write the current `progress.draft_version` from the progress fields.
+/// Versions are append-only: a written file is never rewritten (a change
+/// round mints the next version instead).
+fn onboard_write_draft(state: &std::path::Path, progress: &OnboardState) -> Result<(), String> {
+    let text = onboard_draft_text(
+        &progress.repo,
+        &progress.idea,
+        progress.draft_version,
+        &progress.changes,
+    );
+    std::fs::write(onboard_draft_path(state, progress.draft_version), &text)
+        .map_err(|e| format!("factory onboard: cannot write draft: {e}"))?;
+    Ok(())
+}
+
+/// True when the idea arrived explicitly (flag or env), i.e. Bea told us
+/// her idea this run. Without it there is nothing to approve, and the
+/// flow keeps the backbone contract: ready without a decision.
+fn onboard_explicit_idea(opts: &OnboardOpts) -> bool {
+    onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// True when approval arrived via `--approve` or FACTORY_ONBOARD_APPROVE.
+fn onboard_wants_approve(opts: &OnboardOpts) -> bool {
+    if opts.approve {
+        return true;
+    }
+    matches!(
+        std::env::var("FACTORY_ONBOARD_APPROVE").as_deref(),
+        Ok(v) if !v.trim().is_empty() && v.trim() != "0"
+    )
+}
+
+/// Step 4, idea capture: two free sentences stored verbatim (the seed
+/// already carries them; here they enter the draft loop). A restated
+/// idea before approval is a change round: the next version, with the
+/// old ones kept. Returns the next step (`draft`).
+fn onboard_step_idea(
+    progress: &mut OnboardState,
+    opts: &OnboardOpts,
+) -> Result<&'static str, String> {
+    println!("[onboard:idea] Capturing your idea in your own words.");
+    let idea = onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
+        .unwrap_or_else(|| onboard_default_idea().to_string());
+    let restated = progress.draft_version > 0
+        && progress.approved_version == 0
+        && !progress.idea.is_empty()
+        && progress.idea != idea;
+    progress.idea = idea.clone();
+    if restated {
+        progress
+            .changes
+            .push(format!("Restated idea: {}", idea.trim()));
+        progress.draft_version += 1;
+        let state = dispatch_state_dir();
+        onboard_write_draft(&state, progress)?;
+    }
+    onboard_note_step(progress, "idea");
+    if let Err(e) = onboard_save(&dispatch_state_dir(), progress) {
+        return Err(format!("factory onboard: {e}"));
+    }
+    Ok("draft")
+}
+
+/// Step 5, draft generation: render v1 from her stored idea (her own
+/// words first, then epic/spec/tickets), or replay the current version
+/// when a rerun arrives without a new decision. Versions are never
+/// re-rendered in place. Returns the next step (`approve`).
+fn onboard_step_draft(progress: &mut OnboardState) -> Result<&'static str, String> {
+    let state = dispatch_state_dir();
+    if progress.draft_version == 0 {
+        progress.draft_version = 1;
+        onboard_write_draft(&state, progress)?;
+    }
+    let body = std::fs::read_to_string(onboard_draft_path(&state, progress.draft_version))
+        .map_err(|e| format!("factory onboard: cannot read draft: {e}"))?;
+    println!(
+        "[onboard:draft] Draft v{} for {} \u{2014} in your own words:",
+        progress.draft_version, progress.repo
+    );
+    println!("{body}");
+    onboard_note_step(progress, "draft");
+    if let Err(e) = onboard_save(&state, progress) {
+        return Err(format!("factory onboard: {e}"));
+    }
+    Ok("approve")
+}
+
+/// One draft as the `/onboard` screen sees it: sections plus the
+/// decision state. Rebuilt from the same state files the CLI walks, so
+/// the screen and `--plain` can never disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnboardDraft {
+    pub version: u64,
+    pub repo: String,
+    pub idea: String,
+    pub epic: String,
+    pub spec: String,
+    pub tickets: Vec<String>,
+    pub changes: Vec<String>,
+    pub approved_version: u64,
+    pub hash: String,
+}
+
+/// Read the current draft from the state dir. `None` when no draft was
+/// generated yet (Bea has not described her idea). Read-only.
+pub fn onboard_current_draft() -> Option<OnboardDraft> {
+    let state = dispatch_state_dir();
+    let progress = onboard_load(&state);
+    if progress.draft_version == 0 || progress.repo.is_empty() {
+        return None;
+    }
+    std::fs::read_to_string(onboard_draft_path(&state, progress.draft_version)).ok()?;
+    Some(OnboardDraft {
+        version: progress.draft_version,
+        repo: progress.repo.clone(),
+        idea: progress.idea.clone(),
+        epic: onboard_epic_title(&progress.repo, &progress.idea),
+        spec: format!("Bea wants: {}", progress.idea.trim_end()),
+        tickets: onboard_tickets(&progress.repo, &progress.idea),
+        changes: progress.changes.clone(),
+        approved_version: progress.approved_version,
+        hash: progress.draft_hash.clone(),
+    })
+}
+
+/// Apply her change words: mint the next version (v1 kept), record what
+/// she asked, persist. Shared by the CLI `--change` and the screen's
+/// Change-something form. Returns the new version.
+pub fn onboard_apply_change(feedback: &str) -> Result<u64, String> {
+    let feedback = feedback.trim().to_string();
+    if feedback.is_empty() {
+        return Err(
+            "factory onboard: say what to change in plain words — re-run: factory onboard --change TEXT"
+                .to_string(),
+        );
+    }
+    let state = dispatch_state_dir();
+    let mut progress = onboard_load(&state);
+    if progress.draft_version == 0 {
+        return Err(
+            "factory onboard: no draft to change yet — start one: factory onboard --idea TEXT"
+                .to_string(),
+        );
+    }
+    progress.changes.push(feedback);
+    progress.draft_version += 1;
+    onboard_write_draft(&state, &progress)?;
+    onboard_note_step(&mut progress, "draft");
+    onboard_save(&state, &progress)?;
+    Ok(progress.draft_version)
+}
+
+/// Approve the current version: freeze it with the sha256 of the exact
+/// draft bytes (what she approved is provable later). Shared by the CLI
+/// `--approve` and the screen's Approve button. Returns (version, hash).
+pub fn onboard_apply_approve() -> Result<(u64, String), String> {
+    let state = dispatch_state_dir();
+    let mut progress = onboard_load(&state);
+    if progress.draft_version == 0 {
+        return Err(
+            "factory onboard: no draft to approve yet — start one: factory onboard --idea TEXT"
+                .to_string(),
+        );
+    }
+    let body = std::fs::read_to_string(onboard_draft_path(&state, progress.draft_version))
+        .map_err(|e| format!("factory onboard: cannot read draft: {e}"))?;
+    let hash = onboard_sha256_hex(body.as_bytes());
+    progress.approved_version = progress.draft_version;
+    progress.draft_hash = hash.clone();
+    onboard_note_step(&mut progress, "approve");
+    onboard_save(&state, &progress)?;
+    Ok((progress.approved_version, hash))
+}
+
+/// Step 6, the approve loop: `--change` mints the next version and stops
+/// for review; `--approve` freezes the current version and continues;
+/// without a decision an explicit idea stops with the draft and the two
+/// plain-words reruns; without an explicit idea there is nothing to
+/// approve and the backbone flows straight to ready. Returns `ready`.
+fn onboard_step_approve(
+    progress: &mut OnboardState,
+    opts: &OnboardOpts,
+) -> Result<&'static str, String> {
+    if progress.approved_version > 0 {
+        return Ok("ready");
+    }
+    if let Some(feedback) = onboard_choice(opts.change.clone(), "FACTORY_ONBOARD_CHANGE") {
+        let version = onboard_apply_change(&feedback).map_err(|e| e.to_string())?;
+        *progress = onboard_load(&dispatch_state_dir());
+        let body = std::fs::read_to_string(onboard_draft_path(&dispatch_state_dir(), version))
+            .unwrap_or_default();
+        println!("[onboard:draft] Draft v{version} \u{2014} with your change:");
+        println!("{body}");
+        return Err(format!(
+            "factory onboard: draft v{version} is ready to review \u{2014} approve it: factory onboard --approve \u{2014} or change it again: factory onboard --change TEXT"
+        ));
+    }
+    if onboard_wants_approve(opts) {
+        let (version, hash) = onboard_apply_approve().map_err(|e| e.to_string())?;
+        *progress = onboard_load(&dispatch_state_dir());
+        println!(
+            "[onboard:approve] Approved plan v{version} ({}) \u{2014} frozen as the plan the board builds from.",
+            &hash[..12.min(hash.len())]
+        );
+        return Ok("ready");
+    }
+    if onboard_explicit_idea(opts) {
+        let body = std::fs::read_to_string(onboard_draft_path(
+            &dispatch_state_dir(),
+            progress.draft_version,
+        ))
+        .unwrap_or_default();
+        println!(
+            "[onboard:draft] Draft v{} \u{2014} your decision:",
+            progress.draft_version
+        );
+        println!("{body}");
+        return Err(format!(
+            "factory onboard: review draft v{} above \u{2014} approve it: factory onboard --approve \u{2014} or change something: factory onboard --change TEXT",
+            progress.draft_version
+        ));
+    }
     Ok("ready")
+}
+
+// --- onboard screen (ticket #43, spec #41 draft-approve loop) -------------
+//
+// The approve loop with eyes: her draft in sections (idea, epic, spec,
+// tickets, change history), an Approve button and a Change-something
+// form, and — once frozen — the handoff to the living board. Same-binary
+// Axum, server-rendered HTML, polling fragment (~15s), no websockets.
+//
+// Reads flow through the same state files the CLI walks
+// (`dispatch_state_dir`, overridable with FACTORY_STATE_DIR): the screen
+// and `--plain` print one story. Writes flow only through the POST
+// handlers below, which call `onboard_apply_approve` /
+// `onboard_apply_change` — the same functions the CLI calls. GETs never
+// mutate (snapshot-tested like the board).
+
+/// Poll interval for the onboard fragment (board-class panel: ~15s).
+pub const ONBOARD_POLL_MS: u64 = 15_000;
+
+/// Calm sentence when no draft exists yet (Bea: an invitation, not an error).
+pub fn onboard_empty_sentence() -> &'static str {
+    "No draft yet \u{2014} describe your idea to begin: factory onboard --idea TEXT."
+}
+
+/// Fragment HTML for the draft (the polling unit). Pure over the draft
+/// so tests assert markers without a server: `data-onboard` plus
+/// `data-draft`, sections `data-idea`/`data-epic`/`data-spec`/
+/// `data-tickets`, the decision forms (`data-approve-form` +
+/// `data-change-form`) while unapproved, and the frozen version
+/// (`data-approved`) with the board handoff (`data-board-link`) after.
+pub fn onboard_fragment_html(draft: Option<&OnboardDraft>) -> String {
+    let Some(d) = draft else {
+        return format!(
+            "<section data-onboard><p data-onboard-empty>{}</p></section>",
+            onboard_empty_sentence()
+        );
+    };
+    let mut html = format!("<section data-onboard data-draft=\"{}\">", d.version);
+    html.push_str(&format!(
+        "<h2>Draft v{} for {}</h2><div data-idea>{}</div>",
+        d.version,
+        escape_html(&d.repo),
+        escape_html(&d.idea),
+    ));
+    html.push_str(&format!(
+        "<section data-epic><h3>Epic</h3><p>{}</p></section>",
+        escape_html(&d.epic)
+    ));
+    html.push_str(&format!(
+        "<section data-spec><h3>Spec</h3><p>{}</p></section>",
+        escape_html(&d.spec)
+    ));
+    html.push_str("<section data-tickets><h3>Tickets</h3><ol>");
+    for ticket in &d.tickets {
+        html.push_str(&format!("<li>{}</li>", escape_html(ticket)));
+    }
+    html.push_str("</ol></section>");
+    if !d.changes.is_empty() {
+        html.push_str("<section data-changes><h3>Change history</h3><ol>");
+        for change in &d.changes {
+            html.push_str(&format!("<li>{}</li>", escape_html(change)));
+        }
+        html.push_str("</ol></section>");
+    }
+    if d.approved_version > 0 {
+        html.push_str(&format!(
+            "<p data-approved=\"{}\">Approved plan v{} ({}) \u{2014} frozen.</p><p><a data-board-link href=\"/\">Open the board</a> and watch it move.</p>",
+            d.approved_version, d.approved_version, escape_html(&d.hash),
+        ));
+    } else {
+        html.push_str("<div data-decide><form method=\"post\" action=\"/onboard/approve\" data-approve-form><button type=\"submit\">Approve</button></form>");
+        html.push_str("<form method=\"post\" action=\"/onboard/change\" data-change-form><input name=\"change\" placeholder=\"What should change?\"><button type=\"submit\">Change something</button></form></div>");
+    }
+    html.push_str("</section>");
+    html
+}
+
+/// Full onboard page: the draft plus the polling hook that refreshes
+/// only the fragment (no full reloads). Pure over the draft for testing.
+pub fn onboard_page_html(draft: Option<&OnboardDraft>) -> String {
+    let fragment = onboard_fragment_html(draft);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory onboard</title></head>\
+<body><header><h1>Factory onboard</h1>\
+<p>Your idea, your draft, your decision. Matches <code>factory onboard --plain</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/onboard\">Onboard</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"onboard\" data-onboard-fragment=\"/fragments/onboard\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('onboard');if(!el)return;var url=el.getAttribute('data-onboard-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        ONBOARD_POLL_MS,
+    )
+}
+
+/// GET /onboard: the draft screen. Read-only observer.
+pub async fn onboard_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(onboard_page_html(onboard_current_draft().as_ref()))
+}
+
+/// GET /fragments/onboard: the polling unit. Read-only observer.
+pub async fn onboard_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(onboard_fragment_html(onboard_current_draft().as_ref()))
+}
+
+/// POST /onboard/approve: freeze the current version through the same
+/// `onboard_apply_approve` the CLI calls, then back to the screen.
+pub async fn onboard_approve_handler() -> axum::response::Redirect {
+    let _ = onboard_apply_approve();
+    axum::response::Redirect::to("/onboard")
+}
+
+/// Change form for POST /onboard/change (one field: her words).
+#[derive(Debug, serde::Deserialize)]
+pub struct OnboardChangeForm {
+    pub change: String,
+}
+
+/// POST /onboard/change: mint the next version through the same
+/// `onboard_apply_change` the CLI calls, then back to the screen.
+pub async fn onboard_change_handler(
+    axum::Form(form): axum::Form<OnboardChangeForm>,
+) -> axum::response::Redirect {
+    let _ = onboard_apply_change(&form.change);
+    axum::response::Redirect::to("/onboard")
 }
 
 /// `factory onboard`: drive install → auth → repo → ready, resuming from
@@ -2918,6 +3398,9 @@ pub fn cmd_onboard(json: bool, opts: OnboardOpts) -> i32 {
             "install" => onboard_step_install(&mut progress),
             "auth" => onboard_step_auth(&mut progress),
             "repo" => onboard_step_repo(&mut progress, &opts),
+            "idea" => onboard_step_idea(&mut progress, &opts),
+            "draft" => onboard_step_draft(&mut progress),
+            "approve" => onboard_step_approve(&mut progress, &opts),
             "ready" => break,
             other => {
                 return fail_onboard(json, &format!("factory onboard: unknown step {other:?}"))
@@ -2942,6 +3425,9 @@ pub fn cmd_onboard(json: bool, opts: OnboardOpts) -> i32 {
                 "created": progress.created,
                 "seeded": progress.seeded,
                 "steps": progress.steps,
+                "draft_version": progress.draft_version,
+                "approved_version": progress.approved_version,
+                "draft_hash": progress.draft_hash,
             })
         );
     } else {
@@ -2949,6 +3435,13 @@ pub fn cmd_onboard(json: bool, opts: OnboardOpts) -> i32 {
             "[onboard:ready] Your repo {} is ready — the board will pick it up from here.",
             progress.repo
         );
+        if progress.approved_version > 0 {
+            println!(
+                "[onboard:board] Approved plan v{} ({}) is on your board — watch it move: factory ui",
+                progress.approved_version,
+                progress.draft_hash.chars().take(12).collect::<String>(),
+            );
+        }
     }
     0
 }
@@ -7242,6 +7735,8 @@ pub fn run() -> i32 {
             new,
             visibility,
             idea,
+            approve,
+            change,
         } => cmd_onboard(
             cli.json,
             OnboardOpts {
@@ -7250,6 +7745,8 @@ pub fn run() -> i32 {
                 new,
                 visibility,
                 idea,
+                approve,
+                change,
             },
         ),
     }
