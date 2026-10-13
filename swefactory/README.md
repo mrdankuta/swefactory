@@ -5,6 +5,9 @@ Parity target: `pi-factory` @ `0343c74`.
 
 ## Install
 
+Download home (versioned docs + install buttons for every release):
+https://mrdankuta.github.io/swefactory/
+
 No Rust toolchain needed — pushing a version tag ships tarballs plus
 shell/PowerShell installers and a Homebrew formula via cargo-dist
 (mac, Windows, and musl-static Linux):

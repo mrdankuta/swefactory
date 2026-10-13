@@ -1,0 +1,66 @@
+# Download site (ticket #36): render the oranda site and publish it to
+# GitHub Pages. Kept as a separate workflow (like smoke.yml) so release.yml
+# stays pristine `cargo dist generate-ci` output.
+#
+# NOTE: releases here are created by the Release workflow itself using
+# GITHUB_TOKEN, and token-triggered events never start new workflow runs —
+# so `release: [published]` alone would never fire. Chain off the Release
+# workflow's completion instead (same pattern as smoke.yml).
+
+name: Site
+
+# Only rebuild the site for successful releases; manual dispatches always run.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build oranda site
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      ORANDA_VERSION: "0.6.5"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # No submodules: the product is self-contained; pi-factory/ is a
+          # private reference-only submodule the release token cannot read.
+          submodules: false
+      - name: Install oranda (prebuilt binary)
+        run: >
+          curl --proto '=https' --tlsv1.2 -LsSf
+          'https://github.com/axodotdev/oranda/releases/download/v${{ env.ORANDA_VERSION }}/oranda-x86_64-unknown-linux-gnu.tar.gz'
+          | tar -xzf - -C /tmp
+          && /tmp/oranda --version
+      - name: Build site
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: /tmp/oranda build
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
