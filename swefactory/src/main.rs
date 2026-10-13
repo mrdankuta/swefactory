@@ -355,6 +355,25 @@ fn adapter_for(stack: &str) -> Option<&'static str> {
     }
 }
 
+/// Installed stack, detected from the seeded adapter bytes — never assumed.
+/// Falls back to "rust" when no adapter is installed or it is custom:
+/// seeding never overwrites, so a guess only affects a missing adapter
+/// plus the reported stack string.
+fn detect_stack(dest: &Path) -> &'static str {
+    let body = std::fs::read_to_string(dest.join("scripts/factory-check")).unwrap_or_default();
+    for (name, adapter) in [
+        ("rust", ADAPTER_RUST),
+        ("elixir", ADAPTER_ELIXIR),
+        ("node", ADAPTER_NODE),
+        ("python", ADAPTER_PYTHON),
+    ] {
+        if body == adapter {
+            return name;
+        }
+    }
+    "rust"
+}
+
 fn tool_present(name: &str) -> bool {
     std::process::Command::new(name)
         .arg("--version")
@@ -407,7 +426,14 @@ impl Installer {
     }
 
     fn seed_executable(&mut self, rel: &str, content: &str) {
+        // Only chmod what was newly installed: a kept file is reported as
+        // untouched, so its permissions must stay untouched too. (A present
+        // but non-executable adapter is --fix territory: doctor R3b.)
+        let fresh = !self.dest.join(rel).exists();
         self.seed(rel, content);
+        if !fresh {
+            return;
+        }
         #[cfg(unix)]
         {
             let target = self.dest.join(rel);
@@ -480,7 +506,7 @@ impl Installer {
         ] {
             let _ = std::fs::create_dir_all(self.dest.join(d));
         }
-        // gitignore cache entry (only when a .gitignore already exists)
+        // gitignore cache entry (created when absent, appended when present)
         let gi = self.dest.join(".gitignore");
         if gi.is_file() {
             let body = std::fs::read_to_string(&gi).unwrap_or_default();
@@ -491,9 +517,15 @@ impl Installer {
                 }
                 body.push_str("factory/.cache/\n");
                 if std::fs::write(&gi, body).is_ok() {
+                    self.installed.push(".gitignore".to_string());
                     self.say("install: .gitignore (factory/.cache/)");
                 }
             }
+        } else if std::fs::write(&gi, "factory/.cache/\n").is_ok() {
+            self.installed.push(".gitignore".to_string());
+            self.say("install: .gitignore (factory/.cache/)");
+        } else {
+            self.warn("WARN: cannot create .gitignore");
         }
         // version marker (always records the running binary's version)
         let want = env!("CARGO_PKG_VERSION");
@@ -501,6 +533,7 @@ impl Installer {
         let cur = std::fs::read_to_string(&vf).unwrap_or_default();
         if cur.trim() != want {
             if std::fs::write(&vf, format!("{want}\n")).is_ok() {
+                self.installed.push(".factory-version".to_string());
                 self.say("install: .factory-version");
             }
         } else {
@@ -512,9 +545,12 @@ impl Installer {
 /// Seed every project-local file init owns (prompts, skills, adapter,
 /// AGENTS header, glossary, docs, issue templates, dirs + markers).
 /// Shared by `init`/`update` and `doctor --fix` so repair re-seeds through
-/// init's own path. Never overwrites: existing files are kept, which is
-/// what makes both init and --fix idempotent. No gh calls in here — label
-/// management stays in run_init so --fix never touches issues.
+/// init's own path. Seeded files never overwrite: existing files are kept,
+/// which is what makes both init and --fix idempotent. Exception: the two
+/// markers in finish_dirs_and_markers (.factory-version is always rewritten
+/// to the running binary's version; .gitignore gains the cache entry) —
+/// both are recorded in `installed` so --fix can report them. No gh calls
+/// in here — label management stays in run_init so --fix never touches issues.
 fn seed_project_local(
     ins: &mut Installer,
     stack: &str,
@@ -655,7 +691,7 @@ fn run_init(
 
     if let Some(tag) = pin {
         ins.say(&format!(
-            "pin: {tag} recorded (this binary carries embedded templates; network refresh is out of scope)"
+            "pin: {tag} acknowledged (this binary carries embedded templates; network refresh is out of scope — nothing is persisted)"
         ));
     }
 
@@ -799,12 +835,14 @@ fn run_check(json: bool, adapter: Option<PathBuf>, slot: Option<String>, args: V
 // DOCTOR (ticket #18: diagnose — checks + report + JSON)
 //
 // Pre-flight check over the catalogue in DOCTOR_ORDER. Every probe reads
-// the real environment through the existing shell-out seams (gh/git/pi
-// binaries, adapter discovery, state dir, PATH toolchain) — no API
-// client, no new seam. Doctor is read-only: it never writes files,
-// issues, pushes, or starts auth flows; failures carry the exact fix
-// command instead. `--fix` (safe local repair) is a separate ticket and
-// deliberately has no flag here. The catalogue lives in this one module
+// the real environment through the existing shell-out seams (gh via dgh
+// with its mise-noise filtering, git/pi binaries, adapter discovery,
+// state dir, PATH toolchain) — no API client, no new seam. Doctor is
+// read-only: it never writes files, issues, pushes, or starts auth flows;
+// failures carry the exact fix command instead. `--fix` (ticket #19, safe
+// local repair) applies doctor_fix() first, then reports with the same
+// doctor_checks() — so a green post-repair report means the same thing as
+// a green plain report. The catalogue lives in this one module
 // so later tickets (daemon supervision, policy files) extend DOCTOR_ORDER
 // without touching the runner.
 // ---------------------------------------------------------------------------
@@ -868,42 +906,57 @@ const DOCTOR_FIX_STACK: &str = "rust";
 fn doctor_fix() -> Vec<String> {
     let mut fixed = Vec::new();
 
-    // R1: state dir.
+    // R1: state + cache dirs (create when missing; restore the write bit
+    // when the readonly bit is set). A path blocked by a non-dir file is
+    // left failing with its hint — never delete or move user data.
     let state = dispatch_state_dir();
-    match std::fs::metadata(&state) {
-        Err(_) => {
-            if std::fs::create_dir_all(&state).is_ok() {
-                fixed.push(format!("state-dirs: created {}", state.display()));
-            }
-        }
-        Ok(m) if m.is_dir() && m.permissions().readonly() => {
-            // Restore owner write without widening to world-writable.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = m.permissions().mode() | 0o200;
-                if std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).is_ok() {
-                    fixed.push(format!("state-dirs: made writable {}", state.display()));
+    let cache = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("factory")
+        .join(".cache");
+    for dir in [&state, &cache] {
+        match std::fs::metadata(dir) {
+            Err(_) => {
+                if std::fs::create_dir_all(dir).is_ok() {
+                    fixed.push(format!("state-dirs: created {}", dir.display()));
                 }
             }
-            #[cfg(not(unix))]
-            {
-                let mut perms = m.permissions();
-                perms.set_readonly(false);
-                if std::fs::set_permissions(&state, perms).is_ok() {
-                    fixed.push(format!("state-dirs: made writable {}", state.display()));
+            Ok(m) if m.is_dir() && m.permissions().readonly() => {
+                // Restore owner write without widening to world-writable.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = m.permissions().mode() | 0o200;
+                    if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).is_ok()
+                    {
+                        fixed.push(format!("state-dirs: made writable {}", dir.display()));
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let mut perms = m.permissions();
+                    perms.set_readonly(false);
+                    if std::fs::set_permissions(dir, perms).is_ok() {
+                        fixed.push(format!("state-dirs: made writable {}", dir.display()));
+                    }
                 }
             }
+            Ok(_) => {}
         }
-        Ok(_) => {}
     }
 
     // R2: stale worktree metadata (detect via dry run, repair only on signal).
+    // The repair entry reflects the real prune call: a failed prune is
+    // surfaced, never claimed as done.
     if let Some(dry) = probe_stdout(&git_bin(), &["worktree", "prune", "-n"]) {
         if !dry.is_empty() {
-            let _ = probe_stdout(&git_bin(), &["worktree", "prune"]);
             let first = dry.lines().next().unwrap_or("stale entries");
-            fixed.push(format!("worktree-metadata: pruned ({first})"));
+            match probe_stdout(&git_bin(), &["worktree", "prune"]) {
+                Some(_) => fixed.push(format!("worktree-metadata: pruned ({first})")),
+                None => fixed.push(
+                    "worktree-metadata: prune failed — retry: git worktree prune".to_string(),
+                ),
+            }
         }
     }
 
@@ -995,8 +1048,9 @@ fn path_is_executable(path: &Path) -> bool {
 fn doctor_checks() -> Vec<DoctorCheck> {
     let mut checks = Vec::with_capacity(DOCTOR_ORDER.len());
 
-    // gh-installed: the gh shell-out seam must answer.
-    let gh_version = probe_stdout(&gh_bin(), &["--version"]);
+    // gh-installed: the gh shell-out seam must answer (via dgh, which
+    // filters version-manager noise like the rest of the gh call sites).
+    let gh_version = dgh(&["--version"]).ok();
     checks.push(match gh_version {
         Some(v) => doctor_pass(
             "gh-installed",
@@ -1014,7 +1068,7 @@ fn doctor_checks() -> Vec<DoctorCheck> {
     });
 
     // gh-auth: login must be live.
-    let auth = probe_stdout(&gh_bin(), &["auth", "status"]);
+    let auth = dgh(&["auth", "status"]).ok();
     checks.push(match auth {
         Some(_) => doctor_pass(
             "gh-auth",
@@ -1028,7 +1082,7 @@ fn doctor_checks() -> Vec<DoctorCheck> {
     });
 
     // gh-repo-access: the current repo must be readable via gh.
-    let repo = probe_stdout(&gh_bin(), &["repo", "view", "--json", "nameWithOwner"]);
+    let repo = dgh(&["repo", "view", "--json", "nameWithOwner"]).ok();
     checks.push(match repo {
         Some(v) => doctor_pass(
             "gh-repo-access",
@@ -1068,40 +1122,76 @@ fn doctor_checks() -> Vec<DoctorCheck> {
         )
     });
 
-    // state-dirs: state/cache dir must exist, be a dir, and be writable.
-    // Read-only probe: existence + dir + permission bits, never creates.
+    // state-dirs: state + cache dirs must exist, be dirs, and be writable;
+    // worktree metadata must be consistent (no stale entries). Read-only
+    // probe: existence + dir + permission bits + prune dry-run, never creates.
     let state = dispatch_state_dir();
-    checks.push(match std::fs::metadata(&state) {
-        Ok(m) if !m.is_dir() => doctor_fail(
+    let cache = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("factory")
+        .join(".cache");
+    let mut dir_problems: Vec<(String, String)> = Vec::new();
+    for (label, dir) in [("State", &state), ("Cache", &cache)] {
+        match std::fs::metadata(dir) {
+            Ok(m) if !m.is_dir() => dir_problems.push((
+                format!(
+                    "{label} path {} exists but is not a directory.",
+                    dir.display()
+                ),
+                format!(
+                    "Run: mv {} {}.bak && mkdir -p {}",
+                    dir.display(),
+                    dir.display(),
+                    dir.display()
+                ),
+            )),
+            Ok(m) if m.permissions().readonly() => dir_problems.push((
+                format!("{label} directory {} is not writable.", dir.display()),
+                format!("Run: chmod u+rwX {}", dir.display()),
+            )),
+            Ok(_) => {}
+            Err(_) => dir_problems.push((
+                format!("{label} directory {} does not exist yet.", dir.display()),
+                format!("Run: mkdir -p {}", dir.display()),
+            )),
+        }
+    }
+    match probe_stdout(&git_bin(), &["worktree", "prune", "-n"]) {
+        Some(dry) if !dry.is_empty() => dir_problems.push((
+            format!(
+                "Stale worktree metadata: {}.",
+                dry.lines().next().unwrap_or("stale entries")
+            ),
+            "Run: git worktree prune — to clear stale entries (or: factory doctor --fix)"
+                .to_string(),
+        )),
+        Some(_) => {}
+        None => dir_problems.push((
+            "Worktree metadata could not be verified (git worktree prune -n failed).".to_string(),
+            "Run: git worktree prune -n — to see the cause".to_string(),
+        )),
+    }
+    checks.push(if dir_problems.is_empty() {
+        doctor_pass(
             "state-dirs",
             format!(
-                "State path {} exists but is not a directory.",
-                state.display()
-            ),
-            format!(
-                "Run: mv {} {}.bak && mkdir -p {}",
+                "State directory {} and cache directory {} exist and are writable; worktree metadata is consistent.",
                 state.display(),
-                state.display(),
-                state.display()
+                cache.display()
             ),
-        ),
-        Ok(m) if m.permissions().readonly() => doctor_fail(
-            "state-dirs",
-            format!("State directory {} is not writable.", state.display()),
-            format!("Run: chmod u+rwX {}", state.display()),
-        ),
-        Ok(_) => doctor_pass(
-            "state-dirs",
-            format!(
-                "State directory {} exists and is writable.",
-                state.display()
-            ),
-        ),
-        Err(_) => doctor_fail(
-            "state-dirs",
-            format!("State directory {} does not exist yet.", state.display()),
-            format!("Run: mkdir -p {}", state.display()),
-        ),
+        )
+    } else {
+        let detail = dir_problems
+            .iter()
+            .map(|(d, _)| d.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let hint = dir_problems
+            .iter()
+            .map(|(_, h)| h.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        doctor_fail("state-dirs", detail, hint)
     });
 
     // adapter-present: discovered exactly as the `check` runner discovers it.
@@ -4235,9 +4325,12 @@ fn run() -> i32 {
             0
         }
         Commands::Update { pin } => {
-            // update refreshes from the same embedded templates; because
-            // seeding never overwrites, it is a no-op when in place.
-            let out = run_init(cli.json, "rust", false, pin.as_deref(), "update");
+            // update refreshes from the same embedded templates; the stack
+            // is detected from the installed adapter (never assumed), and
+            // seeding never overwrites, so it is a no-op when in place.
+            let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let stack = detect_stack(&dest);
+            let out = run_init(cli.json, stack, false, pin.as_deref(), "update");
             if cli.json {
                 println!(
                     "{}",

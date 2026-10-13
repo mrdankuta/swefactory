@@ -83,8 +83,8 @@ header merge, `GLOSSARY.md` + `docs/README.md` skeletons,
 `factory/.cache/`, and `.factory-version`.
 
 Divergence from bash (documented): the Rust binary *is* `factory`, so no
-`scripts/factory` shim is installed; `update --pin` records the tag but does
-not fetch (network refresh is out of scope at parity). Missing `gh`/`herdr`
+`scripts/factory` shim is installed; `update --pin` acknowledges the tag but
+does not fetch or persist it (network refresh is out of scope at parity). Missing `gh`/`herdr`
 or unauthenticated `gh` only warn (`WARN:`/`skip:` on stderr) — init
 never fails for missing tooling; labels are ensured best-effort via `gh`.
 

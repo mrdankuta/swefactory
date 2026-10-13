@@ -66,6 +66,7 @@ if [ "$1" = "worktree" ] && [ "$2" = "prune" ] && [ "$3" = "-n" ]; then
   exit 0
 fi
 if [ "$1" = "worktree" ] && [ "$2" = "prune" ]; then
+  if [ "$FIXTURE_PRUNE" = "fail" ]; then echo "prune exploded" >&2; exit 1; fi
   if [ -n "$STALE_MARKER" ]; then rm -f "$STALE_MARKER"; fi
   exit 0
 fi
@@ -446,8 +447,10 @@ fn plain_doctor_stays_readonly() {
         "plain doctor must not seed project files"
     );
     for line in sb.log_lines(&sb.git_log) {
+        // The read-only `prune -n` dry run is a probe, not a repair: only
+        // the mutating bare `prune` is forbidden without --fix.
         assert!(
-            !line.contains("prune"),
+            line.trim() != "worktree prune",
             "plain doctor must not prune, got git call {line:?}"
         );
     }
@@ -516,5 +519,141 @@ fn fix_chmods_non_executable_adapter() {
     assert!(
         fixed.iter().any(|s| s.contains("chmod")),
         "repairs must record the chmod, got: {fixed:?}"
+    );
+}
+
+/// R1 readonly-bit branch: owner-write restore is pinned so nobody widens it.
+#[test]
+fn fix_restores_write_bit_on_readonly_state_dir() {
+    let sb = Sandbox::broken("readonly-state");
+    fs::create_dir_all(&sb.state).unwrap();
+    fs::set_permissions(&sb.state, fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(fs::metadata(&sb.state).unwrap().permissions().readonly());
+
+    let out = sb.output(true, true, &[]);
+    let report = text(&out);
+    assert!(
+        out.status.success(),
+        "--fix must heal a readonly state dir, got {}:\n{report}",
+        out.status
+    );
+    assert!(
+        !fs::metadata(&sb.state).unwrap().permissions().readonly(),
+        "state dir must be writable after --fix"
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    let fixed: Vec<&str> = v
+        .get("fixed")
+        .and_then(|f| f.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        fixed.iter().any(|s| s.contains("made writable")),
+        "repairs must record the write-bit restore, got: {fixed:?}"
+    );
+    fs::set_permissions(&sb.state, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// R1 file-in-the-way branch: never delete or move user data.
+#[test]
+fn fix_leaves_file_blocking_state_path() {
+    let sb = Sandbox::broken("state-is-file");
+    fs::write(&sb.state, "precious user bytes\n").unwrap();
+
+    let out = sb.output(true, false, &[]);
+    let report = text(&out);
+    assert!(
+        !out.status.success(),
+        "blocked state path must stay red, got {}:\n{report}",
+        out.status
+    );
+    assert!(
+        report.contains("state-dirs"),
+        "report must still name the failing check, got:\n{report}"
+    );
+    assert_eq!(
+        fs::read(&sb.state).unwrap(),
+        b"precious user bytes\n",
+        "blocking file must never be deleted or moved"
+    );
+    assert!(
+        report
+            .lines()
+            .filter(|l| l.starts_with("fixed: state-dirs"))
+            .all(|l| !l.contains(&*sb.state.to_string_lossy())),
+        "no repair of the blocked state path may be claimed, got:\n{report}"
+    );
+}
+
+/// R2 must surface the real prune result instead of assuming success.
+#[test]
+fn fix_reports_failed_prune_instead_of_claiming_repair() {
+    let sb = Sandbox::broken("prune-fails");
+    let marker = sb.dir.join("stale-worktree");
+    fs::write(&marker, "stale").unwrap();
+
+    let out = sb.output(
+        true,
+        true,
+        &[
+            ("STALE_MARKER", marker.to_string_lossy().as_ref()),
+            ("FIXTURE_PRUNE", "fail"),
+        ],
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    let fixed: Vec<&str> = v
+        .get("fixed")
+        .and_then(|f| f.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        fixed.iter().all(|s| !s.contains("pruned")),
+        "a failed prune must never be reported as pruned, got: {fixed:?}"
+    );
+    assert!(
+        fixed.iter().any(|s| s.contains("prune failed")),
+        "the prune failure must be surfaced, got: {fixed:?}"
+    );
+}
+
+/// Marker writes (.factory-version / .gitignore) must appear in `fixed`.
+#[test]
+fn fix_reports_marker_writes() {
+    let sb = Sandbox::broken("markers");
+    assert!(!sb.dir.join(".factory-version").exists());
+    assert!(!sb.dir.join(".gitignore").exists());
+
+    let out = sb.output(true, true, &[]);
+    assert!(out.status.success(), "must heal:\n{}", text(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    let fixed: Vec<&str> = v
+        .get("fixed")
+        .and_then(|f| f.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        fixed.iter().any(|s| s.contains(".factory-version")),
+        "fixed must record the version-marker write, got: {fixed:?}"
+    );
+    assert!(
+        fixed.iter().any(|s| s.contains(".gitignore")),
+        "fixed must record the .gitignore write, got: {fixed:?}"
+    );
+}
+
+/// The widened state-dirs check stays repairable: a missing cache dir heals.
+#[test]
+fn fix_creates_missing_cache_dir() {
+    let sb = Sandbox::broken("cache-heal");
+    let out = sb.output(true, false, &[]);
+    let report = text(&out);
+    assert!(
+        out.status.success(),
+        "--fix must heal a missing cache dir, got {}:\n{report}",
+        out.status
+    );
+    assert!(
+        sb.dir.join("factory").join(".cache").is_dir(),
+        "cache dir must be created"
     );
 }

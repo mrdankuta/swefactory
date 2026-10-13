@@ -48,6 +48,12 @@ if [ "$1" = "config" ] && [ "$2" = "user.email" ]; then
   if [ "$FIXTURE_GIT_IDENTITY" = "fail" ]; then exit 1; fi
   echo "test@example.com"; exit 0
 fi
+if [ "$1" = "worktree" ] && [ "$2" = "prune" ] && [ "$3" = "-n" ]; then
+  if [ -n "$STALE_MARKER" ] && [ -f "$STALE_MARKER" ]; then
+    echo "Removing worktrees/wt1: gitdir file points to non-existent location"
+  fi
+  exit 0
+fi
 exit 0
 "#;
 
@@ -59,6 +65,11 @@ echo "pi version 9.9.9-test"; exit 0
 const FAKE_CARGO: &str = r#"
 if [ "$FIXTURE_CARGO" = "fail" ]; then echo "no cargo" >&2; exit 1; fi
 echo "cargo 9.9.9-test"; exit 0
+"#;
+
+const FAKE_RUSTC: &str = r#"
+if [ "$FIXTURE_RUSTC" = "fail" ]; then echo "no rustc" >&2; exit 1; fi
+echo "rustc 9.9.9-test"; exit 0
 "#;
 
 struct Sandbox {
@@ -78,9 +89,12 @@ impl Sandbox {
         let git = write_script(&bin, "git", FAKE_GIT);
         let pi = write_script(&bin, "pi", FAKE_PI);
         write_script(&bin, "cargo", FAKE_CARGO);
+        write_script(&bin, "rustc", FAKE_RUSTC);
         let _ = (gh, git, pi);
         let state = dir.join("state");
         fs::create_dir_all(&state).unwrap();
+        // Project cache dir: the widened state-dirs check probes it.
+        fs::create_dir_all(dir.join("factory").join(".cache")).unwrap();
         let adapter = write_script(&dir, "factory-check", "echo ok\n");
         Self {
             dir,
@@ -392,5 +406,90 @@ fn doctor_runs_with_zero_args_in_any_directory() {
     assert!(
         !out.status.success(),
         "bare dir without adapter must exit nonzero"
+    );
+}
+
+#[test]
+fn doctor_filters_mise_noise_from_gh_probes() {
+    // gh probes must go through the mise-noise filter: a noisy gh that
+    // prints version-manager chatter before its real output must still
+    // yield clean details and a parsed repo name.
+    let sb = Sandbox::healthy("gh-noise");
+    let noisy = r#"
+case "$1" in
+  --version) echo "mise ~/.config/mise/config.toml tools: gh@2.102.0"; echo "gh version 9.9.9-test"; exit 0;;
+  auth) exit 0;;
+  repo) echo "mise ~/.config/mise/config.toml tools: gh@2.102.0"; echo '{"nameWithOwner":"o/r"}'; exit 0;;
+  *) exit 0;;
+esac
+"#;
+    write_script(&sb.bin, "gh", noisy);
+    let out = sb.output(false, &[]);
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "noisy-but-healthy gh must still exit 0, got {}:\n{report}",
+        out.status
+    );
+    assert!(
+        report.contains("gh version 9.9.9-test"),
+        "gh-installed detail must show the version, got:\n{report}"
+    );
+    assert!(
+        !report.contains("mise "),
+        "mise noise must never leak into the report, got:\n{report}"
+    );
+    assert!(
+        report.contains("o/r"),
+        "gh-repo-access must parse the repo name through the noise, got:\n{report}"
+    );
+}
+
+#[test]
+fn doctor_missing_cache_dir_names_mkdir_fix() {
+    let sb = Sandbox::healthy("no-cache");
+    fs::remove_dir_all(sb.dir.join("factory").join(".cache")).unwrap();
+    let out = sb.output(false, &[]);
+
+    assert!(!out.status.success());
+    let text = Sandbox::text(&out);
+    assert!(
+        text.contains("state-dirs") && text.contains("mkdir -p"),
+        "must name state-dirs and print the mkdir fix, got:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_stale_worktree_metadata_fails_with_prune_hint() {
+    let sb = Sandbox::healthy("stale-wt");
+    let marker = sb.dir.join("stale-worktree");
+    fs::write(&marker, "stale").unwrap();
+    let out = sb.output(
+        false,
+        &[("STALE_MARKER", marker.to_string_lossy().as_ref())],
+    );
+
+    assert!(!out.status.success());
+    let text = Sandbox::text(&out);
+    assert!(
+        text.contains("state-dirs") && text.contains("git worktree prune"),
+        "must name state-dirs and hint the prune command, got:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_missing_rustc_fails_with_toolchain_hint() {
+    let sb = Sandbox::healthy("no-rustc");
+    let out = sb.output(false, &[("FIXTURE_RUSTC", "fail")]);
+
+    assert!(!out.status.success());
+    let text = Sandbox::text(&out);
+    assert!(
+        text.contains("toolchain") && text.contains("rustc"),
+        "cargo-ok/rustc-missing must fail naming the toolchain, got:\n{text}"
     );
 }
