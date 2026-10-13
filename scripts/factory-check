@@ -4,9 +4,16 @@
 # failure; print FACTORY-CHECK PASSED only on success. Extra args pass
 # through to the test runner. FACTORY_SLOT offsets the cargo target dir so
 # concurrent dispatcher workers never share build state.
+#
+# Target selection: the adapter checks out the git worktree that contains the
+# CURRENT DIRECTORY (git rev-parse --show-toplevel), not the worktree the script
+# file lives in. Run it from the worktree you want to gate, e.g.
+#   cd ~/Deving/rc_int/swefactory-train && ./scripts/factory-check --fresh
+# Invoking another checkout's copy of the script from elsewhere still gates the
+# caller's tree. Outside a git repo it falls back to the current directory.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 # Gate mode: --fresh builds in a throwaway target dir, immune to cargo
 # fingerprint staleness in reused dirs (observed twice: worktree mtimes vs
@@ -15,12 +22,15 @@ cd "$(dirname "$0")/.."
 args=()
 for a in "$@"; do
   case "$a" in
-    --fresh) export CARGO_TARGET_DIR="$(mktemp -d)/target"; echo "factory-check: fresh target dir $CARGO_TARGET_DIR";;
+    --fresh)
+      fresh_root="$(mktemp -d)"
+      trap 'rm -rf "$fresh_root"' EXIT
+      export CARGO_TARGET_DIR="$fresh_root/target"
+      echo "factory-check: fresh target dir $CARGO_TARGET_DIR";;
     --) ;;
     *) args+=("$a");;
   esac
 done
-set -- "${args[@]:-}"
 
 if [ ! -f swefactory/Cargo.toml ]; then
   echo "factory-check: no swefactory/Cargo.toml yet — nothing to check"
@@ -29,7 +39,9 @@ if [ ! -f swefactory/Cargo.toml ]; then
 fi
 
 # Slot isolation: separate target dirs per dispatcher worker.
-if [ -n "${FACTORY_SLOT:-}" ]; then
+# An explicit --fresh (or preset CARGO_TARGET_DIR) always wins: gates must
+# never reuse fingerprints.
+if [ -z "${CARGO_TARGET_DIR:-}" ] && [ -n "${FACTORY_SLOT:-}" ]; then
   export CARGO_TARGET_DIR="$PWD/swefactory/target-slot-$FACTORY_SLOT"
 fi
 
@@ -40,7 +52,7 @@ echo "==> cargo clippy (deny warnings)"
 cargo clippy --manifest-path swefactory/Cargo.toml --all-targets -- -D warnings
 
 echo "==> cargo test"
-cargo test --manifest-path swefactory/Cargo.toml -- "$@"
+cargo test --manifest-path swefactory/Cargo.toml -- ${args[@]+"${args[@]}"}
 
 
 echo "FACTORY-CHECK PASSED"
