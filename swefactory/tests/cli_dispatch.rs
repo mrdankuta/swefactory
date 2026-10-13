@@ -268,10 +268,46 @@ fn dispatch_once_moves_ready_ticket_through_review_without_landing() {
         "head must advance past base"
     );
 
-    // Labels moved ready -> review -> accepted; evidence posted as comments.
+    // Labels moved ready -> review -> integrated (T35 auto-cut: with no
+    // open train the accept path cuts a default-slug train and merges
+    // there instead of waiting on accepted-only); evidence posted as comments.
     let gh = gh_log(&h);
     assert!(gh.contains("comment"), "must post progress comments:\n{gh}");
-    assert!(gh.contains("accepted"), "must apply accepted label:\n{gh}");
+    assert!(
+        gh.contains("integrated"),
+        "auto-cut must apply integrated label:\n{gh}"
+    );
+
+    // Auto-cut train: freshly cut default slug, attempt recorded on it,
+    // merge commit present on the train.
+    let train_text =
+        fs::read_to_string(h.state.join("train.json")).expect("auto-cut must leave an open train");
+    let train_v: serde_json::Value = serde_json::from_str(&train_text).unwrap();
+    let train = train_v
+        .get("branch")
+        .and_then(|b| b.as_str())
+        .unwrap()
+        .to_string();
+    assert!(train.starts_with("integration/"), "train: {train}");
+    assert!(
+        train.ends_with("-train"),
+        "auto-cut uses the default slug: {train}"
+    );
+    assert_eq!(
+        a.get("train_branch").and_then(|v| v.as_str()),
+        Some(train.as_str()),
+        "attempt must record its auto-cut train:\n{ledger}"
+    );
+    let train_log = std::process::Command::new("git")
+        .args(["log", "--oneline", &train])
+        .current_dir(&h.repo)
+        .output()
+        .unwrap();
+    let train_log = String::from_utf8(train_log.stdout).unwrap();
+    assert!(
+        train_log.contains("Merge ticket #11"),
+        "auto-cut train must carry the merge:\n{train_log}"
+    );
 
     // Worktree cleaned up: dir gone and unlisted.
     let wt_dir = h.state.join("worktrees");
@@ -622,12 +658,39 @@ fn dispatch_routes_changes_requested_back_to_ready() {
 fn no_api_client_dependency_for_dispatch() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let content = fs::read_to_string(&manifest).unwrap().to_lowercase();
-    for banned in ["rusqlite", "reqwest", "octocrab", "ureq", "hyper", "tokio"] {
+    // Spec #27 mandates Axum in the same binary, and ticket #29's
+    // `factory ui` serve path drives it through the Tokio runtime.
+    // Tokio is a server runtime, not a dispatch API client: the dispatch
+    // loop still shells out through the FACTORY_GH_BIN seam, so only
+    // `tokio` leaves this ban list (and `web_serve` must stay its sole
+    // user, asserted below).
+    for banned in ["rusqlite", "reqwest", "octocrab", "ureq", "hyper"] {
         assert!(
             !content.contains(banned),
             "Cargo.toml must not gain {banned} for dispatch"
         );
     }
+    let src =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")).unwrap();
+    let serve_at = src
+        .find("pub fn web_serve")
+        .expect("UI serve path owns the runtime");
+    let mut users = 0;
+    let mut offset = 0;
+    for line in src.lines() {
+        if line.contains("tokio::") {
+            users += 1;
+            assert!(
+                offset >= serve_at,
+                "tokio must stay inside the UI serve path; dispatch stays shell-out only"
+            );
+        }
+        offset += line.len() + 1;
+    }
+    assert!(
+        users > 0,
+        "the UI serve path is expected to drive Axum through tokio"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +856,29 @@ fn dispatch_daemon_pass_matches_once_ledger() {
     );
     let gh = gh_log(&h.inner);
     assert!(gh.contains("comment"), "must post progress comments:\n{gh}");
-    assert!(gh.contains("accepted"), "must apply accepted label:\n{gh}");
+    assert!(
+        gh.contains("integrated"),
+        "auto-cut must apply integrated label:\n{gh}"
+    );
+    // Daemon auto-cut parity: same freshly cut default-slug train as `once`.
+    let train_text = fs::read_to_string(h.inner.state.join("train.json"))
+        .expect("auto-cut must leave an open train");
+    let train_v: serde_json::Value = serde_json::from_str(&train_text).unwrap();
+    let train = train_v
+        .get("branch")
+        .and_then(|b| b.as_str())
+        .unwrap()
+        .to_string();
+    assert!(train.starts_with("integration/"), "train: {train}");
+    assert!(
+        train.ends_with("-train"),
+        "auto-cut uses the default slug: {train}"
+    );
+    assert_eq!(
+        a.get("train_branch").and_then(|v| v.as_str()),
+        Some(train.as_str()),
+        "attempt must record its auto-cut train:\n{ledger}"
+    );
     let logs: Vec<_> = fs::read_dir(h.inner.state.join("logs"))
         .unwrap()
         .filter_map(|e| e.ok())

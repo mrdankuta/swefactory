@@ -179,6 +179,27 @@ pub enum Commands {
         #[arg(long, value_name = "BRANCH")]
         train: Option<String>,
     },
+    /// Serve the Bea-first board over localhost (spec #27 board slice).
+    /// Server-rendered HTML with polling fragments; localhost-only unless
+    /// --allow-remote is passed explicitly. Read-only: GETs observe
+    /// through the ledger, `gh`, and git seams and never mutate.
+    Ui {
+        /// Address to bind (host:port). Localhost by default.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Allow binding a non-localhost address (explicit exposure).
+        #[arg(long)]
+        allow_remote: bool,
+    },
+    /// Alias for `ui` (headless use): serves the same board app.
+    Serve {
+        /// Address to bind (host:port). Localhost by default.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Allow binding a non-localhost address (explicit exposure).
+        #[arg(long)]
+        allow_remote: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -255,12 +276,352 @@ pub fn version_text(json: bool) -> String {
     }
 }
 
-// --- web prefactor (ticket #28, spec #27) ---------------------------------
+// --- web board (ticket #29, spec #27) ------------------------------------
 //
-// Axum + Askama join the build here so later UI tickets wire handlers
-// without touching the dependency set. Nothing is served yet: no `ui`
-// command, no listener. `web_router` only proves the handler shape
-// compiles and renders through the same command functions the CLI calls.
+// `factory ui` (alias `factory serve`) serves Bea's home: issues as
+// cards in columns, polling fragments, calm empty states. Same-binary
+// Axum, server-rendered Askama HTML, no JS build, no websockets.
+//
+// Data flows read-only through the existing seams: `gh issue list` via
+// `run_gh_output` (overridable with FACTORY_GH_BIN), the dispatch ledger
+// via `dispatch_state_dir` (overridable with FACTORY_STATE_DIR), and
+// `git log --grep` via `run_git` (overridable with FACTORY_GIT_BIN).
+// Rendering is pure over `BoardIssue` fixtures so endpoint tests never
+// need the network.
+
+/// One open issue as the board sees it (labels drive the column).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub state: String,
+}
+
+/// One rendered card: status, cost, and what changed in plain words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardCard {
+    pub number: u64,
+    pub title: String,
+    pub status_text: String,
+    pub cost_text: String,
+    pub changed_text: String,
+    pub labels: Vec<String>,
+}
+
+/// One board column: a label-mapped lane of cards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardColumn {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub cards: Vec<BoardCard>,
+}
+
+/// Fixed column order (Bea's reading order): needs-you first, done last.
+/// (id, title) pairs; `board_column_for_labels` maps labels into them.
+pub const BOARD_COLUMNS: &[(&str, &str)] = &[
+    ("needs-you", "Needs you"),
+    ("ready", "Ready to build"),
+    ("running", "Being built"),
+    ("review", "In review"),
+    ("done", "Done"),
+    ("open", "New work"),
+];
+
+/// Poll interval for the board fragment (spec: board ~15s).
+pub const BOARD_POLL_MS: u64 = 15_000;
+
+fn has_label(labels: &[String], name: &str) -> bool {
+    labels.iter().any(|l| l.eq_ignore_ascii_case(name))
+}
+
+/// Map issue labels to a column (id, title). First match wins in Bea
+/// priority order: blocked/needs-* → ready → running → review →
+/// accepted/integrated → fallback open. Pure: unit-tested without `gh`.
+pub fn board_column_for_labels(labels: &[String]) -> (&'static str, &'static str) {
+    if has_label(labels, "blocked")
+        || has_label(labels, "needs-info")
+        || has_label(labels, "needs-you")
+    {
+        return ("needs-you", "Needs you");
+    }
+    if has_label(labels, "review") {
+        return ("review", "In review");
+    }
+    if has_label(labels, "running") {
+        return ("running", "Being built");
+    }
+    if has_label(labels, "ready") {
+        return ("ready", "Ready to build");
+    }
+    if has_label(labels, "accepted") || has_label(labels, "integrated") {
+        return ("done", "Done");
+    }
+    ("open", "New work")
+}
+
+/// Bea-readable status for one card. The optional attempt status is the
+/// dispatcher's latest word for the ticket (e.g. `impl_running`); labels
+/// alone still read as a sentence when there is no attempt yet.
+pub fn board_status_text(labels: &[String], attempt: Option<&str>) -> String {
+    let (id, _) = board_column_for_labels(labels);
+    let base = match id {
+        "needs-you" => "Waiting on you \u{2014} a question needs your answer.",
+        "ready" => "Ready to build.",
+        "running" => "Being built now.",
+        "review" => "In review \u{2014} automation is checking the work.",
+        "done" => "Done \u{2014} accepted.",
+        _ => "New \u{2014} waiting to be picked up.",
+    };
+    match attempt {
+        None => base.to_string(),
+        Some(s) => match s {
+            "impl_running" => format!("{base} An implement attempt is running."),
+            "review_running" => format!("{base} A review attempt is running."),
+            "impl_failed" => format!("{base} The last attempt failed during implement."),
+            "review_failed" => format!("{base} The last attempt failed review."),
+            "review_done" | "impl_done" => {
+                format!("{base} The last attempt finished: {s}.")
+            }
+            other => format!("{base} Last attempt: {other}."),
+        },
+    }
+}
+
+/// Bea-readable cost for one card: the first `Cost:` line in the body, or
+/// a calm sentence when the issue names no cost.
+pub fn board_cost_text(body: &str) -> String {
+    for line in body.lines() {
+        let t = line.trim();
+        if t.len() > 5 && t[..5].eq_ignore_ascii_case("cost:") {
+            let value = t[5..].trim();
+            if !value.is_empty() {
+                return format!("Cost: {value}");
+            }
+        }
+    }
+    "Cost not estimated yet.".to_string()
+}
+
+/// Bea-readable what-changed for one card: the newest `git log` hit that
+/// mentions the ticket, or a calm sentence when nothing landed yet.
+pub fn board_changed_text(hits: &[String]) -> String {
+    match hits.iter().find(|h| !h.trim().is_empty()) {
+        Some(h) => format!("What changed: {}", h.trim()),
+        None => "No changes recorded yet.".to_string(),
+    }
+}
+
+/// Group issues into the fixed column order. `attempts` maps ticket →
+/// latest attempt status; `changes` maps ticket → `git log` hit lines.
+/// Pure over fixtures: the seam endpoint tests assert.
+pub fn board_issues_to_columns(
+    issues: &[BoardIssue],
+    attempts: &std::collections::HashMap<u64, String>,
+    changes: &std::collections::HashMap<u64, Vec<String>>,
+) -> Vec<BoardColumn> {
+    let mut cols: Vec<BoardColumn> = BOARD_COLUMNS
+        .iter()
+        .map(|(id, title)| BoardColumn {
+            id,
+            title,
+            cards: Vec::new(),
+        })
+        .collect();
+    for issue in issues {
+        let (id, _) = board_column_for_labels(&issue.labels);
+        let empty: Vec<String> = Vec::new();
+        let hits = changes.get(&issue.number).unwrap_or(&empty);
+        let card = BoardCard {
+            number: issue.number,
+            title: issue.title.clone(),
+            status_text: board_status_text(
+                &issue.labels,
+                attempts.get(&issue.number).map(|s| s.as_str()),
+            ),
+            cost_text: board_cost_text(&issue.body),
+            changed_text: board_changed_text(hits),
+            labels: issue.labels.clone(),
+        };
+        if let Some(col) = cols.iter_mut().find(|c| c.id == id) {
+            col.cards.push(card);
+        }
+    }
+    cols
+}
+
+/// Calm sentence for a fully empty board (Bea: ready, not broken).
+pub fn board_empty_sentence() -> &'static str {
+    "No work is waiting \u{2014} your board is clear and ready for the next idea."
+}
+
+/// Calm sentence for an empty column.
+pub fn board_column_empty_sentence() -> &'static str {
+    "Nothing here right now."
+}
+
+fn gh_labels(value: &serde_json::Value) -> Vec<String> {
+    match value.get("labels") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|l| match l {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(m) => m
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Read-only issue fetch: open issues with labels + bodies. On any `gh`
+/// failure returns empty (the board renders its calm empty state, never
+/// a 500 for a missing CLI). No writes, no side effects.
+pub fn fetch_board_issues() -> Vec<BoardIssue> {
+    let out = match run_gh_output(&[
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,body,labels,state",
+    ]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
+    };
+    let items: Vec<serde_json::Value> = match serde_json::from_str(&out) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    items
+        .iter()
+        .map(|v| BoardIssue {
+            number: v.get("number").and_then(|n| n.as_u64()).unwrap_or(0),
+            title: v
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            body: v
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string(),
+            labels: gh_labels(v),
+            state: v
+                .get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or("open")
+                .to_string(),
+        })
+        .filter(|i| i.number != 0)
+        .collect()
+}
+
+/// Read-only: latest attempt status per ticket from the dispatch ledger.
+/// Missing/unreadable ledger reads as no attempts (empty board lanes).
+pub fn board_attempt_status() -> std::collections::HashMap<u64, String> {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let mut map = std::collections::HashMap::new();
+    for a in &ledger.attempts {
+        map.insert(a.ticket, a.status.clone());
+    }
+    map
+}
+
+/// Read-only: newest `git log` lines mentioning `#<ticket>` (same seam
+/// `reconcile` uses). Failures read as no changes.
+pub fn board_changed_hits(ticket: u64) -> Vec<String> {
+    let pattern = format!("#{ticket}");
+    let base = drift_base();
+    run_git(&["log", &base, "--oneline", "--grep", &pattern], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(3)
+                .map(|l| l.to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-only board assembly: issues × attempts × git hits → columns.
+pub fn board_data() -> Vec<BoardColumn> {
+    let issues = fetch_board_issues();
+    let attempts = board_attempt_status();
+    let mut changes = std::collections::HashMap::new();
+    for issue in &issues {
+        changes.insert(issue.number, board_changed_hits(issue.number));
+    }
+    board_issues_to_columns(&issues, &attempts, &changes)
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Fragment HTML for the board columns (the polling unit). Pure over
+/// columns so tests assert markers without a server.
+pub fn board_fragment_html(columns: &[BoardColumn]) -> String {
+    let total: usize = columns.iter().map(|c| c.cards.len()).sum();
+    let mut html = String::new();
+    if total == 0 {
+        html.push_str(&format!(
+            "<section data-board-empty><p>{}</p></section>",
+            board_empty_sentence()
+        ));
+    }
+    html.push_str("<section data-board-columns>");
+    for col in columns {
+        html.push_str(&format!(
+            "<section data-column=\"{}\"><h2>{} ({})</h2>",
+            col.id,
+            col.title,
+            col.cards.len()
+        ));
+        if col.cards.is_empty() {
+            html.push_str(&format!(
+                "<p data-empty-column>{}</p>",
+                board_column_empty_sentence()
+            ));
+        }
+        for card in &col.cards {
+            html.push_str(&format!(
+                "<article data-card=\"{}\" data-column=\"{}\"><h3>#{} {}</h3><p data-status>{}</p><p data-cost>{}</p><p data-changed>{}</p></article>",
+                card.number,
+                col.id,
+                card.number,
+                escape_html(&card.title),
+                escape_html(&card.status_text),
+                escape_html(&card.cost_text),
+                escape_html(&card.changed_text),
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("</section>");
+    html
+}
 
 #[derive(Template)]
 #[template(source = "<main><p>factory {{ version }} ok</p></main>", ext = "html")]
@@ -277,13 +638,110 @@ pub fn web_health_response() -> String {
     .expect("health template renders")
 }
 
-/// Handler shape for future UI tickets: routes call command functions.
-/// Not served anywhere in this ticket (structure only, no endpoints).
-pub fn web_router() -> axum::Router {
-    axum::Router::new().route(
-        "/health",
-        axum::routing::get(|| async { web_health_response() }),
+/// Full board page: columns plus the polling hook that refreshes only
+/// the fragment (no full reloads). Pure over columns for testing.
+pub fn board_page_html(columns: &[BoardColumn]) -> String {
+    let fragment = board_fragment_html(columns);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory board</title></head>\
+<body><header><h1>Factory board</h1>\
+<p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        BOARD_POLL_MS,
     )
+}
+
+async fn board_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(board_page_html(&board_data()))
+}
+
+async fn board_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(board_fragment_html(&board_data()))
+}
+
+/// Handler shape for UI tickets: board page + polling fragment + health.
+/// All GETs are read-only observers (same contract as `status`/`log`).
+pub fn web_router() -> axum::Router {
+    axum::Router::new()
+        .route("/", axum::routing::get(board_page_handler))
+        .route(
+            "/fragments/board",
+            axum::routing::get(board_fragment_handler),
+        )
+        .route(
+            "/health",
+            axum::routing::get(|| async { web_health_response() }),
+        )
+}
+
+/// True for loopback binds (127.0.0.1, ::1, localhost, with or without port).
+fn ui_addr_is_local(addr: &str) -> bool {
+    let host = addr
+        .rsplit(':')
+        .next()
+        .unwrap_or(addr)
+        .trim_matches(|c| c == '[' || c == ']');
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim().trim_matches(|c| c == '[' || c == ']'))
+        .unwrap_or(host);
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+/// Serve the board until interrupted. Blocks on a Tokio runtime created
+/// here so the sync `run()` CLI keeps one code path for binary + handlers.
+pub fn web_serve(addr: &str, allow_remote: bool) -> Result<(), String> {
+    if !allow_remote && !ui_addr_is_local(addr) {
+        return Err(format!(
+            "refusing non-localhost bind {addr}: pass --allow-remote to expose the factory UI explicitly"
+        ));
+    }
+    let owned = addr.to_string();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start UI runtime: {e}"))?;
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&owned)
+            .await
+            .map_err(|e| format!("cannot bind {owned}: {e}"))?;
+        println!("factory ui serving the board on http://{owned} (board at /)");
+        axum::serve(listener, web_router())
+            .await
+            .map_err(|e| format!("factory ui failed: {e}"))
+    })
+}
+
+/// `factory ui` / `factory serve`: bind and serve the board. Exit 0 once
+/// the server stops cleanly; nonzero with a plain-English cause when the
+/// address is rejected or the listener cannot start.
+pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
+    match web_serve(addr, allow_remote) {
+        Ok(()) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"serving": false, "addr": addr, "stopped": true})
+                );
+            }
+            0
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"error": e, "addr": addr}));
+            }
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2619,8 +3077,10 @@ fn cmd_dispatch_ticket(
     remove_worktree(&wt);
     if verdict.as_deref() == Some("accept") {
         // Accept path: with an open train, auto-merge cleanly or route to
-        // blocked on conflict (never forced). Without a train the human
-        // owns the land. Never merges into dev/main, never pushes.
+        // blocked on conflict (never forced). With no open train, auto-cut
+        // a default-slug train (T35) and merge there instead of waiting;
+        // a concurrently opened train is merged into, never duplicated.
+        // Never merges into dev/main, never pushes.
         if !open_train_branch.is_empty() {
             match do_train_merge(ticket, &branch, &open_train_branch, state) {
                 Ok(short) => {
@@ -2637,11 +3097,65 @@ fn cmd_dispatch_ticket(
                 }
             }
         } else {
-            // Accepted: human owns the land. Record base→head, never merge/push.
-            gh_relabel(ticket, Some("review"), "accepted");
-            gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
-            println!("  ACCEPTED — #{ticket} awaiting human land");
-            finish_attempt(state, ledger, idx, "review_done", 0);
+            // Auto-cut (T35): no open train, so cut one (default slug)
+            // and merge the accepted ticket into it. A concurrent open
+            // refuses the cut — merge into that train instead, never a
+            // second train. Any other cut failure falls back to the old
+            // accepted-only record (base→head, human owns the land).
+            let train = match cut_train(state, None) {
+                Ok(t) => {
+                    println!("  auto-cut train {t} (no open train)");
+                    Some(t)
+                }
+                Err(e) if e.contains("already open") => {
+                    match load_open_train(state) {
+                        Some(t) => {
+                            println!(
+                            "  train opened concurrently ({}) — merging there, never a second train",
+                            t.branch
+                        );
+                            Some(t.branch)
+                        }
+                        None => {
+                            eprintln!("dispatch: auto-cut race ({e}) with no open train — recording accepted");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dispatch: auto-cut failed ({e}) — recording accepted");
+                    None
+                }
+            };
+            match train {
+                Some(t) => {
+                    ledger.attempts[idx].train_branch = t.clone();
+                    if let Err(e) = save_ledger(state, ledger) {
+                        eprintln!("dispatch: {e}");
+                    }
+                    match do_train_merge(ticket, &branch, &t, state) {
+                        Ok(short) => {
+                            gh_relabel(ticket, Some("review"), "integrated");
+                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` and merged into it ({short}). Human: covered by the train→dev review."));
+                            println!("  ACCEPTED + INTEGRATED into {t} (auto-cut) — #{ticket}");
+                            finish_attempt(state, ledger, idx, "review_done", 0);
+                        }
+                        Err(e) => {
+                            println!("  merge into auto-cut train failed — routing to blocked (never forced)");
+                            gh_relabel(ticket, Some("review"), "blocked");
+                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` but merge failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
+                            finish_attempt(state, ledger, idx, "review_failed", 0);
+                        }
+                    }
+                }
+                None => {
+                    // Accepted: human owns the land. Record base→head, never merge/push.
+                    gh_relabel(ticket, Some("review"), "accepted");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
+                    println!("  ACCEPTED — #{ticket} awaiting human land");
+                    finish_attempt(state, ledger, idx, "review_done", 0);
+                }
+            }
         }
     } else {
         println!("  changes_requested (or unreadable verdict) — back to ready");
@@ -2649,6 +3163,58 @@ fn cmd_dispatch_ticket(
         finish_attempt(state, ledger, idx, "review_failed", 0);
     }
     TicketOutcome::Done
+}
+
+/// Auto-finish (T35): when the open train's head is an ancestor of dev,
+/// the human has merged it — finish without the command (row closed,
+/// train worktree removed, branch cleanup printed, branches never
+/// deleted). Starts with a read-only `git fetch origin` (best effort:
+/// a failed fetch never fails the pass) so a human merge pushed
+/// elsewhere is observed. Unmerged trains are left untouched. With
+/// `dry_run`, observes and prints but changes nothing.
+/// Returns true when a train was finished this pass.
+fn maybe_auto_finish(state: &std::path::Path, dry_run: bool) -> bool {
+    let Some(train) = load_open_train(state) else {
+        return false;
+    };
+    // Read-only fetch first: observe the human's merge wherever it landed.
+    let _ = run_git(&["fetch", "origin"], None);
+    if !train_merged_into_dev(&train.branch) {
+        return false;
+    }
+    // Same empty-train guard as `release finish`: an untouched train whose
+    // head still equals both its base and dev was never landed.
+    let head_now = train_head(&train.branch);
+    if head_now.is_empty() {
+        return false;
+    }
+    let dev_head = rev_parse_ok("dev")
+        .or_else(|| rev_parse_ok("origin/dev"))
+        .unwrap_or_default();
+    if head_now == train.base_commit && head_now == dev_head {
+        return false;
+    }
+    if dry_run {
+        println!(
+            "dry-run: would finish merged train {} (row merged, worktree removed, cleanup printed; branches never deleted)",
+            train.branch
+        );
+        return false;
+    }
+    match finish_train_closed(state) {
+        Ok((branch, _members, cleanup)) => {
+            println!("release: train {branch} merged into dev");
+            println!("cleanup (human runs these, automation never deletes):");
+            for line in &cleanup {
+                println!("  {line}");
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("dispatch auto-finish: {e}");
+            false
+        }
+    }
 }
 
 pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
@@ -2671,6 +3237,10 @@ pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
         return 0;
     };
     let mut ledger = load_ledger(&state);
+    // Auto-finish (T35) runs before the ticket survey so a human-merged
+    // train closes even on passes with no open tickets. Read-only fetch
+    // first, unmerged trains untouched, dry-run changes nothing.
+    maybe_auto_finish(&state, dry_run);
     let max_concurrent = dispatch_max_concurrent();
     let max_attempts = dispatch_max_attempts();
     if dispatch_active(&ledger) >= max_concurrent {
@@ -4046,18 +4616,20 @@ fn train_head(train: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
-    let state = dispatch_state_dir();
-    if let Err(e) = std::fs::create_dir_all(&state) {
-        eprintln!("release: cannot create {}: {e}", state.display());
-        return 1;
+/// Cut a new integration train from the dev base and record it open.
+/// Shared by `release start` and dispatch auto-cut (T35): same refusal
+/// when a train is already open (never two open trains), same refusal
+/// when the branch name exists, same dev base. Returns the train branch.
+/// Read-write: creates the branch + train.json. Never touches dev/main.
+fn cut_train(state: &std::path::Path, slug_opt: Option<&str>) -> Result<String, String> {
+    if let Err(e) = std::fs::create_dir_all(state) {
+        return Err(format!("release: cannot create {}: {e}", state.display()));
     }
-    if let Some(existing) = load_open_train(&state) {
-        eprintln!(
+    if let Some(existing) = load_open_train(state) {
+        return Err(format!(
             "release: train already open ({}) — merge or abandon it first; never two open trains",
             existing.branch
-        );
-        return 1;
+        ));
     }
     let mut slug = slugify(slug_opt.unwrap_or("train"));
     if slug.is_empty() {
@@ -4066,22 +4638,21 @@ pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
     let stamp = date_stamp();
     let train = format!("integration/{stamp}-{slug}");
     if branch_exists(&train) {
-        eprintln!("release: branch {train} already exists — refusing to reuse");
-        return 1;
+        return Err(format!(
+            "release: branch {train} already exists — refusing to reuse"
+        ));
     }
     let base = resolve_train_base();
     match run_git(&["branch", &train, &base], None) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
-            eprintln!(
+            return Err(format!(
                 "release: git branch failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return 1;
+            ));
         }
         Err(e) => {
-            eprintln!("release: {e}");
-            return 1;
+            return Err(format!("release: {e}"));
         }
     }
     let record = TrainState {
@@ -4090,19 +4661,36 @@ pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
         status: "open".to_string(),
         created_at: now_stamp(),
     };
-    if let Err(e) = save_train(&state, &record) {
-        eprintln!("release: {e}");
-        return 1;
+    if let Err(e) = save_train(state, &record) {
+        return Err(format!("release: {e}"));
     }
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"train": train, "base": base, "open": true})
-        );
-    } else {
-        println!("release: train {train} cut from {base}");
+    Ok(train)
+}
+
+pub fn cmd_release_start(json: bool, slug_opt: Option<&str>) -> i32 {
+    let state = dispatch_state_dir();
+    let base_hint = resolve_train_base();
+    match cut_train(&state, slug_opt) {
+        Ok(train) => {
+            // Base was resolved inside cut_train; re-read for the report.
+            let base = load_open_train(&state)
+                .map(|t| t.base_commit)
+                .unwrap_or(base_hint);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"train": train, "base": base, "open": true})
+                );
+            } else {
+                println!("release: train {train} cut from {base}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
-    0
 }
 
 pub fn cmd_release_status(json: bool) -> i32 {
@@ -4266,18 +4854,21 @@ fn cleanup_lines(train: &str, members: &[String]) -> Vec<String> {
     lines
 }
 
-pub fn cmd_release_finish(json: bool) -> i32 {
-    let state = dispatch_state_dir();
-    let Some(train) = load_open_train(&state) else {
-        eprintln!("release: no open train");
-        return 1;
-    };
+/// Verify the human merged the open train into dev and close it:
+/// remove the train worktree, clear the train row, return the branch,
+/// its member branches, and the human-run cleanup lines (never executed
+/// here — branches are never deleted by automation). Shared by `release
+/// finish` and dispatch auto-finish (T35): identical merge predicate
+/// (ancestor check + empty-train guard), identical effects.
+fn finish_train_closed(
+    state: &std::path::Path,
+) -> Result<(String, Vec<String>, Vec<String>), String> {
+    let train = load_open_train(state).ok_or_else(|| "release: no open train".to_string())?;
     if !train_merged_into_dev(&train.branch) {
-        eprintln!(
+        return Err(format!(
             "release: train {} not merged into dev — human must merge first",
             train.branch
-        );
-        return 1;
+        ));
     }
     // An empty train (head == base) is trivially an ancestor but was never
     // landed: refuse only when dev still points at the same commit (no
@@ -4285,40 +4876,51 @@ pub fn cmd_release_finish(json: bool) -> i32 {
     // train, dev has a new merge commit so dev != train and finish succeeds.
     let head_now = train_head(&train.branch);
     if head_now.is_empty() {
-        eprintln!(
+        return Err(format!(
             "release: train {} not merged into dev — human must merge first",
             train.branch
-        );
-        return 1;
+        ));
     }
     let dev_head = rev_parse_ok("dev")
         .or_else(|| rev_parse_ok("origin/dev"))
         .unwrap_or_default();
     if head_now == train.base_commit && head_now == dev_head {
-        eprintln!(
+        return Err(format!(
             "release: train {} not merged into dev — human must merge first",
             train.branch
-        );
-        return 1;
+        ));
     }
-    let ledger = load_ledger(&state);
+    let ledger = load_ledger(state);
     let members = member_branches(&ledger, &train.branch);
-    remove_train_worktree(&state);
-    clear_train(&state);
+    remove_train_worktree(state);
+    clear_train(state);
     let cleanup = cleanup_lines(&train.branch, &members);
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({"train": train.branch, "merged": true, "cleanup": cleanup})
-        );
-    } else {
-        println!("release: train {} merged into dev", train.branch);
-        println!("cleanup (human runs these, automation never deletes):");
-        for line in &cleanup {
-            println!("  {line}");
+    Ok((train.branch, members, cleanup))
+}
+
+pub fn cmd_release_finish(json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    match finish_train_closed(&state) {
+        Ok((branch, _members, cleanup)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"train": branch, "merged": true, "cleanup": cleanup})
+                );
+            } else {
+                println!("release: train {branch} merged into dev");
+                println!("cleanup (human runs these, automation never deletes):");
+                for line in &cleanup {
+                    println!("  {line}");
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
         }
     }
-    0
 }
 
 pub fn cmd_release_abandon(json: bool) -> i32 {
@@ -4415,6 +5017,8 @@ pub fn run() -> i32 {
             ReleaseAction::Abandon => cmd_release_abandon(cli.json),
         },
         Commands::Land { dry_run, train } => cmd_land(cli.json, dry_run, train),
+        Commands::Ui { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
+        Commands::Serve { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
     }
 }
 
