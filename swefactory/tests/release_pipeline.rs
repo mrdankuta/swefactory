@@ -1,10 +1,14 @@
 //! Release pipeline (ticket #12): pushing a tag ships the product.
+//! Homebrew tap (ticket #37): mac installs lead with the tap.
 //!
 //! Seams under test (agreed config surfaces, not behaviour we can execute here):
 //! 1. `swefactory/Cargo.toml` cargo-dist metadata — catches a missing target,
 //!    installer, or formula. Misses whether CI actually runs green.
 //! 2. `.github/workflows/release.yml` tag trigger + dist build + per-platform
 //!    installer smoke — catches unwired CI. Misses real runner execution.
+//! 3. `mrdankuta/homebrew-tap` publishing — catches unwired formula publish.
+//!    Misses real tap commits (no network here) and the HOMEBREW_TAP_TOKEN
+//!    secret (human-owned, verified in CI on the next tagged release).
 //!
 //! What these tests miss by construction (no network, no runners here) is
 //! covered by the workflow itself: it smoke-installs on every tagged release.
@@ -139,5 +143,57 @@ fn install_docs_stay_curl_pipe_shaped() {
     assert!(
         readme.contains("irm") || readme.contains("installer.ps1"),
         "swefactory/README.md install docs never mention the PowerShell installer"
+    );
+}
+
+#[test]
+fn homebrew_tap_publishing_is_wired() {
+    // Ticket #37: formula payload already ships in every release (factory.rb);
+    // this wires it to the tap repo so `brew install mrdankuta/tap/factory`
+    // stays fresh. cargo-dist owns the publish job — we only assert the
+    // two config keys that make it generate one (manual publish otherwise).
+    let cargo_toml = read_repo("swefactory/Cargo.toml");
+    assert!(
+        cargo_toml.contains("mrdankuta/homebrew-tap"),
+        "Cargo.toml dist config must set tap = \"mrdankuta/homebrew-tap\""
+    );
+    assert!(
+        cargo_toml.contains("publish-jobs") && cargo_toml.contains("homebrew"),
+        "Cargo.toml dist config must set publish-jobs = [\"homebrew\"]"
+    );
+
+    // The generated release workflow must carry the homebrew publish leg
+    // (needs HOMEBREW_TAP_TOKEN at runtime — human-owned secret, not
+    // asserted here beyond the workflow referencing it).
+    let workflow = read_repo(".github/workflows/release.yml");
+    assert!(
+        workflow.to_lowercase().contains("homebrew"),
+        "release workflow has no homebrew publish job (regenerate via `dist generate`)"
+    );
+    assert!(
+        workflow.contains("HOMEBREW_TAP_TOKEN"),
+        "release workflow homebrew publish must use HOMEBREW_TAP_TOKEN secret"
+    );
+}
+
+#[test]
+fn install_docs_lead_with_tap_for_mac() {
+    // Ticket #37: README install docs lead with the tap for macOS,
+    // curl-pipe otherwise (Linux shell, Windows PowerShell stay documented).
+    let readme = read_repo("swefactory/README.md");
+    assert!(
+        readme.contains("brew install mrdankuta/tap/factory"),
+        "swefactory/README.md must document `brew install mrdankuta/tap/factory`"
+    );
+    // Tap-first ordering: the brew/tap line must precede the curl fallback.
+    let tap_pos = readme
+        .find("mrdankuta/tap/factory")
+        .expect("tap install line missing");
+    let curl_pos = readme
+        .find("factory-installer.sh")
+        .expect("curl line missing");
+    assert!(
+        tap_pos < curl_pos,
+        "install docs must lead with the tap (mac) before the curl-pipe fallback"
     );
 }

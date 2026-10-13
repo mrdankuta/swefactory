@@ -5,7 +5,9 @@ edition = "2021"
 description = "swefactory — the software factory as a product (single static binary)"
 license = "MIT"
 repository = "https://github.com/mrdankuta/swefactory"
-homepage = "https://github.com/mrdankuta/swefactory"
+# Ticket #36: the Pages download home (rendered by oranda from cargo-dist
+# releases). `repository` below stays the GitHub repo — dist requires it.
+homepage = "https://mrdankuta.github.io/swefactory/"
 
 [[bin]]
 name = "factory"
@@ -52,6 +54,11 @@ cargo-dist-version = "0.33.0"
 allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
+# Ticket #37: publish the Homebrew formula to the tap repo so
+# `brew install mrdankuta/tap/factory` stays fresh. cargo-dist generates
+# the publish leg in release.yml (needs HOMEBREW_TAP_TOKEN secret).
+tap = "mrdankuta/homebrew-tap"
+publish-jobs = ["homebrew"]
 targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",

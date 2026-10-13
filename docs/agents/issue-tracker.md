@@ -44,6 +44,11 @@ member, a spec freeze, or an explicit predecessor) plus a `Depends on:`
 line, which is what the dispatcher enforces. Never use `ready` as a holding
 state — an issue carrying it will be picked up on the next tick.
 
+Operator checklist: when closing a ticket, immediately add `ready` to every
+`ticket`-staged issue whose blockers just cleared. The daemon cannot see
+staged work — an authorized-but-unmarked issue sits invisible (this exact
+miss idled #33 for a full cycle).
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
