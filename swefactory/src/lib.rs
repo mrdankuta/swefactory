@@ -607,7 +607,7 @@ pub fn board_fragment_html(columns: &[BoardColumn]) -> String {
         }
         for card in &col.cards {
             html.push_str(&format!(
-                "<article data-card=\"{}\" data-column=\"{}\"><h3>#{} {}</h3><p data-status>{}</p><p data-cost>{}</p><p data-changed>{}</p></article>",
+                "<article data-card=\"{}\" data-column=\"{}\"><h3>#{} {}</h3><p data-status>{}</p><p data-cost>{}</p><p data-changed>{}</p><a data-detail-link href=\"/tickets/{}\">Open detail</a></article>",
                 card.number,
                 col.id,
                 card.number,
@@ -615,6 +615,7 @@ pub fn board_fragment_html(columns: &[BoardColumn]) -> String {
                 escape_html(&card.status_text),
                 escape_html(&card.cost_text),
                 escape_html(&card.changed_text),
+                card.number,
             ));
         }
         html.push_str("</section>");
@@ -649,6 +650,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
 <title>Factory board</title></head>\
 <body><header><h1>Factory board</h1>\
 <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -667,6 +669,572 @@ async fn board_fragment_handler() -> axum::response::Html<String> {
     axum::response::Html(board_fragment_html(&board_data()))
 }
 
+// --- ticket detail (ticket #30, spec #27) ---------------------------------
+//
+// Bea taps a board card and lands here: the issue body in plain words,
+// then the per-ticket attempt history newest-first with the outcome
+// summary (the story, failure cause first) before the bounded transcript
+// tail (the evidence). Same read-only contract as the board and `log`:
+// `gh issue view` via `run_gh_output` (FACTORY_GH_BIN-overridable), ledger
+// + logs via `dispatch_state_dir` (FACTORY_STATE_DIR-overridable). No git
+// calls, no writes. Rendering is pure over `TicketDetail` fixtures so
+// endpoint tests assert markers without scraping a browser.
+
+/// Transcript lines shown per attempt on the detail page. Matches
+/// LOG_DEFAULT_TAIL so the page and `factory log <n>` tell the same
+/// bounded story; callers pass an explicit `tail` (0 means full) and the
+/// views carry a `truncated` flag whenever older lines were dropped.
+pub const TICKET_DETAIL_TAIL: usize = 50;
+
+/// One attempt as the detail page sees it: summary first, then the
+/// bounded transcript tail. Field-for-field the `factory log --json` row
+/// so prose and JSON shapes carry the same facts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketAttemptView {
+    pub attempt_no: u64,
+    pub status: String,
+    pub summary: String,
+    pub base: String,
+    pub head: String,
+    pub started: String,
+    pub finished: String,
+    pub exit_code: i32,
+    pub transcript: String,
+    pub truncated: bool,
+}
+
+/// One ticket as the detail page sees it: body plus attempt history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketDetail {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub state: String,
+    pub attempts: Vec<TicketAttemptView>,
+}
+
+/// Calm sentence when the ticket has no attempts yet (Bea: ready, not broken).
+pub fn ticket_no_attempts_sentence() -> &'static str {
+    "No attempts yet \u{2014} this ticket is waiting to be picked up."
+}
+
+/// Calm sentence when `gh` has no such issue (never a bare 500).
+pub fn ticket_missing_sentence(raw: &str) -> String {
+    format!(
+        "There is no ticket {raw} that the factory can see \u{2014} it may be closed, mistyped, or outside this repo."
+    )
+}
+
+/// Read-only single-issue fetch via the `gh` seam. `None` on any failure
+/// (bad number, missing CLI, unknown issue): the page renders its calm
+/// missing-ticket sentence instead of a 500. No writes, no side effects.
+pub fn fetch_ticket_issue(number: u64) -> Option<BoardIssue> {
+    let num = number.to_string();
+    let out = match run_gh_output(&[
+        "issue",
+        "view",
+        &num,
+        "--json",
+        "number,title,body,labels,state",
+    ]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return None,
+    };
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let n = v.get("number").and_then(|n| n.as_u64())?;
+    if n == 0 {
+        return None;
+    }
+    Some(BoardIssue {
+        number: n,
+        title: v
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body: v
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string(),
+        labels: gh_labels(&v),
+        state: v
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("open")
+            .to_string(),
+    })
+}
+
+/// Read-only per-ticket attempt history, newest-first, summaries before
+/// bounded transcripts: the same rows `cmd_log` prints, as structs. Sort
+/// order matches `cmd_log` exactly (attempt_no, then id, descending).
+/// Missing/unreadable ledger reads as no attempts. Read-only.
+pub fn ticket_attempt_views(ticket: u64, tail: usize) -> Vec<TicketAttemptView> {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let mut entries: Vec<&DispatchAttempt> = ledger
+        .attempts
+        .iter()
+        .filter(|a| a.ticket == ticket)
+        .collect();
+    entries.sort_by(|a, b| b.attempt_no.cmp(&a.attempt_no).then(b.id.cmp(&a.id)));
+    entries
+        .into_iter()
+        .map(|a| {
+            let full = log_read_transcript(&state, a);
+            let (shown, truncated) = log_tail(&full, tail);
+            TicketAttemptView {
+                attempt_no: a.attempt_no,
+                status: a.status.clone(),
+                summary: log_summary(a),
+                base: a.base_commit.clone(),
+                head: a.head_commit.clone(),
+                started: a.started_at.clone(),
+                finished: a.finished_at.clone(),
+                exit_code: a.exit_code,
+                transcript: shown,
+                truncated,
+            }
+        })
+        .collect()
+}
+
+/// Read-only detail assembly: issue body plus attempt history. `None`
+/// when `gh` has no such issue; `Some` with possibly-empty attempts
+/// otherwise. Read-only.
+pub fn ticket_detail(number: u64, tail: usize) -> Option<TicketDetail> {
+    fetch_ticket_issue(number).map(|issue| TicketDetail {
+        number: issue.number,
+        title: issue.title,
+        body: issue.body,
+        labels: issue.labels,
+        state: issue.state,
+        attempts: ticket_attempt_views(number, tail),
+    })
+}
+
+/// JSON shape for the detail: the same facts as the prose page with the
+/// same bounded transcripts, so machines and Bea read one story.
+pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
+    let attempts: Vec<serde_json::Value> = detail
+        .attempts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "attempt": a.attempt_no,
+                "slot": format!("T{}-a{}", detail.number, a.attempt_no),
+                "status": a.status,
+                "summary": a.summary,
+                "base": a.base,
+                "head": a.head,
+                "started": a.started,
+                "finished": a.finished,
+                "exit_code": a.exit_code,
+                "transcript": a.transcript,
+                "truncated": a.truncated,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "ticket": detail.number,
+        "title": detail.title,
+        "body": detail.body,
+        "labels": detail.labels,
+        "state": detail.state,
+        "attempts": attempts,
+    })
+}
+
+/// Fragment HTML for one ticket (the polling unit). Pure over the detail
+/// so tests assert markers without a server: `data-ticket` plus
+/// `data-ticket-body`, per-attempt `data-attempt` with `data-summary`
+/// before `data-transcript`, and `data-truncated` naming the bound when
+/// older lines were dropped.
+pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
+    let mut html = String::new();
+    html.push_str(&format!(
+        "<section data-ticket=\"{}\"><h2>Ticket #{} {}</h2><div data-ticket-body>{}</div>",
+        detail.number,
+        detail.number,
+        escape_html(&detail.title),
+        escape_html(&detail.body),
+    ));
+    if detail.attempts.is_empty() {
+        html.push_str(&format!(
+            "<p data-no-attempts>{}</p>",
+            ticket_no_attempts_sentence()
+        ));
+    } else {
+        html.push_str("<ol data-attempts>");
+        for a in &detail.attempts {
+            html.push_str(&format!(
+                "<li data-attempt=\"{}\"><p data-summary>{}</p>",
+                a.attempt_no,
+                escape_html(&a.summary),
+            ));
+            if a.transcript.is_empty() {
+                html.push_str("<p data-transcript-empty>(no transcript yet)</p>");
+            } else {
+                html.push_str(&format!(
+                    "<pre data-transcript>{}</pre>",
+                    escape_html(&a.transcript)
+                ));
+            }
+            if a.truncated {
+                let shown = a.transcript.lines().count();
+                html.push_str(&format!(
+                    "<p data-truncated>Showing the last {shown} lines \u{2014} older lines are hidden. Full transcript: <code>factory log {} --tail 0</code>.</p>",
+                    detail.number
+                ));
+            }
+            html.push_str("</li>");
+        }
+        html.push_str("</ol>");
+    }
+    html
+}
+// --- dispatcher live (ticket #31, spec #27) ---------------------------------
+//
+// The status/tail/worktree ritual as one polling view: live attempts in
+// slot lanes, STOP state with STOP/Resume control, per-attempt streaming
+// log tails, worktree list. Same-binary Axum, server-rendered HTML,
+// polling fragment (~3s), no websockets.
+//
+// Reads flow through the existing seams: the dispatch ledger via
+// `dispatch_state_dir` (overridable with FACTORY_STATE_DIR), transcripts
+// via the log-dir files the dispatcher writes, worktrees via
+// `git worktree list` (`run_git`, overridable with FACTORY_GIT_BIN).
+// Writes flow only through the loop controls: the POST handlers below
+// call `cmd_dispatch_stop` / `cmd_dispatch_resume`, the same functions
+// the CLI calls. GETs never mutate (snapshot-tested like the board).
+
+/// Poll interval for the dispatcher fragment (spec: dispatcher-live ~3s).
+pub const DISPATCHER_POLL_MS: u64 = 3_000;
+
+/// Transcript tail (lines) per attempt on the live screen. Matches the
+/// `factory log` default: bounded context, newest lines stream.
+pub const DISPATCHER_LOG_TAIL: usize = LOG_DEFAULT_TAIL;
+
+/// One live attempt as the dispatcher screen sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatcherAttemptView {
+    pub ticket: u64,
+    pub attempt_no: u64,
+    pub slot: String,
+    pub status: String,
+    pub summary: String,
+    pub transcript_tail: String,
+    pub truncated: bool,
+    pub worktree: String,
+    pub branch: String,
+    pub started: String,
+    pub finished: String,
+}
+
+/// The live screen: attempts in slot lanes + STOP state + worktrees.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatcherData {
+    pub attempts: Vec<DispatcherAttemptView>,
+    pub stopped: bool,
+    pub worktrees: Vec<String>,
+    pub max_concurrent: usize,
+}
+
+/// Calm sentence for zero attempts (ready, not broken).
+pub fn dispatcher_empty_sentence() -> &'static str {
+    "No attempts yet \u{2014} the dispatcher is idle and ready for the next ticket."
+}
+
+/// Calm sentence for an attempt with no log lines yet.
+pub fn dispatcher_no_transcript_sentence() -> &'static str {
+    "No transcript yet \u{2014} the attempt has not written any log lines."
+}
+
+/// Calm sentence for zero checked-out worktrees.
+pub fn dispatcher_no_worktrees_sentence() -> &'static str {
+    "No worktrees checked out right now."
+}
+
+/// Read-only: `git worktree list` lines. Failures read as none (the
+/// screen renders its calm empty state, never a 500 for missing git).
+fn dispatcher_worktree_lines() -> Vec<String> {
+    run_git(&["worktree", "list"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-only live assembly: ledger x transcripts x STOP x worktrees.
+/// Missing/unreadable ledger reads as idle (no attempts, running).
+pub fn dispatcher_data() -> DispatcherData {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let stopped = state.join("STOP").is_file();
+    let worktrees = dispatcher_worktree_lines();
+    let mut attempts = Vec::with_capacity(ledger.attempts.len());
+    for a in &ledger.attempts {
+        let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+        let full = log_read_transcript(&state, a);
+        let (tail, truncated) = log_tail(&full, DISPATCHER_LOG_TAIL);
+        attempts.push(DispatcherAttemptView {
+            ticket: a.ticket,
+            attempt_no: a.attempt_no,
+            slot,
+            status: a.status.clone(),
+            summary: log_summary(a),
+            transcript_tail: tail,
+            truncated,
+            worktree: a.worktree.clone(),
+            branch: a.branch.clone(),
+            started: a.started_at.clone(),
+            finished: a.finished_at.clone(),
+        });
+    }
+    DispatcherData {
+        attempts,
+        stopped,
+        worktrees,
+        max_concurrent: dispatch_max_concurrent(),
+    }
+}
+
+/// Fragment HTML for the live screen (the polling unit). Pure over data
+/// so tests assert markers without a server.
+pub fn dispatcher_fragment_html(data: &DispatcherData) -> String {
+    let mut html = String::new();
+    html.push_str("<section data-dispatch>");
+    if data.stopped {
+        html.push_str("<p data-stop=\"halted\">STOP: dispatch loop is halted (STOP file present). Resume to let the loop schedule again.</p>");
+    } else {
+        html.push_str("<p data-stop=\"running\">STOP: dispatch loop running (no STOP file).</p>");
+    }
+    html.push_str("<div data-stop-controls><form method=\"post\" action=\"/dispatch/stop\" data-stop-form><button type=\"submit\">STOP the loop</button></form>");
+    html.push_str("<form method=\"post\" action=\"/dispatch/resume\" data-resume-form><button type=\"submit\">Resume the loop</button></form></div>");
+    html.push_str(&format!(
+        "<p data-cli>Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>. Brake: <code>factory dispatch stop</code> / <code>factory dispatch resume</code>. Slots: up to {} concurrent.</p>",
+        data.max_concurrent
+    ));
+    if data.attempts.is_empty() {
+        html.push_str(&format!(
+            "<section data-attempts-empty><p>{}</p></section>",
+            dispatcher_empty_sentence()
+        ));
+    } else {
+        html.push_str("<section data-attempts>");
+        for a in &data.attempts {
+            html.push_str(&format!(
+                "<article data-attempt=\"{}\" data-slot=\"{}\" data-ticket=\"{}\" data-status=\"{}\"><h3>#{ticket} attempt {n} ({slot}) \u{2014} {status}</h3><p data-summary>{summary}</p>",
+                escape_html(&a.slot),
+                escape_html(&a.slot),
+                a.ticket,
+                escape_html(&a.status),
+                ticket = a.ticket,
+                n = a.attempt_no,
+                slot = escape_html(&a.slot),
+                status = escape_html(&a.status),
+                summary = escape_html(&a.summary),
+            ));
+            if !a.branch.is_empty() || !a.worktree.is_empty() {
+                html.push_str(&format!(
+                    "<p data-where>Branch <code>{}</code> at <code>{}</code>. Tail: <code>factory log {} --tail {}</code>.</p>",
+                    escape_html(&a.branch),
+                    escape_html(&a.worktree),
+                    a.ticket,
+                    DISPATCHER_LOG_TAIL,
+                ));
+            }
+            if a.transcript_tail.is_empty() {
+                html.push_str(&format!(
+                    "<p data-no-transcript>{}</p>",
+                    dispatcher_no_transcript_sentence()
+                ));
+            } else {
+                if a.truncated {
+                    html.push_str(&format!(
+                        "<p data-truncated>(showing last {} lines)</p>",
+                        DISPATCHER_LOG_TAIL
+                    ));
+                }
+                html.push_str(&format!(
+                    "<pre data-log-tail>{}</pre>",
+                    escape_html(&a.transcript_tail)
+                ));
+            }
+            html.push_str("</article>");
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("<section data-worktrees><h2>Worktrees</h2>");
+    if data.worktrees.is_empty() {
+        html.push_str(&format!(
+            "<p data-no-worktrees>{}</p>",
+            dispatcher_no_worktrees_sentence()
+        ));
+    } else {
+        html.push_str("<ul>");
+        for w in &data.worktrees {
+            html.push_str(&format!("<li>{}</li>", escape_html(w)));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</section>");
+    html.push_str("</section>");
+    html
+}
+
+/// Calm missing-ticket fragment (Bea: a sentence, never a bare 500).
+pub fn ticket_missing_fragment_html(raw: &str) -> String {
+    format!(
+        "<section data-ticket-missing><p>{}</p></section>",
+        escape_html(&ticket_missing_sentence(raw))
+    )
+}
+
+/// Full detail page: body plus attempt history with the polling hook that
+/// refreshes only the fragment (no full reloads). Pure over the detail
+/// for testing.
+pub fn ticket_detail_page_html(detail: &TicketDetail) -> String {
+    let fragment = ticket_detail_fragment_html(detail);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Ticket #{} \u{2014} Factory</title></head>\
+<body><header><h1>Ticket #{}</h1>\
+<p>Body, attempts, and transcript tails. Matches <code>factory log {}</code>.</p>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"ticket\" data-ticket-fragment=\"/fragments/ticket/{}\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('ticket');if(!el)return;var url=el.getAttribute('data-ticket-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        detail.number, detail.number, detail.number, detail.number, BOARD_POLL_MS,
+    )
+}
+
+/// Calm missing-ticket page (404 body, still a sentence).
+pub fn ticket_missing_page_html(raw: &str) -> String {
+    let fragment = ticket_missing_fragment_html(raw);
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Ticket not found \u{2014} Factory</title></head>\
+<body><header><h1>Ticket not found</h1></header><main>{fragment}</main></body></html>",
+    )
+}
+
+async fn ticket_page_handler(
+    axum::extract::Path(raw): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    match parse_issue_number(&raw)
+        .ok()
+        .and_then(|n| ticket_detail(n, TICKET_DETAIL_TAIL))
+    {
+        Some(detail) => (
+            axum::http::StatusCode::OK,
+            axum::response::Html(ticket_detail_page_html(&detail)),
+        ),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::response::Html(ticket_missing_page_html(&raw)),
+        ),
+    }
+}
+
+async fn ticket_fragment_handler(
+    axum::extract::Path(raw): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    match parse_issue_number(&raw)
+        .ok()
+        .and_then(|n| ticket_detail(n, TICKET_DETAIL_TAIL))
+    {
+        Some(detail) => (
+            axum::http::StatusCode::OK,
+            axum::response::Html(ticket_detail_fragment_html(&detail)),
+        ),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::response::Html(ticket_missing_fragment_html(&raw)),
+        ),
+    }
+}
+
+async fn ticket_api_handler(
+    axum::extract::Path(raw): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    match parse_issue_number(&raw)
+        .ok()
+        .and_then(|n| ticket_detail(n, TICKET_DETAIL_TAIL))
+    {
+        Some(detail) => (
+            axum::http::StatusCode::OK,
+            axum::Json(ticket_detail_json(&detail)),
+        ),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": ticket_missing_sentence(&raw)})),
+        ),
+    }
+}
+
+/// Handler shape for UI tickets: board page + polling fragment + health,
+/// plus the ticket detail slice (page + fragment + JSON). All GETs are
+/// read-only observers (same contract as `status`/`log`).
+/// Full dispatcher page: live fragment plus the polling hook that
+/// refreshes only the fragment (no full reloads). Pure over data.
+pub fn dispatcher_page_html(data: &DispatcherData) -> String {
+    let fragment = dispatcher_fragment_html(data);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory dispatcher</title></head>\
+<body><header><h1>Factory dispatcher</h1>\
+<p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('dispatch');if(!el)return;var url=el.getAttribute('data-dispatch-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'3000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        DISPATCHER_POLL_MS,
+    )
+}
+
+/// GET /dispatch: the live screen. Read-only observer.
+pub async fn dispatcher_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(dispatcher_page_html(&dispatcher_data()))
+}
+
+/// GET /fragments/dispatch: the polling unit. Read-only observer.
+pub async fn dispatcher_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(dispatcher_fragment_html(&dispatcher_data()))
+}
+
+/// POST /dispatch/stop: halt the loop through the loop controls (the
+/// same `cmd_dispatch_stop` the CLI calls), then back to the screen.
+pub async fn dispatcher_stop_handler() -> axum::response::Redirect {
+    let _ = cmd_dispatch_stop(false);
+    axum::response::Redirect::to("/dispatch")
+}
+
+/// POST /dispatch/resume: restart the loop through the loop controls
+/// (the same `cmd_dispatch_resume` the CLI calls), then back.
+pub async fn dispatcher_resume_handler() -> axum::response::Redirect {
+    let _ = cmd_dispatch_resume(false);
+    axum::response::Redirect::to("/dispatch")
+}
+
 /// Handler shape for UI tickets: board page + polling fragment + health.
 /// All GETs are read-only observers (same contract as `status`/`log`).
 pub fn web_router() -> axum::Router {
@@ -675,6 +1243,28 @@ pub fn web_router() -> axum::Router {
         .route(
             "/fragments/board",
             axum::routing::get(board_fragment_handler),
+        )
+        .route("/tickets/{number}", axum::routing::get(ticket_page_handler))
+        .route(
+            "/fragments/ticket/{number}",
+            axum::routing::get(ticket_fragment_handler),
+        )
+        .route(
+            "/api/tickets/{number}",
+            axum::routing::get(ticket_api_handler),
+        )
+        .route("/dispatch", axum::routing::get(dispatcher_page_handler))
+        .route(
+            "/fragments/dispatch",
+            axum::routing::get(dispatcher_fragment_handler),
+        )
+        .route(
+            "/dispatch/stop",
+            axum::routing::post(dispatcher_stop_handler),
+        )
+        .route(
+            "/dispatch/resume",
+            axum::routing::post(dispatcher_resume_handler),
         )
         .route(
             "/health",
