@@ -235,3 +235,182 @@ fn json_init_is_machine_parseable() {
         );
     }
 }
+
+#[test]
+fn update_pin_is_acknowledged_not_recorded() {
+    let dir = scratch_dir("pin");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["update", "--pin", "v9.9.9"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("v9.9.9"),
+        "pin output must name the tag, got:\n{text}"
+    );
+    assert!(
+        !text.contains("recorded"),
+        "pin must not claim persistence it does not do, got:\n{text}"
+    );
+}
+
+#[test]
+fn update_detects_installed_stack() {
+    let dir = scratch_dir("update-stack");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["init", "--stack", "node"]);
+    cmd.assert().success();
+    let before = fs::read(dir.join("scripts/factory-check")).unwrap();
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["update", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    assert_eq!(
+        parsed.get("stack").and_then(|s| s.as_str()),
+        Some("node"),
+        "update must report the detected stack, got: {parsed}"
+    );
+    assert_eq!(
+        fs::read(dir.join("scripts/factory-check")).unwrap(),
+        before,
+        "update must not clobber the installed adapter"
+    );
+}
+
+#[test]
+fn init_does_not_chmod_kept_adapter() {
+    let dir = scratch_dir("keepmode");
+    let (_bin, path) = empty_path();
+    fs::create_dir_all(dir.join("scripts")).unwrap();
+    fs::write(dir.join("scripts/factory-check"), "# custom adapter\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            dir.join("scripts/factory-check"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+    }
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("keep: scripts/factory-check"),
+        "kept adapter must be reported as kept, got:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("scripts/factory-check")).unwrap(),
+        "# custom adapter\n",
+        "kept adapter content must be untouched"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir.join("scripts/factory-check"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "kept adapter permissions must stay untouched");
+    }
+}
+
+#[test]
+fn global_skills_installs_to_home() {
+    let dir = scratch_dir("globalskills");
+    let home = scratch_dir("fakehome");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("HOME", &home)
+        .args(["init", "--global-skills"]);
+    cmd.assert().success();
+
+    assert!(
+        home.join(".agents/skills/tdd/SKILL.md").is_file(),
+        "global skills must land under $HOME"
+    );
+    assert!(
+        !dir.join(".agents/skills").exists(),
+        "project skills dir must stay absent with --global-skills"
+    );
+}
+
+#[test]
+fn agents_header_merges_into_existing_file() {
+    let dir = scratch_dir("agentsmerge");
+    let (_bin, path) = empty_path();
+    fs::write(dir.join("AGENTS.md"), "# my project notes\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    cmd.assert().success();
+
+    let body = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert!(
+        body.contains("factory:header:start"),
+        "header must be prepended, got:\n{body}"
+    );
+    assert!(
+        body.contains("# my project notes"),
+        "existing body must be preserved, got:\n{body}"
+    );
+}
+
+#[test]
+fn gitignore_gains_cache_entry() {
+    let dir = scratch_dir("gitignore-append");
+    let (_bin, path) = empty_path();
+    fs::write(dir.join(".gitignore"), "node_modules/\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    cmd.assert().success();
+
+    let body = fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(
+        body.contains("node_modules/"),
+        "existing entries must be preserved, got:\n{body}"
+    );
+    assert!(
+        body.contains("factory/.cache/"),
+        "cache entry must be appended, got:\n{body}"
+    );
+}
+
+#[test]
+fn gitignore_is_created_when_absent() {
+    let dir = scratch_dir("gitignore-create");
+    let (_bin, path) = empty_path();
+    assert!(!dir.join(".gitignore").exists());
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    cmd.assert().success();
+
+    let body = fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(
+        body.contains("factory/.cache/"),
+        "fresh init must create .gitignore with the cache entry, got:\n{body}"
+    );
+}
