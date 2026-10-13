@@ -590,3 +590,49 @@ async fn git_and_files_reads_never_mutate_state() {
         assert_eq!(mtime_b, mtime_a, "mtime of {rel_b} unchanged");
     }
 }
+
+/// Regression for review finding [spec-drift] (ticket #33): `?ref=` on the
+/// wire must bind to the files handlers. Every files URL the UI generates
+/// uses `ref=` (tree poll, viewer links, search form), so decoding must go
+/// through Axum's real query codec (`Query::try_from_uri`), not through
+/// directly-constructed structs which bypass deserialization.
+#[tokio::test]
+async fn files_ref_query_binds_on_the_wire() {
+    // Tree: `?ref=dev` binds, and the fragment echoes it.
+    let uri: axum::http::Uri = "/fragments/files/tree?ref=dev".parse().unwrap();
+    let Query(tree_q) = Query::<FilesTreeQuery>::try_from_uri(&uri).unwrap();
+    assert_eq!(tree_q.gitref.as_deref(), Some("dev"));
+    let html = files_tree_fragment_html(&[], tree_q.gitref.as_deref().unwrap_or("HEAD"));
+    assert!(html.contains("data-ref=\"dev\""), "got:\n{html}");
+
+    // Viewer: `?ref=` + `path=` bind together.
+    let uri: axum::http::Uri = "/fragments/files/view?ref=dev&path=AGENTS.md"
+        .parse()
+        .unwrap();
+    let Query(view_q) = Query::<FilesViewQuery>::try_from_uri(&uri).unwrap();
+    assert_eq!(view_q.gitref.as_deref(), Some("dev"));
+    assert_eq!(view_q.path, "AGENTS.md");
+
+    // Search: `?ref=` + `q=` bind together.
+    let uri: axum::http::Uri = "/fragments/files/search?ref=dev&q=serving".parse().unwrap();
+    let Query(search_q) = Query::<FilesSearchQuery>::try_from_uri(&uri).unwrap();
+    assert_eq!(search_q.gitref.as_deref(), Some("dev"));
+    assert_eq!(search_q.q, "serving");
+
+    // Traversal through the real wire stays calm: 200 + missing marker.
+    let uri: axum::http::Uri = "/fragments/files/view?ref=HEAD&path=../evil"
+        .parse()
+        .unwrap();
+    let query = Query::<FilesViewQuery>::try_from_uri(&uri).unwrap();
+    let (status, body) = response_body_text(
+        factory_lib::file_view_fragment_handler(query)
+            .await
+            .into_response(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        body.contains("data-file-missing"),
+        "traversal reads calm, got:\n{body}"
+    );
+}

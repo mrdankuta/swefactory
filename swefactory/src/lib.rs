@@ -1723,12 +1723,14 @@ pub async fn git_api_handler() -> (axum::http::StatusCode, axum::Json<serde_json
 /// Query: `?ref=<branch>` (default HEAD) for the tree and the page.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct FilesTreeQuery {
+    #[serde(alias = "ref")]
     pub gitref: Option<String>,
 }
 
 /// Query: `?ref=<branch>&path=<repo-path>` for the viewer.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct FilesViewQuery {
+    #[serde(alias = "ref")]
     pub gitref: Option<String>,
     pub path: String,
 }
@@ -1736,6 +1738,7 @@ pub struct FilesViewQuery {
 /// Query: `?ref=<branch>&q=<text>` for search.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct FilesSearchQuery {
+    #[serde(alias = "ref")]
     pub gitref: Option<String>,
     pub q: String,
 }
