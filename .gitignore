@@ -1,4 +1,5 @@
 /target
+/public
 factory/.cache/
 factory/.state/
 *.log

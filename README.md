@@ -2,6 +2,9 @@
 
 > Vision: production-grade software engineering, consumer-simple UX.
 > Read first: `docs/product/FACTORY-PRODUCT.md`.
+>
+> Download: https://mrdankuta.github.io/swefactory/ (prebuilt binaries +
+> one-line installers for every release).
 
 ## Layout
 
