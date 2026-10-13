@@ -8,6 +8,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Gate mode: --fresh builds in a throwaway target dir, immune to cargo
+# fingerprint staleness in reused dirs (observed twice: worktree mtimes vs
+# fingerprints reported green-on-broken). Use for merge/train gates.
+# A bare -- is swallowed (separator before test-runner args).
+args=()
+for a in "$@"; do
+  case "$a" in
+    --fresh) export CARGO_TARGET_DIR="$(mktemp -d)/target"; echo "factory-check: fresh target dir $CARGO_TARGET_DIR";;
+    --) ;;
+    *) args+=("$a");;
+  esac
+done
+set -- "${args[@]:-}"
+
 if [ ! -f swefactory/Cargo.toml ]; then
   echo "factory-check: no swefactory/Cargo.toml yet — nothing to check"
   echo "FACTORY-CHECK PASSED"
