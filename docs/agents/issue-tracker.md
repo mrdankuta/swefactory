@@ -30,6 +30,20 @@ An issue about to be built typically carries both (`ready-for-agent` + `ticket`
 + `ready`). Triage never adds protocol labels and the dispatcher never adds
 triage labels.
 
+### Staging rule (specified vs authorized)
+
+The two vocabularies encode two different states — keep them distinct:
+
+- `ready-for-agent` = specified well enough for an agent to take (triage).
+- `ticket` + `ready` = authorized to spend model calls now (dispatch).
+
+Publish flow stamps `ready-for-agent` always. Add `ticket` always (admits the
+issue to the loop). Add `ready` only when the issue may run immediately.
+Stage sequencing with `ticket`-without-`ready` (e.g. waiting on a train
+member, a spec freeze, or an explicit predecessor) plus a `Depends on:`
+line, which is what the dispatcher enforces. Never use `ready` as a holding
+state — an issue carrying it will be picked up on the next tick.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
