@@ -200,6 +200,32 @@ pub enum Commands {
         #[arg(long)]
         allow_remote: bool,
     },
+    /// Bea's front door (spec #41 backbone, ticket #42): install check,
+    /// GitHub auth as a guided tour, repo pick-or-create (private by
+    /// default, identity-only seed for fresh repos). A state machine that
+    /// resumes: rerunning continues where the last run stopped and never
+    /// duplicates created resources. Every step prints in plain words;
+    /// --plain selects the plain transcript explicitly (the visual screen
+    /// is a later ticket; today both paths print the same backbone).
+    /// Choices arrive via flags or FACTORY_ONBOARD_* env so SSH and
+    /// automation never hit an interactive wall.
+    Onboard {
+        /// Print the plain transcript for every step (explicit).
+        #[arg(long)]
+        plain: bool,
+        /// Pick an existing repo (e.g. `bea/existing`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Create a fresh repo with this name (private by default).
+        #[arg(long)]
+        new: Option<String>,
+        /// Fresh-repo visibility: `private` (default) or `public`.
+        #[arg(long)]
+        visibility: Option<String>,
+        /// The idea in plain sentences, stored verbatim in the seed.
+        #[arg(long)]
+        idea: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1697,6 +1723,367 @@ pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
             1
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ONBOARD (ticket #42, spec #41 backbone: install check, auth tour, repo)
+//
+// `factory onboard [--plain] [--repo NAME] [--new NAME]
+// [--visibility private|public] [--idea TEXT]` walks Bea from zero to a
+// ready repo. Each step is a function returning the next step; progress
+// persists to `<state>/onboard.json` so a rerun resumes where the last run
+// stopped and never duplicates created resources (the `gh repo create`
+// call is skipped when the state already records `created: true` for the
+// same name).
+//
+// Seams reused, never reinvented: `gh` through `dgh` (FACTORY_GH_BIN-
+// overridable, like every other call site), state through
+// `dispatch_state_dir` (FACTORY_STATE_DIR-overridable). No custom OAuth,
+// no held secrets: auth is the guided `gh` inheritance the spec locks in
+// (detect, install hint, browser device-flow tour, verify with an API
+// call). Fresh repos are private by default and get the identity-only
+// seed (name README, idea file, ignore file, first commit) — never sample
+// code. `--plain` covers every step: the visual screen is a later ticket,
+// so both paths print the same plain backbone today.
+// ---------------------------------------------------------------------------
+
+/// Fixed bytes of the identity-only seed README (`{name}` substituted).
+/// Byte-checked by `cli_onboard.rs`: change these bytes and the test must
+/// change with them (the spec locks identity-only scope).
+pub fn onboard_readme_text(name: &str) -> String {
+    format!("# {name}\n\nBuilt with the factory.\n")
+}
+
+/// Fixed bytes of the identity-only seed ignore file.
+pub fn onboard_gitignore_text() -> &'static str {
+    "target/\nfactory/.state/\n.DS_Store\n"
+}
+
+/// Default idea text when Bea has not described hers yet (stored verbatim
+/// once given via `--idea` / FACTORY_ONBOARD_IDEA).
+pub fn onboard_default_idea() -> &'static str {
+    "My factory idea.\n"
+}
+
+/// Resumable onboarding progress. `steps` holds the visited step names in
+/// order (`install`, `auth`, `repo`, `ready`); `created` is true only after
+/// a successful `gh repo create` for `repo`, so resumes skip the create.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct OnboardState {
+    pub install_ok: bool,
+    pub auth: String,
+    pub repo: String,
+    pub visibility: String,
+    pub created: bool,
+    pub seeded: bool,
+    pub steps: Vec<String>,
+}
+
+impl Default for OnboardState {
+    fn default() -> Self {
+        Self {
+            install_ok: false,
+            auth: String::new(),
+            repo: String::new(),
+            visibility: "private".to_string(),
+            created: false,
+            seeded: false,
+            steps: Vec::new(),
+        }
+    }
+}
+
+/// CLI-supplied onboarding choices (flags win over FACTORY_ONBOARD_* env).
+#[derive(Debug, Clone, Default)]
+pub struct OnboardOpts {
+    pub plain: bool,
+    pub repo: Option<String>,
+    pub new: Option<String>,
+    pub visibility: Option<String>,
+    pub idea: Option<String>,
+}
+
+fn onboard_state_path(state: &std::path::Path) -> PathBuf {
+    state.join("onboard.json")
+}
+
+fn onboard_load(state: &std::path::Path) -> OnboardState {
+    std::fs::read_to_string(onboard_state_path(state))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn onboard_save(state: &std::path::Path, progress: &OnboardState) -> Result<(), String> {
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let tmp = state.join("onboard.json.tmp");
+    let text = serde_json::to_string_pretty(progress)
+        .map_err(|e| format!("cannot serialize onboard state: {e}"))?;
+    std::fs::write(&tmp, text).map_err(|e| format!("cannot write onboard state: {e}"))?;
+    std::fs::rename(&tmp, onboard_state_path(state))
+        .map_err(|e| format!("cannot replace onboard state: {e}"))?;
+    Ok(())
+}
+
+fn onboard_note_step(progress: &mut OnboardState, step: &str) {
+    if !progress.steps.iter().any(|s| s == step) {
+        progress.steps.push(step.to_string());
+    }
+}
+
+fn onboard_choice(flag: Option<String>, env_name: &str) -> Option<String> {
+    flag.or_else(|| {
+        std::env::var(env_name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    })
+}
+
+/// Step 1, install check: the `gh` shell-out seam must answer (the same
+/// probe `doctor_checks` uses for `gh-installed`), and the state dir must
+/// exist. Read-only except for creating the state dir. Returns the next
+/// step (`auth`) on success.
+fn onboard_step_install(progress: &mut OnboardState) -> Result<&'static str, String> {
+    println!("[onboard:install] Checking the factory's prerequisites.");
+    match dgh(&["--version"]) {
+        Ok(_) => {
+            println!("[onboard:install] GitHub CLI found — good, that is all we need.");
+        }
+        Err(_) => {
+            return Err(format!(
+                "factory onboard: the GitHub CLI (`{}`) is not installed. Install it first: https://cli.github.com — then re-run: factory onboard",
+                gh_bin()
+            ));
+        }
+    }
+    let state = dispatch_state_dir();
+    if let Err(e) = std::fs::create_dir_all(&state) {
+        return Err(format!(
+            "factory onboard: cannot create state dir {}: {e}",
+            state.display()
+        ));
+    }
+    progress.install_ok = true;
+    onboard_note_step(progress, "install");
+    if let Err(e) = onboard_save(&state, progress) {
+        return Err(format!("factory onboard: {e}"));
+    }
+    Ok("auth")
+}
+
+/// Step 2, the GitHub auth tour: verifies the login with an API call. On
+/// an expired or missing login it prints the browser device-flow tour and
+/// stops (resumable: rerun after approving in the browser). Returns the
+/// next step (`repo`) on success.
+fn onboard_step_auth(progress: &mut OnboardState) -> Result<&'static str, String> {
+    println!("[onboard:auth] Checking your GitHub login.");
+    match dgh(&["auth", "status"]) {
+        Ok(_) => {
+            println!("[onboard:auth] GitHub login works — no codes, no tokens to copy.");
+        }
+        Err(_) => {
+            return Err(
+                "factory onboard: GitHub login is missing or expired. I will show you a code — approve it in your browser and you are done: run `gh auth login`, follow the browser step, then re-run: factory onboard"
+                    .to_string(),
+            );
+        }
+    }
+    progress.auth = "valid".to_string();
+    onboard_note_step(progress, "auth");
+    if let Err(e) = onboard_save(&dispatch_state_dir(), progress) {
+        return Err(format!("factory onboard: {e}"));
+    }
+    Ok("repo")
+}
+
+/// Parse the visibility choice: empty means the safe default (`private`);
+/// anything other than private/public is refused in plain words.
+fn onboard_visibility(choice: Option<String>) -> Result<String, String> {
+    match choice.as_deref().map(str::trim) {
+        None | Some("") => Ok("private".to_string()),
+        Some("private") => Ok("private".to_string()),
+        Some("public") => Ok("public".to_string()),
+        Some(other) => Err(format!(
+            "factory onboard: visibility {other:?} is not a choice — say `private` (keeps your idea yours, the default) or `public`: factory onboard --new NAME --visibility public"
+        )),
+    }
+}
+
+/// Write the identity-only seed into `<cwd>/<name>`: name README, idea
+/// file, ignore file — never sample code — then `git init` plus a first
+/// commit (hermetic: local `-c` identity, best-effort when git is
+/// missing). Byte-exact: `cli_onboard.rs` asserts the file bytes.
+fn onboard_seed_fresh(name: &str, idea: &str) -> Result<(), String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dir = cwd.join(name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("factory onboard: cannot create {}: {e}", dir.display()))?;
+    std::fs::write(dir.join("README.md"), onboard_readme_text(name))
+        .map_err(|e| format!("factory onboard: cannot seed README.md: {e}"))?;
+    std::fs::write(dir.join("IDEA.md"), idea)
+        .map_err(|e| format!("factory onboard: cannot seed IDEA.md: {e}"))?;
+    std::fs::write(dir.join(".gitignore"), onboard_gitignore_text())
+        .map_err(|e| format!("factory onboard: cannot seed .gitignore: {e}"))?;
+    // First commit, hermetic: repo-local identity so Bea's global git
+    // config (or its absence) never blocks the seed. Best-effort: files
+    // on disk are the seed; a missing git binary must not fail onboarding.
+    let git_ok = run_git(&["init", "-b", "main"], Some(&dir))
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if git_ok {
+        let _ = run_git(
+            &["config", "user.name", "Bea (factory onboard)"],
+            Some(&dir),
+        );
+        let _ = run_git(&["config", "user.email", "bea@factory.local"], Some(&dir));
+        let _ = run_git(&["add", "-A"], Some(&dir));
+        let _ = run_git(
+            &["commit", "-qm", "factory onboard: identity seed"],
+            Some(&dir),
+        );
+    }
+    Ok(())
+}
+
+/// Step 3, repo pick-or-create. Existing (`--repo`): verify through `gh
+/// repo view`, record, continue. Fresh (`--new`): create private by
+/// default (public only as a plain-words choice), then the identity-only
+/// seed — skipping the create when the state already records it for the
+/// same name (resume without duplicating). Neither: stop in plain words
+/// naming both flags (resumable). Returns the next step (`ready`).
+fn onboard_step_repo(
+    progress: &mut OnboardState,
+    opts: &OnboardOpts,
+) -> Result<&'static str, String> {
+    println!("[onboard:repo] Choosing where your idea will live.");
+    let pick = onboard_choice(opts.repo.clone(), "FACTORY_ONBOARD_REPO");
+    let fresh = onboard_choice(opts.new.clone(), "FACTORY_ONBOARD_NEW");
+    let visibility = onboard_visibility(onboard_choice(
+        opts.visibility.clone(),
+        "FACTORY_ONBOARD_VISIBILITY",
+    ))?;
+    let idea = onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
+        .unwrap_or_else(|| onboard_default_idea().to_string());
+
+    if let Some(name) = pick {
+        let name = name.trim().to_string();
+        dgh(&["repo", "view", &name, "--json", "nameWithOwner"]).map_err(|_| {
+            format!(
+                "factory onboard: cannot read repo {name:?} through gh — check the name (or your access) with: gh repo view {name} — then re-run: factory onboard --repo {name}"
+            )
+        })?;
+        println!("[onboard:repo] Using your existing repo {name} — nothing created.");
+        progress.repo = name;
+        progress.visibility = "existing".to_string();
+        progress.created = false;
+        progress.seeded = false;
+    } else if let Some(name) = fresh {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(
+                "factory onboard: the fresh repo needs a name — re-run: factory onboard --new NAME"
+                    .to_string(),
+            );
+        }
+        progress.visibility = visibility.clone();
+        let already = progress.created && progress.repo == name;
+        if already {
+            println!(
+                "[onboard:repo] {name} is already yours from the last run — not creating it again."
+            );
+        } else {
+            let scope = if visibility == "public" {
+                "--public"
+            } else {
+                "--private"
+            };
+            println!(
+                "[onboard:repo] Creating {name} as {visibility} (your idea stays yours by default)."
+            );
+            dgh(&["repo", "create", &name, scope, "--confirm"]).map_err(|e| {
+                format!("factory onboard: could not create repo {name:?}: {e} — fix it, then re-run: factory onboard --new {name}")
+            })?;
+            progress.repo = name.clone();
+            progress.created = true;
+        }
+        progress.repo = name.clone();
+        onboard_seed_fresh(&name, &idea)?;
+        println!("[onboard:repo] Seeded {name} with identity only (name, idea, ignore files) — no sample code.");
+        progress.seeded = true;
+    } else {
+        return Err(
+            "factory onboard: tell me where your idea should live — pick an existing repo: factory onboard --repo OWNER/NAME — or start fresh (private by default): factory onboard --new NAME"
+                .to_string(),
+        );
+    }
+    onboard_note_step(progress, "repo");
+    if let Err(e) = onboard_save(&dispatch_state_dir(), progress) {
+        return Err(format!("factory onboard: {e}"));
+    }
+    Ok("ready")
+}
+
+/// `factory onboard`: drive install → auth → repo → ready, resuming from
+/// `<state>/onboard.json`. Exit 0 with the ready sentence; nonzero with a
+/// plain-English cause naming the fix and the rerun. `--plain` selects the
+/// plain transcript explicitly; `--json` carries the same facts
+/// structurally. Completed steps are never repeated; created repos are
+/// never created twice.
+pub fn cmd_onboard(json: bool, opts: OnboardOpts) -> i32 {
+    let state = dispatch_state_dir();
+    let mut progress = onboard_load(&state);
+    if opts.plain {
+        println!("[onboard] Plain mode: every step in plain words, no visuals.");
+    }
+
+    let mut step: &'static str = "install";
+    loop {
+        let next = match step {
+            "install" => onboard_step_install(&mut progress),
+            "auth" => onboard_step_auth(&mut progress),
+            "repo" => onboard_step_repo(&mut progress, &opts),
+            "ready" => break,
+            other => {
+                return fail_onboard(json, &format!("factory onboard: unknown step {other:?}"))
+            }
+        };
+        match next {
+            Ok(n) => step = n,
+            Err(e) => return fail_onboard(json, &e),
+        }
+    }
+    onboard_note_step(&mut progress, "ready");
+    if let Err(e) = onboard_save(&state, &progress) {
+        return fail_onboard(json, &format!("factory onboard: {e}"));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ready": true,
+                "repo": progress.repo,
+                "visibility": progress.visibility,
+                "created": progress.created,
+                "seeded": progress.seeded,
+                "steps": progress.steps,
+            })
+        );
+    } else {
+        println!(
+            "[onboard:ready] Your repo {} is ready — the board will pick it up from here.",
+            progress.repo
+        );
+    }
+    0
+}
+
+fn fail_onboard(json: bool, msg: &str) -> i32 {
+    if json {
+        println!("{}", serde_json::json!({"ready": false, "error": msg}));
+    }
+    eprintln!("{msg}");
+    1
 }
 
 #[derive(Serialize)]
@@ -5974,6 +6361,22 @@ pub fn run() -> i32 {
         Commands::Land { dry_run, train } => cmd_land(cli.json, dry_run, train),
         Commands::Ui { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
         Commands::Serve { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
+        Commands::Onboard {
+            plain,
+            repo,
+            new,
+            visibility,
+            idea,
+        } => cmd_onboard(
+            cli.json,
+            OnboardOpts {
+                plain,
+                repo,
+                new,
+                visibility,
+                idea,
+            },
+        ),
     }
 }
 
