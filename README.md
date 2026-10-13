@@ -5,7 +5,7 @@
 
 ## Layout
 
-* `pi-factory/` — git submodule of the true source, `github.com/mrdankuta/pi-factory` @ `0343c74` (v0.5.1+). This is the rewrite reference. Clone with `git clone --recurse-submodules`, or run `git submodule update --init` after clone.
+* `pi-factory/` — git submodule of the true source, `github.com/mrdankuta/pi-factory` @ `bec5572` (v0.5.1+; retry worktree-reuse fix). This is the rewrite reference. Clone with `git clone --recurse-submodules`, or run `git submodule update --init` after clone.
   * `bin/` — `factory`, `factory-dispatch` · `checks/` — elixir/node/python adapters
   * `prompts/` (incl. `review-integration.md`), `skills/`, `templates/`,
   * `docs/` (`DISPATCHER`, `HERDR`, `SKILL-PINS`, `USAGE`, `WORKFLOW`),
