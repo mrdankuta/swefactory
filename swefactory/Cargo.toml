@@ -11,7 +11,15 @@ homepage = "https://github.com/mrdankuta/swefactory"
 name = "factory"
 path = "src/main.rs"
 
+# Ticket #28 (spec #27 prefactor): command implementations live in the
+# library so Axum handlers and the CLI call the same functions.
+[lib]
+name = "factory_lib"
+path = "src/lib.rs"
+
 [dependencies]
+askama = "0.16.1"
+axum = "0.8.9"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
