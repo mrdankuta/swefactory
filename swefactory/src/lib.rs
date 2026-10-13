@@ -650,6 +650,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
 <title>Factory board</title></head>\
 <body><header><h1>Factory board</h1>\
 <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
 {fragment}</div></main>\
@@ -892,6 +893,200 @@ pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
         }
         html.push_str("</ol>");
     }
+    html
+}
+// --- dispatcher live (ticket #31, spec #27) ---------------------------------
+//
+// The status/tail/worktree ritual as one polling view: live attempts in
+// slot lanes, STOP state with STOP/Resume control, per-attempt streaming
+// log tails, worktree list. Same-binary Axum, server-rendered HTML,
+// polling fragment (~3s), no websockets.
+//
+// Reads flow through the existing seams: the dispatch ledger via
+// `dispatch_state_dir` (overridable with FACTORY_STATE_DIR), transcripts
+// via the log-dir files the dispatcher writes, worktrees via
+// `git worktree list` (`run_git`, overridable with FACTORY_GIT_BIN).
+// Writes flow only through the loop controls: the POST handlers below
+// call `cmd_dispatch_stop` / `cmd_dispatch_resume`, the same functions
+// the CLI calls. GETs never mutate (snapshot-tested like the board).
+
+/// Poll interval for the dispatcher fragment (spec: dispatcher-live ~3s).
+pub const DISPATCHER_POLL_MS: u64 = 3_000;
+
+/// Transcript tail (lines) per attempt on the live screen. Matches the
+/// `factory log` default: bounded context, newest lines stream.
+pub const DISPATCHER_LOG_TAIL: usize = LOG_DEFAULT_TAIL;
+
+/// One live attempt as the dispatcher screen sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatcherAttemptView {
+    pub ticket: u64,
+    pub attempt_no: u64,
+    pub slot: String,
+    pub status: String,
+    pub summary: String,
+    pub transcript_tail: String,
+    pub truncated: bool,
+    pub worktree: String,
+    pub branch: String,
+    pub started: String,
+    pub finished: String,
+}
+
+/// The live screen: attempts in slot lanes + STOP state + worktrees.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatcherData {
+    pub attempts: Vec<DispatcherAttemptView>,
+    pub stopped: bool,
+    pub worktrees: Vec<String>,
+    pub max_concurrent: usize,
+}
+
+/// Calm sentence for zero attempts (ready, not broken).
+pub fn dispatcher_empty_sentence() -> &'static str {
+    "No attempts yet \u{2014} the dispatcher is idle and ready for the next ticket."
+}
+
+/// Calm sentence for an attempt with no log lines yet.
+pub fn dispatcher_no_transcript_sentence() -> &'static str {
+    "No transcript yet \u{2014} the attempt has not written any log lines."
+}
+
+/// Calm sentence for zero checked-out worktrees.
+pub fn dispatcher_no_worktrees_sentence() -> &'static str {
+    "No worktrees checked out right now."
+}
+
+/// Read-only: `git worktree list` lines. Failures read as none (the
+/// screen renders its calm empty state, never a 500 for missing git).
+fn dispatcher_worktree_lines() -> Vec<String> {
+    run_git(&["worktree", "list"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-only live assembly: ledger x transcripts x STOP x worktrees.
+/// Missing/unreadable ledger reads as idle (no attempts, running).
+pub fn dispatcher_data() -> DispatcherData {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let stopped = state.join("STOP").is_file();
+    let worktrees = dispatcher_worktree_lines();
+    let mut attempts = Vec::with_capacity(ledger.attempts.len());
+    for a in &ledger.attempts {
+        let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+        let full = log_read_transcript(&state, a);
+        let (tail, truncated) = log_tail(&full, DISPATCHER_LOG_TAIL);
+        attempts.push(DispatcherAttemptView {
+            ticket: a.ticket,
+            attempt_no: a.attempt_no,
+            slot,
+            status: a.status.clone(),
+            summary: log_summary(a),
+            transcript_tail: tail,
+            truncated,
+            worktree: a.worktree.clone(),
+            branch: a.branch.clone(),
+            started: a.started_at.clone(),
+            finished: a.finished_at.clone(),
+        });
+    }
+    DispatcherData {
+        attempts,
+        stopped,
+        worktrees,
+        max_concurrent: dispatch_max_concurrent(),
+    }
+}
+
+/// Fragment HTML for the live screen (the polling unit). Pure over data
+/// so tests assert markers without a server.
+pub fn dispatcher_fragment_html(data: &DispatcherData) -> String {
+    let mut html = String::new();
+    html.push_str("<section data-dispatch>");
+    if data.stopped {
+        html.push_str("<p data-stop=\"halted\">STOP: dispatch loop is halted (STOP file present). Resume to let the loop schedule again.</p>");
+    } else {
+        html.push_str("<p data-stop=\"running\">STOP: dispatch loop running (no STOP file).</p>");
+    }
+    html.push_str("<div data-stop-controls><form method=\"post\" action=\"/dispatch/stop\" data-stop-form><button type=\"submit\">STOP the loop</button></form>");
+    html.push_str("<form method=\"post\" action=\"/dispatch/resume\" data-resume-form><button type=\"submit\">Resume the loop</button></form></div>");
+    html.push_str(&format!(
+        "<p data-cli>Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>. Brake: <code>factory dispatch stop</code> / <code>factory dispatch resume</code>. Slots: up to {} concurrent.</p>",
+        data.max_concurrent
+    ));
+    if data.attempts.is_empty() {
+        html.push_str(&format!(
+            "<section data-attempts-empty><p>{}</p></section>",
+            dispatcher_empty_sentence()
+        ));
+    } else {
+        html.push_str("<section data-attempts>");
+        for a in &data.attempts {
+            html.push_str(&format!(
+                "<article data-attempt=\"{}\" data-slot=\"{}\" data-ticket=\"{}\" data-status=\"{}\"><h3>#{ticket} attempt {n} ({slot}) \u{2014} {status}</h3><p data-summary>{summary}</p>",
+                escape_html(&a.slot),
+                escape_html(&a.slot),
+                a.ticket,
+                escape_html(&a.status),
+                ticket = a.ticket,
+                n = a.attempt_no,
+                slot = escape_html(&a.slot),
+                status = escape_html(&a.status),
+                summary = escape_html(&a.summary),
+            ));
+            if !a.branch.is_empty() || !a.worktree.is_empty() {
+                html.push_str(&format!(
+                    "<p data-where>Branch <code>{}</code> at <code>{}</code>. Tail: <code>factory log {} --tail {}</code>.</p>",
+                    escape_html(&a.branch),
+                    escape_html(&a.worktree),
+                    a.ticket,
+                    DISPATCHER_LOG_TAIL,
+                ));
+            }
+            if a.transcript_tail.is_empty() {
+                html.push_str(&format!(
+                    "<p data-no-transcript>{}</p>",
+                    dispatcher_no_transcript_sentence()
+                ));
+            } else {
+                if a.truncated {
+                    html.push_str(&format!(
+                        "<p data-truncated>(showing last {} lines)</p>",
+                        DISPATCHER_LOG_TAIL
+                    ));
+                }
+                html.push_str(&format!(
+                    "<pre data-log-tail>{}</pre>",
+                    escape_html(&a.transcript_tail)
+                ));
+            }
+            html.push_str("</article>");
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("<section data-worktrees><h2>Worktrees</h2>");
+    if data.worktrees.is_empty() {
+        html.push_str(&format!(
+            "<p data-no-worktrees>{}</p>",
+            dispatcher_no_worktrees_sentence()
+        ));
+    } else {
+        html.push_str("<ul>");
+        for w in &data.worktrees {
+            html.push_str(&format!("<li>{}</li>", escape_html(w)));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</section>");
     html.push_str("</section>");
     html
 }
@@ -994,6 +1189,54 @@ async fn ticket_api_handler(
 /// Handler shape for UI tickets: board page + polling fragment + health,
 /// plus the ticket detail slice (page + fragment + JSON). All GETs are
 /// read-only observers (same contract as `status`/`log`).
+/// Full dispatcher page: live fragment plus the polling hook that
+/// refreshes only the fragment (no full reloads). Pure over data.
+pub fn dispatcher_page_html(data: &DispatcherData) -> String {
+    let fragment = dispatcher_fragment_html(data);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory dispatcher</title></head>\
+<body><header><h1>Factory dispatcher</h1>\
+<p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
+<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('dispatch');if(!el)return;var url=el.getAttribute('data-dispatch-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'3000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        DISPATCHER_POLL_MS,
+    )
+}
+
+/// GET /dispatch: the live screen. Read-only observer.
+pub async fn dispatcher_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(dispatcher_page_html(&dispatcher_data()))
+}
+
+/// GET /fragments/dispatch: the polling unit. Read-only observer.
+pub async fn dispatcher_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(dispatcher_fragment_html(&dispatcher_data()))
+}
+
+/// POST /dispatch/stop: halt the loop through the loop controls (the
+/// same `cmd_dispatch_stop` the CLI calls), then back to the screen.
+pub async fn dispatcher_stop_handler() -> axum::response::Redirect {
+    let _ = cmd_dispatch_stop(false);
+    axum::response::Redirect::to("/dispatch")
+}
+
+/// POST /dispatch/resume: restart the loop through the loop controls
+/// (the same `cmd_dispatch_resume` the CLI calls), then back.
+pub async fn dispatcher_resume_handler() -> axum::response::Redirect {
+    let _ = cmd_dispatch_resume(false);
+    axum::response::Redirect::to("/dispatch")
+}
+
+/// Handler shape for UI tickets: board page + polling fragment + health.
+/// All GETs are read-only observers (same contract as `status`/`log`).
 pub fn web_router() -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::get(board_page_handler))
@@ -1009,6 +1252,19 @@ pub fn web_router() -> axum::Router {
         .route(
             "/api/tickets/{number}",
             axum::routing::get(ticket_api_handler),
+        )
+        .route("/dispatch", axum::routing::get(dispatcher_page_handler))
+        .route(
+            "/fragments/dispatch",
+            axum::routing::get(dispatcher_fragment_handler),
+        )
+        .route(
+            "/dispatch/stop",
+            axum::routing::post(dispatcher_stop_handler),
+        )
+        .route(
+            "/dispatch/resume",
+            axum::routing::post(dispatcher_resume_handler),
         )
         .route(
             "/health",
