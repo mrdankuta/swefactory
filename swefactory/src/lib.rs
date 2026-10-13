@@ -179,6 +179,27 @@ pub enum Commands {
         #[arg(long, value_name = "BRANCH")]
         train: Option<String>,
     },
+    /// Serve the Bea-first board over localhost (spec #27 board slice).
+    /// Server-rendered HTML with polling fragments; localhost-only unless
+    /// --allow-remote is passed explicitly. Read-only: GETs observe
+    /// through the ledger, `gh`, and git seams and never mutate.
+    Ui {
+        /// Address to bind (host:port). Localhost by default.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Allow binding a non-localhost address (explicit exposure).
+        #[arg(long)]
+        allow_remote: bool,
+    },
+    /// Alias for `ui` (headless use): serves the same board app.
+    Serve {
+        /// Address to bind (host:port). Localhost by default.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Allow binding a non-localhost address (explicit exposure).
+        #[arg(long)]
+        allow_remote: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -255,12 +276,352 @@ pub fn version_text(json: bool) -> String {
     }
 }
 
-// --- web prefactor (ticket #28, spec #27) ---------------------------------
+// --- web board (ticket #29, spec #27) ------------------------------------
 //
-// Axum + Askama join the build here so later UI tickets wire handlers
-// without touching the dependency set. Nothing is served yet: no `ui`
-// command, no listener. `web_router` only proves the handler shape
-// compiles and renders through the same command functions the CLI calls.
+// `factory ui` (alias `factory serve`) serves Bea's home: issues as
+// cards in columns, polling fragments, calm empty states. Same-binary
+// Axum, server-rendered Askama HTML, no JS build, no websockets.
+//
+// Data flows read-only through the existing seams: `gh issue list` via
+// `run_gh_output` (overridable with FACTORY_GH_BIN), the dispatch ledger
+// via `dispatch_state_dir` (overridable with FACTORY_STATE_DIR), and
+// `git log --grep` via `run_git` (overridable with FACTORY_GIT_BIN).
+// Rendering is pure over `BoardIssue` fixtures so endpoint tests never
+// need the network.
+
+/// One open issue as the board sees it (labels drive the column).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub state: String,
+}
+
+/// One rendered card: status, cost, and what changed in plain words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardCard {
+    pub number: u64,
+    pub title: String,
+    pub status_text: String,
+    pub cost_text: String,
+    pub changed_text: String,
+    pub labels: Vec<String>,
+}
+
+/// One board column: a label-mapped lane of cards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardColumn {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub cards: Vec<BoardCard>,
+}
+
+/// Fixed column order (Bea's reading order): needs-you first, done last.
+/// (id, title) pairs; `board_column_for_labels` maps labels into them.
+pub const BOARD_COLUMNS: &[(&str, &str)] = &[
+    ("needs-you", "Needs you"),
+    ("ready", "Ready to build"),
+    ("running", "Being built"),
+    ("review", "In review"),
+    ("done", "Done"),
+    ("open", "New work"),
+];
+
+/// Poll interval for the board fragment (spec: board ~15s).
+pub const BOARD_POLL_MS: u64 = 15_000;
+
+fn has_label(labels: &[String], name: &str) -> bool {
+    labels.iter().any(|l| l.eq_ignore_ascii_case(name))
+}
+
+/// Map issue labels to a column (id, title). First match wins in Bea
+/// priority order: blocked/needs-* → ready → running → review →
+/// accepted/integrated → fallback open. Pure: unit-tested without `gh`.
+pub fn board_column_for_labels(labels: &[String]) -> (&'static str, &'static str) {
+    if has_label(labels, "blocked")
+        || has_label(labels, "needs-info")
+        || has_label(labels, "needs-you")
+    {
+        return ("needs-you", "Needs you");
+    }
+    if has_label(labels, "review") {
+        return ("review", "In review");
+    }
+    if has_label(labels, "running") {
+        return ("running", "Being built");
+    }
+    if has_label(labels, "ready") {
+        return ("ready", "Ready to build");
+    }
+    if has_label(labels, "accepted") || has_label(labels, "integrated") {
+        return ("done", "Done");
+    }
+    ("open", "New work")
+}
+
+/// Bea-readable status for one card. The optional attempt status is the
+/// dispatcher's latest word for the ticket (e.g. `impl_running`); labels
+/// alone still read as a sentence when there is no attempt yet.
+pub fn board_status_text(labels: &[String], attempt: Option<&str>) -> String {
+    let (id, _) = board_column_for_labels(labels);
+    let base = match id {
+        "needs-you" => "Waiting on you \u{2014} a question needs your answer.",
+        "ready" => "Ready to build.",
+        "running" => "Being built now.",
+        "review" => "In review \u{2014} automation is checking the work.",
+        "done" => "Done \u{2014} accepted.",
+        _ => "New \u{2014} waiting to be picked up.",
+    };
+    match attempt {
+        None => base.to_string(),
+        Some(s) => match s {
+            "impl_running" => format!("{base} An implement attempt is running."),
+            "review_running" => format!("{base} A review attempt is running."),
+            "impl_failed" => format!("{base} The last attempt failed during implement."),
+            "review_failed" => format!("{base} The last attempt failed review."),
+            "review_done" | "impl_done" => {
+                format!("{base} The last attempt finished: {s}.")
+            }
+            other => format!("{base} Last attempt: {other}."),
+        },
+    }
+}
+
+/// Bea-readable cost for one card: the first `Cost:` line in the body, or
+/// a calm sentence when the issue names no cost.
+pub fn board_cost_text(body: &str) -> String {
+    for line in body.lines() {
+        let t = line.trim();
+        if t.len() > 5 && t[..5].eq_ignore_ascii_case("cost:") {
+            let value = t[5..].trim();
+            if !value.is_empty() {
+                return format!("Cost: {value}");
+            }
+        }
+    }
+    "Cost not estimated yet.".to_string()
+}
+
+/// Bea-readable what-changed for one card: the newest `git log` hit that
+/// mentions the ticket, or a calm sentence when nothing landed yet.
+pub fn board_changed_text(hits: &[String]) -> String {
+    match hits.iter().find(|h| !h.trim().is_empty()) {
+        Some(h) => format!("What changed: {}", h.trim()),
+        None => "No changes recorded yet.".to_string(),
+    }
+}
+
+/// Group issues into the fixed column order. `attempts` maps ticket →
+/// latest attempt status; `changes` maps ticket → `git log` hit lines.
+/// Pure over fixtures: the seam endpoint tests assert.
+pub fn board_issues_to_columns(
+    issues: &[BoardIssue],
+    attempts: &std::collections::HashMap<u64, String>,
+    changes: &std::collections::HashMap<u64, Vec<String>>,
+) -> Vec<BoardColumn> {
+    let mut cols: Vec<BoardColumn> = BOARD_COLUMNS
+        .iter()
+        .map(|(id, title)| BoardColumn {
+            id,
+            title,
+            cards: Vec::new(),
+        })
+        .collect();
+    for issue in issues {
+        let (id, _) = board_column_for_labels(&issue.labels);
+        let empty: Vec<String> = Vec::new();
+        let hits = changes.get(&issue.number).unwrap_or(&empty);
+        let card = BoardCard {
+            number: issue.number,
+            title: issue.title.clone(),
+            status_text: board_status_text(
+                &issue.labels,
+                attempts.get(&issue.number).map(|s| s.as_str()),
+            ),
+            cost_text: board_cost_text(&issue.body),
+            changed_text: board_changed_text(hits),
+            labels: issue.labels.clone(),
+        };
+        if let Some(col) = cols.iter_mut().find(|c| c.id == id) {
+            col.cards.push(card);
+        }
+    }
+    cols
+}
+
+/// Calm sentence for a fully empty board (Bea: ready, not broken).
+pub fn board_empty_sentence() -> &'static str {
+    "No work is waiting \u{2014} your board is clear and ready for the next idea."
+}
+
+/// Calm sentence for an empty column.
+pub fn board_column_empty_sentence() -> &'static str {
+    "Nothing here right now."
+}
+
+fn gh_labels(value: &serde_json::Value) -> Vec<String> {
+    match value.get("labels") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|l| match l {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(m) => m
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Read-only issue fetch: open issues with labels + bodies. On any `gh`
+/// failure returns empty (the board renders its calm empty state, never
+/// a 500 for a missing CLI). No writes, no side effects.
+pub fn fetch_board_issues() -> Vec<BoardIssue> {
+    let out = match run_gh_output(&[
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,body,labels,state",
+    ]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
+    };
+    let items: Vec<serde_json::Value> = match serde_json::from_str(&out) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    items
+        .iter()
+        .map(|v| BoardIssue {
+            number: v.get("number").and_then(|n| n.as_u64()).unwrap_or(0),
+            title: v
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            body: v
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .to_string(),
+            labels: gh_labels(v),
+            state: v
+                .get("state")
+                .and_then(|s| s.as_str())
+                .unwrap_or("open")
+                .to_string(),
+        })
+        .filter(|i| i.number != 0)
+        .collect()
+}
+
+/// Read-only: latest attempt status per ticket from the dispatch ledger.
+/// Missing/unreadable ledger reads as no attempts (empty board lanes).
+pub fn board_attempt_status() -> std::collections::HashMap<u64, String> {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let mut map = std::collections::HashMap::new();
+    for a in &ledger.attempts {
+        map.insert(a.ticket, a.status.clone());
+    }
+    map
+}
+
+/// Read-only: newest `git log` lines mentioning `#<ticket>` (same seam
+/// `reconcile` uses). Failures read as no changes.
+pub fn board_changed_hits(ticket: u64) -> Vec<String> {
+    let pattern = format!("#{ticket}");
+    let base = drift_base();
+    run_git(&["log", &base, "--oneline", "--grep", &pattern], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(3)
+                .map(|l| l.to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read-only board assembly: issues × attempts × git hits → columns.
+pub fn board_data() -> Vec<BoardColumn> {
+    let issues = fetch_board_issues();
+    let attempts = board_attempt_status();
+    let mut changes = std::collections::HashMap::new();
+    for issue in &issues {
+        changes.insert(issue.number, board_changed_hits(issue.number));
+    }
+    board_issues_to_columns(&issues, &attempts, &changes)
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Fragment HTML for the board columns (the polling unit). Pure over
+/// columns so tests assert markers without a server.
+pub fn board_fragment_html(columns: &[BoardColumn]) -> String {
+    let total: usize = columns.iter().map(|c| c.cards.len()).sum();
+    let mut html = String::new();
+    if total == 0 {
+        html.push_str(&format!(
+            "<section data-board-empty><p>{}</p></section>",
+            board_empty_sentence()
+        ));
+    }
+    html.push_str("<section data-board-columns>");
+    for col in columns {
+        html.push_str(&format!(
+            "<section data-column=\"{}\"><h2>{} ({})</h2>",
+            col.id,
+            col.title,
+            col.cards.len()
+        ));
+        if col.cards.is_empty() {
+            html.push_str(&format!(
+                "<p data-empty-column>{}</p>",
+                board_column_empty_sentence()
+            ));
+        }
+        for card in &col.cards {
+            html.push_str(&format!(
+                "<article data-card=\"{}\" data-column=\"{}\"><h3>#{} {}</h3><p data-status>{}</p><p data-cost>{}</p><p data-changed>{}</p></article>",
+                card.number,
+                col.id,
+                card.number,
+                escape_html(&card.title),
+                escape_html(&card.status_text),
+                escape_html(&card.cost_text),
+                escape_html(&card.changed_text),
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("</section>");
+    html
+}
 
 #[derive(Template)]
 #[template(source = "<main><p>factory {{ version }} ok</p></main>", ext = "html")]
@@ -277,13 +638,110 @@ pub fn web_health_response() -> String {
     .expect("health template renders")
 }
 
-/// Handler shape for future UI tickets: routes call command functions.
-/// Not served anywhere in this ticket (structure only, no endpoints).
-pub fn web_router() -> axum::Router {
-    axum::Router::new().route(
-        "/health",
-        axum::routing::get(|| async { web_health_response() }),
+/// Full board page: columns plus the polling hook that refreshes only
+/// the fragment (no full reloads). Pure over columns for testing.
+pub fn board_page_html(columns: &[BoardColumn]) -> String {
+    let fragment = board_fragment_html(columns);
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Factory board</title></head>\
+<body><header><h1>Factory board</h1>\
+<p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
+<p data-version>factory {version}</p></header>\
+<main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
+{fragment}</div></main>\
+<script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+</body></html>",
+        BOARD_POLL_MS,
     )
+}
+
+async fn board_page_handler() -> axum::response::Html<String> {
+    axum::response::Html(board_page_html(&board_data()))
+}
+
+async fn board_fragment_handler() -> axum::response::Html<String> {
+    axum::response::Html(board_fragment_html(&board_data()))
+}
+
+/// Handler shape for UI tickets: board page + polling fragment + health.
+/// All GETs are read-only observers (same contract as `status`/`log`).
+pub fn web_router() -> axum::Router {
+    axum::Router::new()
+        .route("/", axum::routing::get(board_page_handler))
+        .route(
+            "/fragments/board",
+            axum::routing::get(board_fragment_handler),
+        )
+        .route(
+            "/health",
+            axum::routing::get(|| async { web_health_response() }),
+        )
+}
+
+/// True for loopback binds (127.0.0.1, ::1, localhost, with or without port).
+fn ui_addr_is_local(addr: &str) -> bool {
+    let host = addr
+        .rsplit(':')
+        .next()
+        .unwrap_or(addr)
+        .trim_matches(|c| c == '[' || c == ']');
+    let host = addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim().trim_matches(|c| c == '[' || c == ']'))
+        .unwrap_or(host);
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+/// Serve the board until interrupted. Blocks on a Tokio runtime created
+/// here so the sync `run()` CLI keeps one code path for binary + handlers.
+pub fn web_serve(addr: &str, allow_remote: bool) -> Result<(), String> {
+    if !allow_remote && !ui_addr_is_local(addr) {
+        return Err(format!(
+            "refusing non-localhost bind {addr}: pass --allow-remote to expose the factory UI explicitly"
+        ));
+    }
+    let owned = addr.to_string();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start UI runtime: {e}"))?;
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&owned)
+            .await
+            .map_err(|e| format!("cannot bind {owned}: {e}"))?;
+        println!("factory ui serving the board on http://{owned} (board at /)");
+        axum::serve(listener, web_router())
+            .await
+            .map_err(|e| format!("factory ui failed: {e}"))
+    })
+}
+
+/// `factory ui` / `factory serve`: bind and serve the board. Exit 0 once
+/// the server stops cleanly; nonzero with a plain-English cause when the
+/// address is rejected or the listener cannot start.
+pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
+    match web_serve(addr, allow_remote) {
+        Ok(()) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"serving": false, "addr": addr, "stopped": true})
+                );
+            }
+            0
+        }
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({"error": e, "addr": addr}));
+            }
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -4415,6 +4873,8 @@ pub fn run() -> i32 {
             ReleaseAction::Abandon => cmd_release_abandon(cli.json),
         },
         Commands::Land { dry_run, train } => cmd_land(cli.json, dry_run, train),
+        Commands::Ui { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
+        Commands::Serve { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
     }
 }
 

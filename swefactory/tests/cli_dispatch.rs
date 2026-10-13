@@ -622,12 +622,39 @@ fn dispatch_routes_changes_requested_back_to_ready() {
 fn no_api_client_dependency_for_dispatch() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let content = fs::read_to_string(&manifest).unwrap().to_lowercase();
-    for banned in ["rusqlite", "reqwest", "octocrab", "ureq", "hyper", "tokio"] {
+    // Spec #27 mandates Axum in the same binary, and ticket #29's
+    // `factory ui` serve path drives it through the Tokio runtime.
+    // Tokio is a server runtime, not a dispatch API client: the dispatch
+    // loop still shells out through the FACTORY_GH_BIN seam, so only
+    // `tokio` leaves this ban list (and `web_serve` must stay its sole
+    // user, asserted below).
+    for banned in ["rusqlite", "reqwest", "octocrab", "ureq", "hyper"] {
         assert!(
             !content.contains(banned),
             "Cargo.toml must not gain {banned} for dispatch"
         );
     }
+    let src =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")).unwrap();
+    let serve_at = src
+        .find("pub fn web_serve")
+        .expect("UI serve path owns the runtime");
+    let mut users = 0;
+    let mut offset = 0;
+    for line in src.lines() {
+        if line.contains("tokio::") {
+            users += 1;
+            assert!(
+                offset >= serve_at,
+                "tokio must stay inside the UI serve path; dispatch stays shell-out only"
+            );
+        }
+        offset += line.len() + 1;
+    }
+    assert!(
+        users > 0,
+        "the UI serve path is expected to drive Axum through tokio"
+    );
 }
 
 // ---------------------------------------------------------------------------
