@@ -348,3 +348,23 @@ fn non_localhost_bind_refuses_without_override() {
         "refusal names the explicit override, got: {err}"
     );
 }
+
+/// Ticket #34: the localhost-only default and the v1 no-auth boundary are
+/// documented where Bea and the maintainer look — the product README —
+/// so no auth gap is silent. The refusal path names the override (proved
+/// above); these docs name the default and the boundary.
+#[test]
+fn bind_and_auth_gaps_are_documented_loudly() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(manifest.join("README.md"))
+        .expect("swefactory/README.md must exist");
+    for marker in [
+        "127.0.0.1:8080",
+        "--addr",
+        "--allow-remote",
+        "Localhost-only",
+        "No auth in v1",
+    ] {
+        assert!(readme.contains(marker), "README never documents {marker:?}");
+    }
+}
