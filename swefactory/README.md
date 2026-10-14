@@ -85,6 +85,18 @@ check adapter, `.github/ISSUE_TEMPLATE/{spec,ticket}.yml`, the `AGENTS.md`
 header merge, `GLOSSARY.md` + `docs/README.md` skeletons,
 `factory/.cache/`, and `.factory-version`.
 
+## Seed layout contracts
+
+Seeded locations are either **integration contracts** (expected at their
+conventional paths by editors, agents, and hosts — `AGENTS.md`,
+`GLOSSARY.md`, `scripts/factory-check`, `.pi/prompts/*`,
+`.agents/skills/*`, `.github/ISSUE_TEMPLATE/*`, the `docs/` skeleton,
+the `.gitignore` cache entry) or **factory-owned** (`factory/.cache/`,
+`factory/.state/` at runtime, the `.factory-version` marker). The full
+table ships in the seeded `docs/README.md`. Standing rule: all future
+seeds land under the factory-owned directory (`factory/`); nothing
+already seeded moves, and re-seeding never overwrites customized files.
+
 Divergence from bash (documented): the Rust binary *is* `factory`, so no
 `scripts/factory` shim is installed; `update --pin` acknowledges the tag but
 does not fetch or persist it (network refresh is out of scope at parity). Missing `gh`/`herdr`
