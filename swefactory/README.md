@@ -153,6 +153,47 @@ comments/edits and no pushes. `start` never touches GitHub state either —
 it reads the ticket via `gh issue view` and creates only local
 worktree/branch/brief state.
 
+## factory ui (local web, Bea-first)
+
+`factory ui` serves the factory for humans — a Bea-first board and ticket
+views, a live dispatcher screen, git and file views, and a clickable train
+review with human land. `factory serve` is the same app under a headless
+name. Server-rendered HTML with polling fragments (no JS build, no
+websockets); every panel shows the CLI command it corresponds to, so you
+can drop to the terminal without re-deriving anything.
+
+```sh
+factory ui                           # board on http://127.0.0.1:8080
+factory ui --addr 127.0.0.1:9000        # same loopback-only bind, other port
+factory serve --addr 127.0.0.1:8080     # headless alias, same app
+```
+
+Localhost-only by default. The server binds `127.0.0.1:8080` unless
+`--addr` says otherwise, and it *refuses* a non-loopback bind unless
+`--allow-remote` is passed explicitly — exposure is always a conscious
+flag, never an accident:
+
+```sh
+factory ui --addr 0.0.0.0:8080
+# refusing non-localhost bind 0.0.0.0:8080: pass --allow-remote to expose the factory UI explicitly
+factory ui --addr 0.0.0.0:8080 --allow-remote   # you mean it; it serves
+```
+
+Loopback means `127.0.0.1`, `::1`, or `localhost`. Anything else needs
+`--allow-remote`.
+
+No auth in v1 — stated loudly, by design. There is no login, no session,
+no multi-user model: the loopback bind *is* the security boundary. Anyone
+who can reach the port can read every view and press every button (land,
+STOP/Resume, Needs-you answers post as issue comments). Do not expose the
+UI beyond loopback unless you accept that. Non-localhost auth is
+out of scope for v1 (see the spec); file viewing is copy-only and every
+GET is a read-only observer (same contract as `status`/`log` — rendering
+never mutates state, proven by byte+mtime snapshot tests on every GET
+endpoint). Writes happen only through the command functions that already
+guard mutation (land preflights exactly like the CLI: red heads and dirty
+trees refuse in the UI too).
+
 ## Checks
 
 ```sh
