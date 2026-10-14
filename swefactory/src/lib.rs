@@ -59,9 +59,9 @@ pub enum Commands {
     },
     /// Seed the factory into the current project (idempotent, never clobbers).
     Init {
-        /// Check-adapter stack to install.
-        #[arg(long, default_value = "rust")]
-        stack: String,
+        /// Check-adapter stack to install (default: auto-detect from the project).
+        #[arg(long)]
+        stack: Option<String>,
         /// Install skills to $HOME/.agents/skills instead of the project.
         #[arg(long)]
         global_skills: bool,
@@ -3515,6 +3515,7 @@ fn fail_onboard(json: bool, msg: &str) -> i32 {
 #[derive(Serialize)]
 pub struct InitOutput {
     stack: String,
+    detected_from: Option<String>,
     installed: Vec<String>,
     kept: Vec<String>,
     warnings: Vec<String>,
@@ -3631,11 +3632,292 @@ fn adapter_for(stack: &str) -> Option<&'static str> {
     }
 }
 
-/// Installed stack, detected from the seeded adapter bytes — never assumed.
-/// Falls back to "rust" when no adapter is installed or it is custom:
-/// seeding never overwrites, so a guess only affects a missing adapter
-/// plus the reported stack string.
-fn detect_stack(dest: &Path) -> &'static str {
+/// One stack family the project probe knows: plain marker filenames plus
+/// filename extensions (without dot) matched against the directory listing.
+/// Order is precedence: strongest manifest first, `package.json` late because
+/// it is the most common secondary file (Rails+JS, Go+JS, …).
+struct StackProbe {
+    stack: &'static str,
+    markers: &'static [&'static str],
+    ext_markers: &'static [&'static str],
+}
+
+const STACK_PROBES: &[StackProbe] = &[
+    StackProbe {
+        stack: "rust",
+        markers: &["Cargo.toml"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "go",
+        markers: &["go.mod"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "elixir",
+        markers: &["mix.exs"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "ruby",
+        markers: &["Gemfile", "Gemfile.lock", ".ruby-version"],
+        ext_markers: &["gemspec"],
+    },
+    StackProbe {
+        stack: "java",
+        markers: &["pom.xml", "build.gradle", "build.gradle.kts"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "php",
+        markers: &["composer.json"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "dotnet",
+        markers: &["global.json"],
+        ext_markers: &["csproj", "sln"],
+    },
+    StackProbe {
+        stack: "swift",
+        markers: &["Package.swift"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "node",
+        markers: &["package.json"],
+        ext_markers: &[],
+    },
+    StackProbe {
+        stack: "python",
+        markers: &[
+            "pyproject.toml",
+            "requirements.txt",
+            "setup.py",
+            "setup.cfg",
+        ],
+        ext_markers: &[],
+    },
+];
+
+/// Extra files that mark the node family even without a package manifest
+/// (they only exist inside JavaScript/TypeScript projects) and enrich
+/// node evidence when the manifest is present.
+const NODE_EVIDENCE_FILES: &[&str] = &[
+    "bun.lock",
+    "svelte.config.js",
+    "convex.json",
+    "vite.config.ts",
+    "vite.config.js",
+    "tsconfig.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+];
+
+/// A project stack guess: winning stack, human-readable evidence for it,
+/// and every marker seen (winner first, precedence order).
+struct DetectedStack {
+    stack: String,
+    evidence: String,
+    markers: Vec<String>,
+}
+
+fn has_extension(dir: &Path, ext: &str) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some(ext) {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Guess the project stack from manifest files — never assumed, always
+/// reported with evidence. Empty-handed directories fall back to "generic"
+/// (an honest stub, never a pretend stack). Explicit `--stack` always
+/// bypasses this: it only runs when the user named no stack.
+fn detect_project_stack(dir: &Path) -> DetectedStack {
+    let mut markers: Vec<String> = Vec::new();
+    let mut winner: Option<(String, Vec<String>)> = None;
+    for probe in STACK_PROBES {
+        let mut found: Vec<String> = probe
+            .markers
+            .iter()
+            .filter(|m| dir.join(m).is_file())
+            .map(|m| m.to_string())
+            .collect();
+        for ext in probe.ext_markers {
+            if let Some(name) = has_extension(dir, ext) {
+                found.push(name);
+            }
+        }
+        if found.is_empty() {
+            // Node-family config files are weak markers on their own: they
+            // only exist inside JavaScript/TypeScript projects.
+            if probe.stack == "node" {
+                for extra in NODE_EVIDENCE_FILES {
+                    if dir.join(extra).is_file() {
+                        found.push(extra.to_string());
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        markers.push(format!("{} ({})", probe.stack, found.join(", ")));
+        if winner.is_none() {
+            winner = Some((probe.stack.to_string(), found));
+        }
+    }
+    match winner {
+        None => DetectedStack {
+            stack: "generic".to_string(),
+            evidence: "no stack markers found".to_string(),
+            markers,
+        },
+        Some((stack, mut files)) => {
+            if stack == "node" {
+                for extra in NODE_EVIDENCE_FILES {
+                    if !files.iter().any(|f| f == extra) && dir.join(extra).is_file() {
+                        files.push(extra.to_string());
+                    }
+                }
+            }
+            DetectedStack {
+                evidence: files.join(" + "),
+                markers,
+                stack,
+            }
+        }
+    }
+}
+
+/// Generic check adapter, parameterized by stack name. It probes for the
+/// obvious tools of the known families (manifest-gated, so a Ruby checkout
+/// never runs Go tools), runs whatever it finds in contract order, skips
+/// with a reason what it lacks, and fails with wiring guidance when the
+/// project has markers but nothing runnable. Empty projects pass cleanly.
+/// The `# STACK:` line lets the refresh path recognize the seed.
+fn generic_adapter(stack: &str) -> String {
+    format!(
+        r###"#!/usr/bin/env bash
+# factory-check (generic stub for '{stack}')
+# STACK: {stack}
+# Seeded by `factory init`: no first-class adapter for '{stack}' yet.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# real failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. This stub runs whatever it finds (each stage
+# is manifest-gated), skips with a reason what it lacks, and fails with
+# wiring guidance when nothing runnable matches. Edit this file to wire
+# your runner precisely — seeds never overwrite, so customizations stick.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+have() {{ command -v "$1" >/dev/null 2>&1; }}
+
+ran_any=0
+note() {{ echo "(skip: $1)"; }}
+
+# --- manifest inventory: a markerless tree has nothing to check ---
+if ! {{ ls Cargo.toml go.mod go.sum mix.exs Gemfile Gemfile.lock pom.xml build.gradle build.gradle.kts settings.gradle composer.json Package.swift package.json pyproject.toml requirements.txt setup.py setup.cfg stack.yaml dune-project dune-workspace CMakeLists.txt meson.build Makefile Pipfile poetry.lock *.gemspec *.csproj *.sln *.cabal 2>/dev/null || true; }} | grep -q .; then
+  echo "factory-check: no project markers yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+fail_missing() {{
+  echo "factory-check: '{stack}' project detected but no runnable checks found (missing toolchains?)"
+  echo "Edit scripts/factory-check to wire your runner (contract: format→lint→test, non-zero on fail)"
+  exit 1
+}}
+
+if [ -f Cargo.toml ]; then
+  have cargo || fail_missing
+  echo "==> cargo fmt --check"; cargo fmt --check
+  echo "==> cargo clippy (deny warnings)"; cargo clippy --all-targets -- -D warnings
+  echo "==> cargo test"; cargo test -- "$@"
+  ran_any=1
+elif [ -f go.mod ]; then
+  have go || fail_missing
+  echo "==> gofmt -l"; test -z "$(gofmt -l .)"
+  echo "==> go vet"; go vet ./...
+  echo "==> go test"; go test ./... "$@"
+  ran_any=1
+elif [ -f mix.exs ]; then
+  have mix || fail_missing
+  echo "==> mix format --check-formatted"; mix format --check-formatted
+  echo "==> mix compile (warnings as errors)"; mix compile --warnings-as-errors
+  echo "==> mix test"; MIX_ENV=test mix test "$@"
+  ran_any=1
+elif [ -f Gemfile ] || ls *.gemspec >/dev/null 2>&1; then
+  have bundle || fail_missing
+  if bundle exec rubocop -V >/dev/null 2>&1; then echo "==> rubocop"; bundle exec rubocop; else note "rubocop not available"; fi
+  if [ -f Rakefile ]; then echo "==> rake test"; bundle exec rake test "$@"; elif [ -d spec ] && bundle exec rspec -V >/dev/null 2>&1; then echo "==> rspec"; bundle exec rspec "$@"; else note "no Rakefile or spec/ suite found"; fi
+  ran_any=1
+elif [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+  if [ -f pom.xml ]; then have mvn || fail_missing; echo "==> mvn test"; mvn -B -q test "$@";
+  elif [ -x ./gradlew ]; then echo "==> gradlew test"; ./gradlew test "$@";
+  elif have gradle; then echo "==> gradle test"; gradle test "$@";
+  else fail_missing; fi
+  ran_any=1
+elif [ -f composer.json ]; then
+  have php || fail_missing
+  if [ -x vendor/bin/pint ]; then echo "==> pint --test"; vendor/bin/pint --test; else note "pint not installed"; fi
+  if [ -x vendor/bin/phpunit ]; then echo "==> phpunit"; vendor/bin/phpunit "$@"; else note "phpunit not installed"; fi
+  ran_any=1
+elif ls *.csproj *.sln >/dev/null 2>&1; then
+  have dotnet || fail_missing
+  echo "==> dotnet format (verify)"; dotnet format --verify-no-changes --verbosity quiet || note "dotnet format reported changes (run: dotnet format)"
+  echo "==> dotnet test"; dotnet test "$@"
+  ran_any=1
+elif [ -f Package.swift ]; then
+  have swift || fail_missing
+  if have swiftformat; then echo "==> swiftformat --lint"; swiftformat --lint .; else note "swiftformat not installed"; fi
+  echo "==> swift test"; swift test "$@"
+  ran_any=1
+elif [ -f package.json ]; then
+  if have npx && [ -f .prettierrc ] || [ -f .prettierrc.json ] || grep -q '"prettier"' package.json 2>/dev/null; then echo "==> prettier --check"; npx prettier --check .; else note "prettier not configured"; fi
+  if {{ ls eslint.config.* .eslintrc* 2>/dev/null || true; }} | grep -q .; then echo "==> eslint"; npx eslint .; else note "eslint not configured"; fi
+  echo "==> npm test"; npm test -- "$@"
+  ran_any=1
+elif [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f setup.py ]; then
+  if have ruff; then echo "==> ruff format --check"; ruff format --check .; echo "==> ruff check"; ruff check .; else note "ruff not installed"; fi
+  have pytest || have python || fail_missing
+  echo "==> pytest"; python -m pytest "$@"
+  ran_any=1
+fi
+
+if [ "$ran_any" = 0 ]; then
+  fail_missing
+fi
+
+echo "FACTORY-CHECK PASSED"
+"###,
+        stack = stack,
+    )
+}
+
+/// Adapter text for a stack: the embedded first-class script when one
+/// exists, otherwise the generic stub parameterized by stack name.
+/// Returns the text plus whether it is first-class.
+fn adapter_text(stack: &str) -> (String, bool) {
+    match adapter_for(stack) {
+        Some(adapter) => (adapter.to_string(), true),
+        None => (generic_adapter(stack), false),
+    }
+}
+
+/// Installed stack, detected from the seeded adapter — never assumed.
+/// Byte-matches first-class scripts, parses the `# STACK:` marker on
+/// templated stubs, and falls back to "rust" for missing or fully custom
+/// adapters: seeding never overwrites, so a guess only affects a missing
+/// adapter plus the reported stack string.
+fn detect_stack(dest: &Path) -> String {
     let body = std::fs::read_to_string(dest.join("scripts/factory-check")).unwrap_or_default();
     for (name, adapter) in [
         ("rust", ADAPTER_RUST),
@@ -3644,10 +3926,18 @@ fn detect_stack(dest: &Path) -> &'static str {
         ("python", ADAPTER_PYTHON),
     ] {
         if body == adapter {
-            return name;
+            return name.to_string();
         }
     }
-    "rust"
+    for line in body.lines() {
+        if let Some(name) = line.strip_prefix("# STACK:") {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "rust".to_string()
 }
 
 fn tool_present(name: &str) -> bool {
@@ -3865,17 +4155,15 @@ fn seed_project_local(
         }
     }
 
-    // --- check adapter for the stack ---
-    match adapter_for(stack) {
-        Some(adapter) => {
-            ins.seed_executable("scripts/factory-check", adapter);
-            if cmd == "init" {
-                ins.say(&format!("check adapter: {stack}"));
-            }
-        }
-        None => {
-            ins.warn(&format!(
-                "WARN: no check adapter for '{stack}' (expected one of rust, elixir, node, python) — write scripts/factory-check (contract: format→lint→test, non-zero on fail)"
+    // --- check adapter for the stack (first-class script, else generic stub) ---
+    let (text, first_class) = adapter_text(stack);
+    ins.seed_executable("scripts/factory-check", &text);
+    if cmd == "init" {
+        if first_class {
+            ins.say(&format!("check adapter: {stack}"));
+        } else {
+            ins.say(&format!(
+                "check adapter: {stack} (generic stub — edit scripts/factory-check to wire your runner)"
             ));
         }
     }
@@ -3913,11 +4201,22 @@ fn seed_project_local(
 
 pub fn run_init(
     json: bool,
-    stack: &str,
+    stack: Option<&str>,
     global_skills: bool,
     pin: Option<&str>,
     cmd: &str,
 ) -> InitOutput {
+    let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // No explicit stack: detect from the project and report the evidence.
+    // Explicit `--stack` (even unknown) always wins over detection.
+    let (stack_owned, detected): (String, Option<DetectedStack>) = match stack {
+        Some(s) => (s.to_string(), None),
+        None => {
+            let d = detect_project_stack(&dest);
+            (d.stack.clone(), Some(d))
+        }
+    };
+    let stack: &str = &stack_owned;
     let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut ins = Installer {
         dest: dest.clone(),
@@ -3948,6 +4247,32 @@ pub fn run_init(
         dest.join(".agents/skills")
     };
     seed_project_local(&mut ins, stack, cmd, &skill_root, global_skills);
+
+    // Report what detection found (explicit stacks need no explanation).
+    let mut detected_from: Option<String> = None;
+    if let Some(d) = detected {
+        detected_from = Some(d.evidence.clone());
+        if cmd == "init" {
+            ins.say(&format!("detected stack: {stack} ({})", d.evidence));
+            let others: Vec<&str> = d
+                .markers
+                .iter()
+                .filter(|m| !m.starts_with(&format!("{stack} (")))
+                .map(|m| m.as_str())
+                .collect();
+            if !others.is_empty() {
+                ins.say(&format!(
+                    "note: also found {}; using {stack} — pass --stack to override",
+                    others.join(", ")
+                ));
+            }
+            if d.markers.is_empty() {
+                ins.warn(
+                    "WARN: no stack markers found — seeded generic check adapter (edit scripts/factory-check to wire your runner)",
+                );
+            }
+        }
+    }
 
     // --- labels (best effort via gh) ---
     let authed = gh_present
@@ -3981,6 +4306,7 @@ pub fn run_init(
 
     InitOutput {
         stack: stack.to_string(),
+        detected_from,
         installed: ins.installed,
         kept: ins.kept,
         warnings: ins.warnings,
@@ -4180,9 +4506,8 @@ struct DoctorOutput {
 // installers, ever — those stay report + hint only.
 // ---------------------------------------------------------------------------
 
-/// Default stack re-seeded when the adapter is missing entirely.
-/// `--fix` takes no --stack flag (spec: `doctor [--fix] [--json]`).
-const DOCTOR_FIX_STACK: &str = "rust";
+// Stack re-seed for repair comes from project detection (same as init).
+// `--fix` takes no --stack flag (spec: `doctor [--fix] [--json]`).
 
 pub fn doctor_fix() -> Vec<String> {
     let mut fixed = Vec::new();
@@ -4250,9 +4575,10 @@ pub fn doctor_fix() -> Vec<String> {
         warnings: Vec::new(),
         json: true, // quiet: repairs are reported by doctor, not init chatter
     };
+    let detected = detect_project_stack(&dest);
     seed_project_local(
         &mut ins,
-        DOCTOR_FIX_STACK,
+        &detected.stack,
         "doctor",
         &dest.join(".agents/skills"),
         false,
@@ -7979,7 +8305,7 @@ pub fn run() -> i32 {
             stack,
             global_skills,
         } => {
-            let out = run_init(cli.json, &stack, global_skills, None, "init");
+            let out = run_init(cli.json, stack.as_deref(), global_skills, None, "init");
             if cli.json {
                 println!(
                     "{}",
@@ -7994,7 +8320,7 @@ pub fn run() -> i32 {
             // seeding never overwrites, so it is a no-op when in place.
             let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let stack = detect_stack(&dest);
-            let out = run_init(cli.json, stack, false, pin.as_deref(), "update");
+            let out = run_init(cli.json, Some(&stack), false, pin.as_deref(), "update");
             if cli.json {
                 println!(
                     "{}",

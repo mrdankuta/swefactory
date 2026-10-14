@@ -83,13 +83,13 @@ fn fresh_init_installs_prompts_skills_adapter_and_templates() {
         let f = dir.join(".agents/skills").join(s).join("SKILL.md");
         assert!(f.is_file(), "missing skill {s}/SKILL.md");
     }
-    // check adapter (default stack: rust)
+    // check adapter (empty dir: honest generic stub, never a pretend stack)
     let adapter = dir.join("scripts/factory-check");
     assert!(adapter.is_file(), "missing scripts/factory-check");
     let body = fs::read_to_string(&adapter).unwrap();
     assert!(
-        body.contains("cargo"),
-        "default adapter must be the rust one"
+        body.contains("# STACK: generic"),
+        "empty-dir adapter must be the generic stub"
     );
     assert!(body.contains("FACTORY-CHECK PASSED"));
     // issue templates
@@ -412,5 +412,190 @@ fn gitignore_is_created_when_absent() {
     assert!(
         body.contains("factory/.cache/"),
         "fresh init must create .gitignore with the cache entry, got:\n{body}"
+    );
+}
+
+#[test]
+fn init_detects_node_in_svelte_convex_project() {
+    let dir = scratch_dir("detect-node");
+    for f in [
+        "package.json",
+        "svelte.config.js",
+        "convex.json",
+        "tsconfig.json",
+    ] {
+        fs::write(dir.join(f), "{}\n").unwrap();
+    }
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains(
+            "detected stack: node (package.json + svelte.config.js + convex.json + tsconfig.json)"
+        ),
+        "must report the detected stack with evidence, got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "svelte/convex project must get the node adapter"
+    );
+}
+
+#[test]
+fn init_prefers_strongest_manifest_in_polyglot_checkout() {
+    let dir = scratch_dir("polyglot");
+    fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("detected stack: rust (Cargo.toml)"),
+        "rust must win by precedence, got:\n{text}"
+    );
+    assert!(
+        text.contains("also found node (package.json)"),
+        "losing markers must be reported, got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(body.contains("cargo"), "winner adapter must be rust");
+}
+
+#[test]
+fn explicit_stack_overrides_detection_without_commentary() {
+    let dir = scratch_dir("explicit");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["init", "--stack", "rust"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !text.contains("detected stack"),
+        "explicit stacks need no detection report, got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(body.contains("cargo"), "explicit --stack rust must win");
+}
+
+#[test]
+fn unknown_stack_seeds_generic_stub() {
+    let dir = scratch_dir("unknown");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["init", "--stack", "cobol"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("generic stub"),
+        "stub provenance must be announced, got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("# STACK: cobol"),
+        "stub must carry its stack marker, got:\n{body}"
+    );
+    assert!(body.contains("FACTORY-CHECK PASSED"));
+}
+
+#[test]
+fn update_round_trips_custom_stack() {
+    let dir = scratch_dir("roundtrip");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["init", "--stack", "cobol"]);
+    cmd.assert().success();
+    let before = fs::read(dir.join("scripts/factory-check")).unwrap();
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["update", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).expect("JSON");
+    assert_eq!(
+        parsed.get("stack").and_then(|s| s.as_str()),
+        Some("cobol"),
+        "update must report the marked stack, got: {parsed}"
+    );
+    assert_eq!(
+        fs::read(dir.join("scripts/factory-check")).unwrap(),
+        before,
+        "update must not clobber the installed stub"
+    );
+}
+
+#[test]
+fn json_init_carries_detection_evidence() {
+    let dir = scratch_dir("jsonevidence");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .args(["init", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).expect("JSON");
+    assert_eq!(
+        parsed.get("stack").and_then(|s| s.as_str()),
+        Some("node"),
+        "JSON must carry the detected stack, got: {parsed}"
+    );
+    assert!(
+        parsed
+            .get("detected_from")
+            .and_then(|s| s.as_str())
+            .is_some_and(|e| e.contains("package.json")),
+        "JSON must carry detection evidence, got: {parsed}"
+    );
+
+    let empty = scratch_dir("jsonempty");
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&empty)
+        .env("PATH", &path)
+        .args(["init", "--json"]);
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).expect("JSON");
+    assert_eq!(
+        parsed.get("stack").and_then(|s| s.as_str()),
+        Some("generic"),
+        "empty dir must report generic, got: {parsed}"
     );
 }
