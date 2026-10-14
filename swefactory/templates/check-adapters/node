@@ -5,6 +5,12 @@
 # through to the test runner. FACTORY_SLOT offsets concurrent state (e.g.
 # per-worker ports, temp dirs, or test concurrency) so parallel dispatcher
 # workers never share mutable resources.
+#
+# Smart toolchain resolution: the package manager comes from lockfiles,
+# the formatter/linter run only when their config is present (absent
+# config skips with a reason instead of failing), the typecheck prefers
+# svelte-check on Svelte projects then tsc on typed projects, and the
+# test runner comes from package.json scripts and dev dependencies.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -21,13 +27,107 @@ if [ -n "${FACTORY_SLOT:-}" ]; then
   export VITEST_POOL_ID="$FACTORY_SLOT"
 fi
 
+# Package manager from lockfiles (first match wins; default npm).
+PM="npm"
+if [ -f pnpm-lock.yaml ]; then
+  PM="pnpm"
+elif [ -f yarn.lock ]; then
+  PM="yarn"
+elif [ -f bun.lockb ] || [ -f bun.lock ]; then
+  PM="bun"
+elif [ -f package-lock.json ]; then
+  PM="npm"
+fi
+echo "factory-check: package manager: $PM"
+
+# Tool runner for the selected package manager.
+pm_exec() {
+  case "$PM" in
+    pnpm) pnpm exec "$@";;
+    yarn) yarn "$@";;
+    bun) bunx "$@";;
+    *) npx "$@";;
+  esac
+}
+
+# True when package.json carries the given top-level key ("prettier",
+# "eslintConfig", ...) — a config-presence signal alongside config files.
+pkg_has_key() {
+  grep -q "\"$1\"[[:space:]]*:" package.json 2>/dev/null
+}
+
+# True when package.json names the given dependency (dep or devDep).
+pkg_has_dep() {
+  grep -q "\"$1\"[[:space:]]*:[[:space:]]*\"[^\\\"]*\"" package.json 2>/dev/null
+}
+
+# True when package.json declares a test script. The scripts block holds
+# plain string commands (no nested objects), so the block up to its
+# closing brace is a reliable search scope.
+has_test_script() {
+  sed -n '/"scripts"[[:space:]]*:/,/^[[:space:]]*}/p' package.json 2>/dev/null \
+    | grep -q '"test"[[:space:]]*:'
+}
+
 echo "==> prettier --check"
-npx prettier --check .
+if [ -f .prettierrc ] || [ -f prettier.config.js ] || [ -f prettier.config.cjs ] \
+  || [ -f prettier.config.mjs ] || [ -f prettier.config.ts ] \
+  || compgen -G ".prettierrc.*" > /dev/null \
+  || compgen -G "prettier.config.*" > /dev/null \
+  || pkg_has_key "prettier"; then
+  pm_exec prettier --check .
+else
+  echo "factory-check: no formatter config — skipping format"
+fi
 
 echo "==> eslint"
-npx eslint .
+if [ -f eslint.config.js ] || [ -f eslint.config.cjs ] || [ -f eslint.config.mjs ] \
+  || [ -f eslint.config.ts ] || [ -f .eslintrc ] || [ -f .eslintrc.js ] \
+  || [ -f .eslintrc.cjs ] || [ -f .eslintrc.json ] || [ -f .eslintrc.yaml ] \
+  || [ -f .eslintrc.yml ] || pkg_has_key "eslintConfig"; then
+  pm_exec eslint .
+else
+  echo "factory-check: no linter config — skipping lint"
+fi
+
+if [ -f svelte.config.js ] || [ -f svelte.config.cjs ] || [ -f svelte.config.mjs ] \
+  || [ -f svelte.config.ts ] || pkg_has_dep "svelte"; then
+  echo "==> typecheck (svelte-check)"
+  if [ -f tsconfig.json ]; then
+    pm_exec svelte-check --tsconfig ./tsconfig.json
+  else
+    pm_exec svelte-check
+  fi
+elif [ -f tsconfig.json ] || pkg_has_dep "typescript"; then
+  echo "==> typecheck (tsc --noEmit)"
+  if [ -f tsconfig.json ]; then
+    pm_exec tsc --noEmit -p tsconfig.json
+  else
+    pm_exec tsc --noEmit
+  fi
+else
+  echo "==> typecheck"
+  echo "factory-check: no type config — skipping typecheck"
+fi
 
 echo "==> test"
-npm test -- "$@"
+if has_test_script; then
+  case "$PM" in
+    yarn) yarn test "$@";;
+    bun) bun test "$@";;
+    *) "$PM" test -- "$@";;
+  esac
+elif compgen -G "vitest.config.*" > /dev/null || compgen -G "vitest.workspace.*" > /dev/null \
+  || pkg_has_dep "vitest"; then
+  pm_exec vitest run "$@"
+elif [ -f jest.config.js ] || [ -f jest.config.cjs ] || [ -f jest.config.mjs ] \
+  || [ -f jest.config.ts ] || [ -f jest.config.json ] || pkg_has_key "jest" \
+  || pkg_has_dep "jest"; then
+  pm_exec jest "$@"
+elif compgen -G "playwright.config.*" > /dev/null || pkg_has_dep "@playwright/test"; then
+  pm_exec playwright test "$@"
+else
+  echo "factory-check: no test script — skipping tests"
+fi
 
 echo "FACTORY-CHECK PASSED"
