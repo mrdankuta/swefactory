@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# factory-check (java) — check adapter for Java projects, Maven and Gradle.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets concurrent state so
+# parallel dispatcher workers never share mutable resources.
+set -euo pipefail
+
+cd "${0%/*}/.."
+
+if [ ! -f pom.xml ] && [ ! -f build.gradle ] && [ ! -f build.gradle.kts ]; then
+  echo "factory-check: no pom.xml or Gradle build file yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: separate temp state (and Gradle home) per worker.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export TMPDIR="${TMPDIR:-/tmp}/factory-slot-$FACTORY_SLOT"
+  mkdir -p "$TMPDIR"
+  export GRADLE_USER_HOME="$TMPDIR/gradle-home"
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+note() { echo "(skip: $1)"; }
+
+if [ -f pom.xml ]; then
+  if ! have mvn; then
+    echo "factory-check: pom.xml found but maven (mvn) is not installed" >&2
+    exit 1
+  fi
+
+  echo "==> spotless:check"
+  if grep -q "spotless" pom.xml 2>/dev/null; then
+    mvn -B -q spotless:check
+  else
+    note "spotless not configured"
+  fi
+
+  echo "==> mvn compile"
+  mvn -B -q compile
+
+  echo "==> mvn test"
+  mvn -B test "$@"
+else
+  if [ -x ./gradlew ]; then
+    gradle_cmd="./gradlew"
+  elif have gradle; then
+    gradle_cmd="gradle"
+  else
+    echo "factory-check: Gradle build file found but neither the gradlew wrapper nor gradle is installed" >&2
+    exit 1
+  fi
+
+  echo "==> spotlessCheck"
+  if grep -q "spotless" build.gradle build.gradle.kts 2>/dev/null; then
+    $gradle_cmd spotlessCheck --console=plain -q
+  else
+    note "spotless not configured"
+  fi
+
+  echo "==> gradle test"
+  $gradle_cmd test --console=plain "$@"
+fi
+
+echo "FACTORY-CHECK PASSED"

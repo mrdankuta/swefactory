@@ -599,3 +599,166 @@ fn json_init_carries_detection_evidence() {
         "empty dir must report generic, got: {parsed}"
     );
 }
+
+/// Absolute path to a bash interpreter (the seeded adapters are bash
+/// scripts, so `sh -n` would reject their `pipefail` prelude).
+fn bash_bin() -> PathBuf {
+    for p in ["/usr/bin/bash", "/bin/bash"] {
+        if Path::new(p).is_file() {
+            return PathBuf::from(p);
+        }
+    }
+    PathBuf::from("bash")
+}
+
+/// Ticket #50: each of the six new stacks seeds a first-class adapter
+/// mentioning its toolchain's checks (never the generic stub).
+#[test]
+fn six_new_stacks_seed_first_class_adapters() {
+    for (stack, markers) in [
+        ("go", &["gofmt", "go vet", "go test"][..]),
+        ("ruby", &["rubocop", "rspec"][..]),
+        ("php", &["pint", "phpunit"][..]),
+        ("java", &["mvn", "gradle"][..]),
+        ("dotnet", &["dotnet format", "dotnet test"][..]),
+        ("swift", &["swiftformat", "swift test"][..]),
+    ] {
+        let dir = scratch_dir(&format!("first-class-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let body =
+            fs::read_to_string(dir.join("scripts/factory-check")).expect("adapter installed");
+        for m in markers {
+            assert!(body.contains(m), "--stack {stack} adapter must mention {m}");
+        }
+        assert!(
+            !body.contains("no first-class adapter"),
+            "--stack {stack} must seed a first-class adapter, not the generic stub"
+        );
+    }
+}
+
+/// Ticket #50: every new adapter passes a shell syntax check and no-ops
+/// cleanly (exit 0 + success marker) in an empty project with no
+/// toolchains on PATH.
+#[test]
+fn six_new_adapters_pass_syntax_check_and_noop_when_empty() {
+    for stack in ["go", "ruby", "php", "java", "dotnet", "swift"] {
+        let dir = scratch_dir(&format!("noop-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let adapter = dir.join("scripts/factory-check");
+        let status = std::process::Command::new(bash_bin())
+            .arg("-n")
+            .arg(&adapter)
+            .status()
+            .expect("bash -n runs");
+        assert!(
+            status.success(),
+            "--stack {stack} adapter must pass bash -n"
+        );
+        // Empty project, hermetic PATH: the no-op guard must fire before
+        // any toolchain is touched.
+        let out = std::process::Command::new(bash_bin())
+            .arg(&adapter)
+            .current_dir(&dir)
+            .env("PATH", &path)
+            .output()
+            .expect("adapter runs");
+        assert!(
+            out.status.success(),
+            "--stack {stack} adapter must no-op green in an empty project, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("FACTORY-CHECK PASSED"),
+            "--stack {stack} no-op must print the success marker"
+        );
+    }
+}
+
+/// Ticket #50: every new stack is selectable by explicit flag and
+/// round-trips through refresh byte-for-byte.
+#[test]
+fn six_new_adapters_round_trip_through_refresh() {
+    for stack in ["go", "ruby", "php", "java", "dotnet", "swift"] {
+        let dir = scratch_dir(&format!("roundtrip-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let before = fs::read(dir.join("scripts/factory-check")).unwrap();
+
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["update", "--json"]);
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).expect("JSON");
+        assert_eq!(
+            parsed.get("stack").and_then(|s| s.as_str()),
+            Some(stack),
+            "update must report the seeded stack {stack}, got: {parsed}"
+        );
+        assert_eq!(
+            fs::read(dir.join("scripts/factory-check")).unwrap(),
+            before,
+            "update must preserve the {stack} adapter byte-for-byte"
+        );
+    }
+}
+
+/// Ticket #50: the new adapters keep the uniform contract — strict
+/// failure mode, format before lint/compile before test, and the success
+/// marker printed only on the green path.
+#[test]
+fn six_new_adapters_follow_the_uniform_contract() {
+    for stack in ["go", "ruby", "php", "java", "dotnet", "swift"] {
+        let dir = scratch_dir(&format!("contract-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let body =
+            fs::read_to_string(dir.join("scripts/factory-check")).expect("adapter installed");
+        assert!(
+            body.contains("set -euo pipefail"),
+            "--stack {stack} adapter must fail fast (set -euo pipefail)"
+        );
+        // Format, then lint/compile, then test: stage keywords in order.
+        let fmt = body.find("format").expect("format stage");
+        let lint = body
+            .find("vet")
+            .or_else(|| body.find("lint"))
+            .or_else(|| body.find("compile"))
+            .or_else(|| body.find("build"))
+            .expect("lint/compile stage");
+        let test = body.rfind("==> ").expect("test stage echo");
+        assert!(
+            fmt < lint,
+            "--stack {stack} adapter must run format before lint/compile"
+        );
+        assert!(
+            lint < test,
+            "--stack {stack} adapter must run lint/compile before test"
+        );
+        assert!(
+            body.trim_end().ends_with("echo \"FACTORY-CHECK PASSED\""),
+            "--stack {stack} adapter must print the success marker last (green path only)"
+        );
+    }
+}

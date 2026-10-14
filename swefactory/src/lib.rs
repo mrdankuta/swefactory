@@ -3535,6 +3535,12 @@ const ADAPTER_RUST: &str = include_str!("../templates/check-adapters/rust");
 const ADAPTER_ELIXIR: &str = include_str!("../templates/check-adapters/elixir");
 const ADAPTER_NODE: &str = include_str!("../templates/check-adapters/node");
 const ADAPTER_PYTHON: &str = include_str!("../templates/check-adapters/python");
+const ADAPTER_GO: &str = include_str!("../templates/check-adapters/go");
+const ADAPTER_RUBY: &str = include_str!("../templates/check-adapters/ruby");
+const ADAPTER_PHP: &str = include_str!("../templates/check-adapters/php");
+const ADAPTER_JAVA: &str = include_str!("../templates/check-adapters/java");
+const ADAPTER_DOTNET: &str = include_str!("../templates/check-adapters/dotnet");
+const ADAPTER_SWIFT: &str = include_str!("../templates/check-adapters/swift");
 
 const AGENTS_HEADER: &str = include_str!("../templates/header/AGENTS.header.md");
 const GLOSSARY: &str = include_str!("../templates/glossary/GLOSSARY.md");
@@ -3628,6 +3634,12 @@ fn adapter_for(stack: &str) -> Option<&'static str> {
         "elixir" => Some(ADAPTER_ELIXIR),
         "node" => Some(ADAPTER_NODE),
         "python" => Some(ADAPTER_PYTHON),
+        "go" => Some(ADAPTER_GO),
+        "ruby" => Some(ADAPTER_RUBY),
+        "php" => Some(ADAPTER_PHP),
+        "java" => Some(ADAPTER_JAVA),
+        "dotnet" => Some(ADAPTER_DOTNET),
+        "swift" => Some(ADAPTER_SWIFT),
         _ => None,
     }
 }
@@ -3924,6 +3936,12 @@ fn detect_stack(dest: &Path) -> String {
         ("elixir", ADAPTER_ELIXIR),
         ("node", ADAPTER_NODE),
         ("python", ADAPTER_PYTHON),
+        ("go", ADAPTER_GO),
+        ("ruby", ADAPTER_RUBY),
+        ("php", ADAPTER_PHP),
+        ("java", ADAPTER_JAVA),
+        ("dotnet", ADAPTER_DOTNET),
+        ("swift", ADAPTER_SWIFT),
     ] {
         if body == adapter {
             return name.to_string();
