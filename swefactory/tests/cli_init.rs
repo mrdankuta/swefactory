@@ -599,3 +599,261 @@ fn json_init_carries_detection_evidence() {
         "empty dir must report generic, got: {parsed}"
     );
 }
+
+// --- bounded guided mode (ticket #49, spec #45) -----------------------------
+// Seams: the `factory init` CLI surface only — which adapter lands, which
+// lines are reported, prompt/no-prompt behavior. Never adapter internals.
+// Every test pins stdin (piped ⇒ non-terminal) and arms a timeout, so a
+// regression that blocks on a prompt fails instead of hanging the suite.
+// `FACTORY_FORCE_TTY` simulates a terminal for the prompting tests; the
+// silent tests remove it so ambient env cannot flip them.
+
+#[test]
+fn interactive_piped_input_never_prompts_and_uses_default() {
+    let dir = scratch_dir("guided-piped");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env_remove("FACTORY_FORCE_TTY")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack"),
+        "piped input must never see the stack prompt, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Where should skills"),
+        "piped input must never see the skills prompt, got:\n{stderr}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "detection default (node) must win when piped"
+    );
+}
+
+#[test]
+fn interactive_json_never_prompts() {
+    let dir = scratch_dir("guided-json");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive", "--json"])
+        .write_stdin("1\n1\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must stay pure JSON");
+    assert_eq!(
+        parsed.get("stack").and_then(|s| s.as_str()),
+        Some("node"),
+        "JSON keeps the detected stack, got: {parsed}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack") && !stdout.contains("Select a stack"),
+        "JSON mode must never prompt, stderr was:\n{stderr}"
+    );
+}
+
+#[test]
+fn interactive_flag_selects_stack_by_number() {
+    let dir = scratch_dir("guided-pick");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("1\n1\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Select a stack"),
+        "flagged terminal run must ask the stack question, got:\n{text}"
+    );
+    assert!(
+        text.contains("Where should skills"),
+        "flagged terminal run must ask the skills question, got:\n{text}"
+    );
+    assert!(
+        text.contains("selected stack: rust"),
+        "choice 1 (rust) must be reported, got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("cargo"),
+        "choice 1 must install the rust adapter"
+    );
+}
+
+#[test]
+fn interactive_flag_empty_answer_keeps_detection_winner() {
+    let dir = scratch_dir("guided-default");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("selected stack: node"),
+        "empty answer must keep the detected winner (node), got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "default must install the node adapter"
+    );
+}
+
+#[test]
+fn ambiguous_detection_prompts_without_flag_on_terminal() {
+    let dir = scratch_dir("guided-auto");
+    fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .arg("init")
+        .write_stdin("9\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Select a stack"),
+        "ambiguous detection on a terminal must prompt, stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Where should skills") && !stdout.contains("Where should skills"),
+        "auto mode asks the stack only, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("selected stack: node"),
+        "choice 9 (node) must win over the silent rust guess, got:\n{stdout}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "chosen stack must install the node adapter"
+    );
+}
+
+#[test]
+fn ambiguous_detection_stays_silent_when_piped() {
+    let dir = scratch_dir("guided-silent");
+    fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env_remove("FACTORY_FORCE_TTY")
+        .timeout(std::time::Duration::from_secs(10))
+        .arg("init")
+        .write_stdin("");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack") && !stdout.contains("Select a stack"),
+        "piped runs must never prompt, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("detected stack: rust (Cargo.toml)"),
+        "precedence winner must be reported as before, got:\n{stdout}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(body.contains("cargo"), "silent run keeps the rust adapter");
+}
+
+#[test]
+fn interactive_skills_choice_global_lands_under_home() {
+    let dir = scratch_dir("guided-skills");
+    let home = scratch_dir("guided-fakehome");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("HOME", &home)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("11\n2\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("skills location: global"),
+        "skills answer must be reported, got:\n{text}"
+    );
+    assert!(
+        home.join(".agents/skills/tdd/SKILL.md").is_file(),
+        "choice 2 must install skills under $HOME"
+    );
+    assert!(
+        !dir.join(".agents/skills").exists(),
+        "project skills dir must stay absent on the global choice"
+    );
+}
+
+#[test]
+fn explicit_stack_skips_prompt_even_on_terminal() {
+    let dir = scratch_dir("guided-explicit");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive", "--stack", "rust"])
+        .write_stdin("9\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack") && !stdout.contains("Select a stack"),
+        "explicit --stack always wins, no stack question, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(body.contains("cargo"), "explicit rust must install rust");
+}
