@@ -986,7 +986,7 @@ pub fn dispatcher_no_transcript_sentence() -> &'static str {
 
 /// Calm sentence for zero checked-out worktrees.
 pub fn dispatcher_no_worktrees_sentence() -> &'static str {
-    "No worktrees checked out right now."
+    "No worktrees checked out right now \u{2014} nothing is running, so there is nothing to tidy."
 }
 
 /// Read-only: `git worktree list` lines. Failures read as none (the
