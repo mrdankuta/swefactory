@@ -1,7 +1,7 @@
 # /review — independent review of a fixed diff (no edits)
 
 Pi has no subagents: run the reviewer as a separate Pi process in a Herdr
-pane (recipe: `docs/HERDR.md` in pi-factory). Never review your own diff in-session.
+pane (recipe: the Orchestrator steps below). Never review your own diff in-session.
 
 ## Orchestrator steps (the implementer or integrator runs these)
 
@@ -16,7 +16,7 @@ pane (recipe: `docs/HERDR.md` in pi-factory). Never review your own diff in-sess
    Prefer the signal wait: have the brief require a terminal `FACTORY:`
    signal and wait with `herdr pane wait-output <pane> --regex
    '^\s*FACTORY:(READY_FOR_REVIEW|NEEDS_CLARIFICATION|BLOCKED)\s*$'`
-   (see pi-factory docs/HERDR.md for why anchored, not substring). Fall back to
+   (anchored so pasted verdicts in scrollback can't false-match). Fall back to
    `herdr agent wait <pane> --timeout 600000`.
 5. Collect: the reviewer writes its full report to `/tmp/<ticket>-review.md`
    and pastes verdict + findings in reply. Read the pane
@@ -62,6 +62,6 @@ pane (recipe: `docs/HERDR.md` in pi-factory). Never review your own diff in-sess
   report goes to `/tmp/<ticket>-review.md`; reply contains verdict
   (accept | changes_requested with concrete fixes + re-review scope)
   plus findings by severity with file refs. Reviewer starts pi with a
-  unique session id (`review-<ticket>-<yyyymmdd>`, see docs/HERDR.md).
+  unique session id (`review-<ticket>-<yyyymmdd>`).
   End the reply with the terminal signal line, e.g.
   `FACTORY:READY_FOR_REVIEW`, so the orchestrator can wait on it.

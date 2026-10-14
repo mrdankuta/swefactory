@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# factory-check (ruby) — check adapter for Ruby projects.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets concurrent state so
+# parallel dispatcher workers never share mutable resources.
+set -euo pipefail
+
+cd "${0%/*}/.."
+
+has_gemspec=0
+for f in *.gemspec; do
+  if [ -e "$f" ]; then has_gemspec=1; break; fi
+done
+
+if [ ! -f Gemfile ] && [ "$has_gemspec" = 0 ]; then
+  echo "factory-check: no Gemfile or gemspec yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: separate temp state per dispatcher worker.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export TMPDIR="${TMPDIR:-/tmp}/factory-slot-$FACTORY_SLOT"
+  mkdir -p "$TMPDIR"
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+note() { echo "(skip: $1)"; }
+
+run=""
+if [ -f Gemfile ]; then
+  if ! have bundle; then
+    echo "factory-check: Gemfile found but bundler is not installed" >&2
+    exit 1
+  fi
+  run="bundle exec"
+elif ! have ruby; then
+  echo "factory-check: gemspec found but ruby is not installed" >&2
+  exit 1
+fi
+
+echo "==> rubocop"
+if $run rubocop -V >/dev/null 2>&1; then
+  $run rubocop
+else
+  note "rubocop not available"
+fi
+
+echo "==> test"
+if [ -f Rakefile ]; then
+  echo "==> rake test"
+  $run rake test "$@"
+elif [ -d spec ] && $run rspec -V >/dev/null 2>&1; then
+  echo "==> rspec"
+  $run rspec "$@"
+else
+  note "no Rakefile or spec/ suite found"
+fi
+
+echo "FACTORY-CHECK PASSED"

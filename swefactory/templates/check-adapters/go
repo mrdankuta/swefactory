@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# factory-check (go) — check adapter for Go projects.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets the build cache so
+# parallel dispatcher workers never share build state.
+set -euo pipefail
+
+cd "${0%/*}/.."
+
+if [ ! -f go.mod ]; then
+  echo "factory-check: no go.mod yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: separate build/test cache per dispatcher worker.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export GOCACHE="${TMPDIR:-/tmp}/factory-go-slot-$FACTORY_SLOT"
+  mkdir -p "$GOCACHE"
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+note() { echo "(skip: $1)"; }
+
+if ! have go; then
+  echo "factory-check: go.mod found but the go toolchain is not installed" >&2
+  exit 1
+fi
+
+echo "==> gofmt -l"
+if [ -n "$(gofmt -l .)" ]; then
+  echo "factory-check: these files need gofmt (run: gofmt -w .):" >&2
+  gofmt -l . >&2
+  exit 1
+fi
+
+echo "==> go vet"
+go vet ./...
+
+if have golangci-lint; then
+  echo "==> golangci-lint run"
+  golangci-lint run ./...
+else
+  note "golangci-lint not installed"
+fi
+
+echo "==> go test"
+go test ./... "$@"
+
+echo "FACTORY-CHECK PASSED"

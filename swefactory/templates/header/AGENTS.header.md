@@ -1,7 +1,7 @@
 <!-- factory:header:start -->
 # Factory: how we deliver changes (applies to all work)
 
-> Installed from [pi-factory](https://github.com/mrdankuta/pi-factory) (`factory update` refreshes the shaded block only — stack rules below are yours).
+> Managed by [`factory`](https://github.com/mrdankuta/swefactory) (`factory update` refreshes the shaded block only — stack rules below are yours).
 
 ## Source of truth
 - Product decisions: GitHub issues (epic + spec + ticket issues). The issue is authoritative.
@@ -30,7 +30,6 @@
 ## Handoff
 Report via `factory handoff <ticket-issue>`: ticket + base/head commits, changes made,
 checks run (actual output), acceptance criteria satisfied with evidence, risks and open questions.
-Review runs in a separate Pi process in a Herdr pane — never in-session (recipe in pi-factory `docs/HERDR.md`,
-brief in `.pi/prompts/review.md`) — against the fixed diff with findings posted to the ticket issue.
+Review runs in a separate Pi process in a Herdr pane — never in-session (recipe + brief in `.pi/prompts/review.md`) — against the fixed diff with findings posted to the ticket issue.
 Only the human moves a ticket to accepted/landed.
 <!-- factory:header:end -->

@@ -65,6 +65,13 @@ pub enum Commands {
         /// Install skills to $HOME/.agents/skills instead of the project.
         #[arg(long)]
         global_skills: bool,
+        /// Guided setup: ask at most stack and skills location via
+        /// numbered stdin choices (default: the detected stack). Engages
+        /// automatically on ambiguous detection when stdin is an
+        /// interactive terminal. Never prompts with --json or when stdin
+        /// is piped/non-terminal, so scripts and CI can never hang.
+        #[arg(long)]
+        interactive: bool,
     },
     /// Refresh prompts/skills/checks in place (idempotent, never clobbers).
     Update {
@@ -3535,6 +3542,12 @@ const ADAPTER_RUST: &str = include_str!("../templates/check-adapters/rust");
 const ADAPTER_ELIXIR: &str = include_str!("../templates/check-adapters/elixir");
 const ADAPTER_NODE: &str = include_str!("../templates/check-adapters/node");
 const ADAPTER_PYTHON: &str = include_str!("../templates/check-adapters/python");
+const ADAPTER_GO: &str = include_str!("../templates/check-adapters/go");
+const ADAPTER_RUBY: &str = include_str!("../templates/check-adapters/ruby");
+const ADAPTER_PHP: &str = include_str!("../templates/check-adapters/php");
+const ADAPTER_JAVA: &str = include_str!("../templates/check-adapters/java");
+const ADAPTER_DOTNET: &str = include_str!("../templates/check-adapters/dotnet");
+const ADAPTER_SWIFT: &str = include_str!("../templates/check-adapters/swift");
 
 const AGENTS_HEADER: &str = include_str!("../templates/header/AGENTS.header.md");
 const GLOSSARY: &str = include_str!("../templates/glossary/GLOSSARY.md");
@@ -3628,6 +3641,12 @@ fn adapter_for(stack: &str) -> Option<&'static str> {
         "elixir" => Some(ADAPTER_ELIXIR),
         "node" => Some(ADAPTER_NODE),
         "python" => Some(ADAPTER_PYTHON),
+        "go" => Some(ADAPTER_GO),
+        "ruby" => Some(ADAPTER_RUBY),
+        "php" => Some(ADAPTER_PHP),
+        "java" => Some(ADAPTER_JAVA),
+        "dotnet" => Some(ADAPTER_DOTNET),
+        "swift" => Some(ADAPTER_SWIFT),
         _ => None,
     }
 }
@@ -3924,6 +3943,12 @@ fn detect_stack(dest: &Path) -> String {
         ("elixir", ADAPTER_ELIXIR),
         ("node", ADAPTER_NODE),
         ("python", ADAPTER_PYTHON),
+        ("go", ADAPTER_GO),
+        ("ruby", ADAPTER_RUBY),
+        ("php", ADAPTER_PHP),
+        ("java", ADAPTER_JAVA),
+        ("dotnet", ADAPTER_DOTNET),
+        ("swift", ADAPTER_SWIFT),
     ] {
         if body == adapter {
             return name.to_string();
@@ -4199,23 +4224,129 @@ fn seed_project_local(
     ins.finish_dirs_and_markers();
 }
 
+// --- bounded guided mode (ticket #49, spec #45) ----------------------------
+//
+// `factory init --interactive` asks at most two numbered stdin questions
+// (stack, skills location) with plain text and no new dependencies. It
+// also engages automatically when detection found several stacks and
+// stdin is an interactive terminal. Machine-readable mode (--json) and
+// piped/non-terminal stdin never prompt and never block: the gate below
+// refuses before any read, so scripts and CI cannot hang. Each question
+// reads exactly one line with no retry loop; empty, invalid, or EOF
+// input falls back to the default (the detection winner for stacks).
+
+/// Stack choices in detection-precedence order plus the generic fallback.
+/// Stable: tests address options by number (node is 9, generic is 11).
+const INTERACTIVE_STACKS: &[&str] = &[
+    "rust", "go", "elixir", "ruby", "java", "php", "dotnet", "swift", "node", "python", "generic",
+];
+
+/// Skills-location choices: index 0 is project-local, index 1 is global.
+/// The default index follows the `--global-skills` flag.
+const INTERACTIVE_SKILLS: &[&str] = &["project (.agents/skills)", "global (~/.agents/skills)"];
+
+/// Parse one choice line into a 0-based option index. Empty, unparseable,
+/// or out-of-range input falls back to `default_idx` — prompting never
+/// retries, so a question is always exactly one read and one answer.
+fn parse_choice_line(line: &str, n_options: usize, default_idx: usize) -> usize {
+    let t = line.trim();
+    if t.is_empty() {
+        return default_idx;
+    }
+    match t.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= n_options => n - 1,
+        _ => default_idx,
+    }
+}
+
+/// True when stdin may be prompted: a real terminal, or the test-only
+/// `FACTORY_FORCE_TTY` seam (piped-stdin tests use it to simulate a
+/// terminal; the single `read_line` still returns immediately on EOF, so
+/// even forced runs can never hang waiting for an answer).
+fn stdin_is_interactive() -> bool {
+    if std::env::var_os("FACTORY_FORCE_TTY").is_some() {
+        return true;
+    }
+    std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
+
+/// Ask one numbered question on stderr, reading exactly one stdin line.
+/// Returns the 0-based index of the chosen option (`default_idx` on
+/// empty/invalid/EOF). Prompts go to stderr so stdout stays clean for
+/// automation; callers gate on `!json && stdin_is_interactive()` first.
+fn prompt_numbered(title: &str, options: &[&str], default_idx: usize) -> usize {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{title}");
+    for (i, opt) in options.iter().enumerate() {
+        let marker = if i == default_idx { " (default)" } else { "" };
+        let _ = writeln!(err, "  {}) {opt}{marker}", i + 1);
+    }
+    let _ = write!(err, "Enter a number [{}]: ", default_idx + 1);
+    let _ = err.flush();
+    drop(err);
+    let mut line = String::new();
+    match std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line) {
+        Ok(_) => parse_choice_line(&line, options.len(), default_idx),
+        Err(_) => default_idx,
+    }
+}
+
 pub fn run_init(
     json: bool,
     stack: Option<&str>,
-    global_skills: bool,
+    mut global_skills: bool,
     pin: Option<&str>,
     cmd: &str,
+    interactive: bool,
 ) -> InitOutput {
     let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // No explicit stack: detect from the project and report the evidence.
     // Explicit `--stack` (even unknown) always wins over detection.
-    let (stack_owned, detected): (String, Option<DetectedStack>) = match stack {
+    let (mut stack_owned, detected): (String, Option<DetectedStack>) = match stack {
         Some(s) => (s.to_string(), None),
         None => {
             let d = detect_project_stack(&dest);
             (d.stack.clone(), Some(d))
         }
     };
+    // --- bounded guided mode (ticket #49): resolve at most two answers ---
+    // Init only, never under --json or piped stdin (the gate refuses
+    // before any read, so scripts and CI cannot hang). The stack question
+    // runs when flagged, or automatically when detection found several
+    // stacks — ambiguity is surfaced, never guessed silently. The skills
+    // question runs only when flagged. Explicit `--stack` always wins.
+    let mut asked_stack = false;
+    let mut asked_skills = false;
+    if cmd == "init" && !json && stdin_is_interactive() {
+        let ambiguous = detected
+            .as_ref()
+            .map(|d| d.markers.len() > 1)
+            .unwrap_or(false);
+        if stack.is_none() && (interactive || ambiguous) {
+            let winner = detected
+                .as_ref()
+                .map(|d| d.stack.as_str())
+                .unwrap_or("generic");
+            let default_idx = INTERACTIVE_STACKS
+                .iter()
+                .position(|s| *s == winner)
+                .unwrap_or(INTERACTIVE_STACKS.len() - 1);
+            let idx = prompt_numbered("Select a stack", INTERACTIVE_STACKS, default_idx);
+            asked_stack = true;
+            stack_owned = INTERACTIVE_STACKS[idx].to_string();
+        }
+        if interactive {
+            let default_idx = if global_skills { 1 } else { 0 };
+            let idx = prompt_numbered(
+                "Where should skills be installed?",
+                INTERACTIVE_SKILLS,
+                default_idx,
+            );
+            asked_skills = true;
+            global_skills = idx == 1;
+        }
+    }
     let stack: &str = &stack_owned;
     let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut ins = Installer {
@@ -4272,6 +4403,22 @@ pub fn run_init(
                 );
             }
         }
+    }
+
+    // Guided answers are reported only when a question was actually asked,
+    // so unflagged non-interactive output stays byte-for-byte unchanged.
+    if asked_stack {
+        ins.say(&format!("selected stack: {stack}"));
+    }
+    if asked_skills {
+        ins.say(&format!(
+            "skills location: {}",
+            if global_skills {
+                "global (~/.agents/skills)"
+            } else {
+                "project (.agents/skills)"
+            }
+        ));
     }
 
     // --- labels (best effort via gh) ---
@@ -8320,8 +8467,16 @@ pub fn run() -> i32 {
         Commands::Init {
             stack,
             global_skills,
+            interactive,
         } => {
-            let out = run_init(cli.json, stack.as_deref(), global_skills, None, "init");
+            let out = run_init(
+                cli.json,
+                stack.as_deref(),
+                global_skills,
+                None,
+                "init",
+                interactive,
+            );
             if cli.json {
                 println!(
                     "{}",
@@ -8336,7 +8491,14 @@ pub fn run() -> i32 {
             // seeding never overwrites, so it is a no-op when in place.
             let dest = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let stack = detect_stack(&dest);
-            let out = run_init(cli.json, Some(&stack), false, pin.as_deref(), "update");
+            let out = run_init(
+                cli.json,
+                Some(&stack),
+                false,
+                pin.as_deref(),
+                "update",
+                false,
+            );
             if cli.json {
                 println!(
                     "{}",
@@ -9278,5 +9440,33 @@ pub fn cmd_verify_freeze(json: bool, issue_raw: &str) -> i32 {
             )
         );
         1
+    }
+}
+
+#[cfg(test)]
+mod guided_tests {
+    use super::parse_choice_line;
+
+    #[test]
+    fn empty_line_keeps_default() {
+        assert_eq!(parse_choice_line("", 11, 8), 8);
+        assert_eq!(parse_choice_line("\n", 11, 8), 8);
+        assert_eq!(parse_choice_line("   \n", 11, 0), 0);
+    }
+
+    #[test]
+    fn valid_number_selects_one_based() {
+        assert_eq!(parse_choice_line("1\n", 11, 8), 0);
+        assert_eq!(parse_choice_line("9", 11, 8), 8);
+        assert_eq!(parse_choice_line("11\n", 11, 8), 10);
+    }
+
+    #[test]
+    fn out_of_range_and_garbage_fall_back_to_default() {
+        assert_eq!(parse_choice_line("0\n", 11, 8), 8);
+        assert_eq!(parse_choice_line("12\n", 11, 8), 8);
+        assert_eq!(parse_choice_line("99\n", 11, 8), 8);
+        assert_eq!(parse_choice_line("rust\n", 11, 8), 8);
+        assert_eq!(parse_choice_line("-1\n", 11, 8), 8);
     }
 }

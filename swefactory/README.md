@@ -54,7 +54,7 @@ factory sync 6             # write factory/.cache/SPEC-6.md, verify vs freeze
 factory verify-freeze 6    # exit 0 iff body still matches the freeze;
                            # else exit 1 with a diff of what changed
 
-factory init [--stack rust|elixir|node|python] [--global-skills]
+factory init [--stack rust|elixir|node|python|go|ruby|php|java|dotnet|swift] [--global-skills]
                          # seed prompts, skills, check adapter, issue
                          # templates, and labels into the current project
 factory update [--pin vX.Y.Z]
@@ -78,12 +78,30 @@ untouched), so re-running `init`/`update` is a no-op when in place.
 | `elixir`  | `mix format --check` → `mix compile --warnings-as-errors` → `mix test` |
 | `node`    | `prettier --check` → `eslint` → `npm test` |
 | `python`  | `ruff format --check` → `ruff check` → `pytest` |
+| `go`      | `gofmt -l` → `go vet` → `go test` (plus `golangci-lint` when installed) |
+| `ruby`    | `rubocop` → `rake test` / `rspec` (skips with reason what the project lacks) |
+| `php`     | `pint` → `phpstan` / `psalm` → `phpunit` (skips with reason what is not installed) |
+| `java`    | `spotless` → `mvn compile` → `mvn test` (Maven) or `spotlessCheck` → `gradle test` (Gradle) |
+| `dotnet`  | `dotnet format` → `dotnet build` → `dotnet test` |
+| `swift`   | `swiftformat --lint` → `swift build` → `swift test` |
 
 Installed into the project: `.pi/prompts/*`, `.agents/skills/*`
 (`--global-skills` targets `~/.agents/skills` instead), the stack's
 check adapter, `.github/ISSUE_TEMPLATE/{spec,ticket}.yml`, the `AGENTS.md`
 header merge, `GLOSSARY.md` + `docs/README.md` skeletons,
 `factory/.cache/`, and `.factory-version`.
+
+## Seed layout contracts
+
+Seeded locations are either **integration contracts** (expected at their
+conventional paths by editors, agents, and hosts — `AGENTS.md`,
+`GLOSSARY.md`, `scripts/factory-check`, `.pi/prompts/*`,
+`.agents/skills/*`, `.github/ISSUE_TEMPLATE/*`, the `docs/` skeleton,
+the `.gitignore` cache entry) or **factory-owned** (`factory/.cache/`,
+`factory/.state/` at runtime, the `.factory-version` marker). The full
+table ships in the seeded `docs/README.md`. Standing rule: all future
+seeds land under the factory-owned directory (`factory/`); nothing
+already seeded moves, and re-seeding never overwrites customized files.
 
 Divergence from bash (documented): the Rust binary *is* `factory`, so no
 `scripts/factory` shim is installed; `update --pin` acknowledges the tag but

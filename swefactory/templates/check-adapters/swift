@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# factory-check (swift) — check adapter for SwiftPM projects.
+# Contract: format check -> lint/compile -> tests; exit non-zero on ANY
+# failure; print FACTORY-CHECK PASSED only on success. Extra args pass
+# through to the test runner. FACTORY_SLOT offsets concurrent state so
+# parallel dispatcher workers never share mutable resources.
+set -euo pipefail
+
+cd "${0%/*}/.."
+
+if [ ! -f Package.swift ]; then
+  echo "factory-check: no Package.swift yet — nothing to check"
+  echo "FACTORY-CHECK PASSED"
+  exit 0
+fi
+
+# Slot isolation: separate temp state per dispatcher worker.
+if [ -n "${FACTORY_SLOT:-}" ]; then
+  export TMPDIR="${TMPDIR:-/tmp}/factory-slot-$FACTORY_SLOT"
+  mkdir -p "$TMPDIR"
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+note() { echo "(skip: $1)"; }
+
+if ! have swift; then
+  echo "factory-check: Package.swift found but the swift toolchain is not installed" >&2
+  exit 1
+fi
+
+echo "==> swiftformat --lint"
+if have swiftformat; then
+  swiftformat --lint .
+else
+  note "swiftformat not installed"
+fi
+
+echo "==> swift build"
+swift build
+
+echo "==> swift test"
+swift test "$@"
+
+echo "FACTORY-CHECK PASSED"

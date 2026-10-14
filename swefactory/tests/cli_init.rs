@@ -599,3 +599,424 @@ fn json_init_carries_detection_evidence() {
         "empty dir must report generic, got: {parsed}"
     );
 }
+
+// --- bounded guided mode (ticket #49, spec #45) -----------------------------
+// Seams: the `factory init` CLI surface only — which adapter lands, which
+// lines are reported, prompt/no-prompt behavior. Never adapter internals.
+// Every test pins stdin (piped ⇒ non-terminal) and arms a timeout, so a
+// regression that blocks on a prompt fails instead of hanging the suite.
+// `FACTORY_FORCE_TTY` simulates a terminal for the prompting tests; the
+// silent tests remove it so ambient env cannot flip them.
+
+#[test]
+fn interactive_piped_input_never_prompts_and_uses_default() {
+    let dir = scratch_dir("guided-piped");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env_remove("FACTORY_FORCE_TTY")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack"),
+        "piped input must never see the stack prompt, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Where should skills"),
+        "piped input must never see the skills prompt, got:\n{stderr}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "detection default (node) must win when piped"
+    );
+}
+
+#[test]
+fn interactive_json_never_prompts() {
+    let dir = scratch_dir("guided-json");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive", "--json"])
+        .write_stdin("1\n1\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must stay pure JSON");
+    assert_eq!(
+        parsed.get("stack").and_then(|s| s.as_str()),
+        Some("node"),
+        "JSON keeps the detected stack, got: {parsed}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack") && !stdout.contains("Select a stack"),
+        "JSON mode must never prompt, stderr was:\n{stderr}"
+    );
+}
+
+#[test]
+fn interactive_flag_selects_stack_by_number() {
+    let dir = scratch_dir("guided-pick");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("1\n1\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Select a stack"),
+        "flagged terminal run must ask the stack question, got:\n{text}"
+    );
+    assert!(
+        text.contains("Where should skills"),
+        "flagged terminal run must ask the skills question, got:\n{text}"
+    );
+    assert!(
+        text.contains("selected stack: rust"),
+        "choice 1 (rust) must be reported, got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("cargo"),
+        "choice 1 must install the rust adapter"
+    );
+}
+
+#[test]
+fn interactive_flag_empty_answer_keeps_detection_winner() {
+    let dir = scratch_dir("guided-default");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("selected stack: node"),
+        "empty answer must keep the detected winner (node), got:\n{text}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "default must install the node adapter"
+    );
+}
+
+#[test]
+fn ambiguous_detection_prompts_without_flag_on_terminal() {
+    let dir = scratch_dir("guided-auto");
+    fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .arg("init")
+        .write_stdin("9\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Select a stack"),
+        "ambiguous detection on a terminal must prompt, stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Where should skills") && !stdout.contains("Where should skills"),
+        "auto mode asks the stack only, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("selected stack: node"),
+        "choice 9 (node) must win over the silent rust guess, got:\n{stdout}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(
+        body.contains("npm"),
+        "chosen stack must install the node adapter"
+    );
+}
+
+#[test]
+fn ambiguous_detection_stays_silent_when_piped() {
+    let dir = scratch_dir("guided-silent");
+    fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env_remove("FACTORY_FORCE_TTY")
+        .timeout(std::time::Duration::from_secs(10))
+        .arg("init")
+        .write_stdin("");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack") && !stdout.contains("Select a stack"),
+        "piped runs must never prompt, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("detected stack: rust (Cargo.toml)"),
+        "precedence winner must be reported as before, got:\n{stdout}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(body.contains("cargo"), "silent run keeps the rust adapter");
+}
+
+#[test]
+fn interactive_skills_choice_global_lands_under_home() {
+    let dir = scratch_dir("guided-skills");
+    let home = scratch_dir("guided-fakehome");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("HOME", &home)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive"])
+        .write_stdin("11\n2\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("skills location: global"),
+        "skills answer must be reported, got:\n{text}"
+    );
+    assert!(
+        home.join(".agents/skills/tdd/SKILL.md").is_file(),
+        "choice 2 must install skills under $HOME"
+    );
+    assert!(
+        !dir.join(".agents/skills").exists(),
+        "project skills dir must stay absent on the global choice"
+    );
+}
+
+#[test]
+fn explicit_stack_skips_prompt_even_on_terminal() {
+    let dir = scratch_dir("guided-explicit");
+    fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir)
+        .env("PATH", &path)
+        .env("FACTORY_FORCE_TTY", "1")
+        .timeout(std::time::Duration::from_secs(10))
+        .args(["init", "--interactive", "--stack", "rust"])
+        .write_stdin("9\n");
+    let output = cmd.output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("Select a stack") && !stdout.contains("Select a stack"),
+        "explicit --stack always wins, no stack question, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let body = fs::read_to_string(dir.join("scripts/factory-check")).unwrap();
+    assert!(body.contains("cargo"), "explicit rust must install rust");
+}
+
+/// Absolute path to a bash interpreter (the seeded adapters are bash
+/// scripts, so `sh -n` would reject their `pipefail` prelude).
+fn bash_bin() -> PathBuf {
+    for p in ["/usr/bin/bash", "/bin/bash"] {
+        if Path::new(p).is_file() {
+            return PathBuf::from(p);
+        }
+    }
+    PathBuf::from("bash")
+}
+
+/// Ticket #50: each of the six new stacks seeds a first-class adapter
+/// mentioning its toolchain's checks (never the generic stub).
+#[test]
+fn six_new_stacks_seed_first_class_adapters() {
+    for (stack, markers) in [
+        ("go", &["gofmt", "go vet", "go test"][..]),
+        ("ruby", &["rubocop", "rspec"][..]),
+        ("php", &["pint", "phpunit"][..]),
+        ("java", &["mvn", "gradle"][..]),
+        ("dotnet", &["dotnet format", "dotnet test"][..]),
+        ("swift", &["swiftformat", "swift test"][..]),
+    ] {
+        let dir = scratch_dir(&format!("first-class-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let body =
+            fs::read_to_string(dir.join("scripts/factory-check")).expect("adapter installed");
+        for m in markers {
+            assert!(body.contains(m), "--stack {stack} adapter must mention {m}");
+        }
+        assert!(
+            !body.contains("no first-class adapter"),
+            "--stack {stack} must seed a first-class adapter, not the generic stub"
+        );
+    }
+}
+
+/// Ticket #50: every new adapter passes a shell syntax check and no-ops
+/// cleanly (exit 0 + success marker) in an empty project with no
+/// toolchains on PATH.
+#[test]
+fn six_new_adapters_pass_syntax_check_and_noop_when_empty() {
+    for stack in ["go", "ruby", "php", "java", "dotnet", "swift"] {
+        let dir = scratch_dir(&format!("noop-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let adapter = dir.join("scripts/factory-check");
+        let status = std::process::Command::new(bash_bin())
+            .arg("-n")
+            .arg(&adapter)
+            .status()
+            .expect("bash -n runs");
+        assert!(
+            status.success(),
+            "--stack {stack} adapter must pass bash -n"
+        );
+        // Empty project, hermetic PATH: the no-op guard must fire before
+        // any toolchain is touched.
+        let out = std::process::Command::new(bash_bin())
+            .arg(&adapter)
+            .current_dir(&dir)
+            .env("PATH", &path)
+            .output()
+            .expect("adapter runs");
+        assert!(
+            out.status.success(),
+            "--stack {stack} adapter must no-op green in an empty project, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("FACTORY-CHECK PASSED"),
+            "--stack {stack} no-op must print the success marker"
+        );
+    }
+}
+
+/// Ticket #50: every new stack is selectable by explicit flag and
+/// round-trips through refresh byte-for-byte.
+#[test]
+fn six_new_adapters_round_trip_through_refresh() {
+    for stack in ["go", "ruby", "php", "java", "dotnet", "swift"] {
+        let dir = scratch_dir(&format!("roundtrip-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let before = fs::read(dir.join("scripts/factory-check")).unwrap();
+
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["update", "--json"]);
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).expect("JSON");
+        assert_eq!(
+            parsed.get("stack").and_then(|s| s.as_str()),
+            Some(stack),
+            "update must report the seeded stack {stack}, got: {parsed}"
+        );
+        assert_eq!(
+            fs::read(dir.join("scripts/factory-check")).unwrap(),
+            before,
+            "update must preserve the {stack} adapter byte-for-byte"
+        );
+    }
+}
+
+/// Ticket #50: the new adapters keep the uniform contract — strict
+/// failure mode, format before lint/compile before test, and the success
+/// marker printed only on the green path.
+#[test]
+fn six_new_adapters_follow_the_uniform_contract() {
+    for stack in ["go", "ruby", "php", "java", "dotnet", "swift"] {
+        let dir = scratch_dir(&format!("contract-{stack}"));
+        let (_bin, path) = empty_path();
+        let mut cmd = Command::cargo_bin("factory").unwrap();
+        cmd.current_dir(&dir)
+            .env("PATH", &path)
+            .args(["init", "--stack", stack]);
+        cmd.assert().success();
+        let body =
+            fs::read_to_string(dir.join("scripts/factory-check")).expect("adapter installed");
+        assert!(
+            body.contains("set -euo pipefail"),
+            "--stack {stack} adapter must fail fast (set -euo pipefail)"
+        );
+        // Format, then lint/compile, then test: stage keywords in order.
+        let fmt = body.find("format").expect("format stage");
+        let lint = body
+            .find("vet")
+            .or_else(|| body.find("lint"))
+            .or_else(|| body.find("compile"))
+            .or_else(|| body.find("build"))
+            .expect("lint/compile stage");
+        let test = body.rfind("==> ").expect("test stage echo");
+        assert!(
+            fmt < lint,
+            "--stack {stack} adapter must run format before lint/compile"
+        );
+        assert!(
+            lint < test,
+            "--stack {stack} adapter must run lint/compile before test"
+        );
+        assert!(
+            body.trim_end().ends_with("echo \"FACTORY-CHECK PASSED\""),
+            "--stack {stack} adapter must print the success marker last (green path only)"
+        );
+    }
+}
