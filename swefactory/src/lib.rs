@@ -4956,10 +4956,26 @@ fn git_bin() -> String {
 }
 
 fn run_gh_output(args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new(gh_bin())
+    let mut out = Command::new(gh_bin())
         .args(args)
         .output()
-        .map_err(|e| format!("failed to run gh {}: {e}", args.join(" ")))
+        .map_err(|e| format!("failed to run gh {}: {e}", args.join(" ")))?;
+    // Version-manager shims (mise) print status lines to stdout, which
+    // corrupts `--json` parsing in every consumer below. Strip them once,
+    // here, so all callers see clean JSON (mirrors the bash dispatcher's
+    // gh() wrapper). Real errors stay on stderr, untouched.
+    out.stdout = strip_gh_noise(&out.stdout);
+    Ok(out)
+}
+
+/// Drop version-manager status lines from gh stdout bytes.
+fn strip_gh_noise(raw: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .filter(|l| !l.starts_with("mise "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }
 
 fn run_git(args: &[&str], cwd: Option<&std::path::Path>) -> Result<std::process::Output, String> {
