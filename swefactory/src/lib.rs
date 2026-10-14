@@ -5050,6 +5050,11 @@ struct DispatchAttempt {
 struct DispatchLedger {
     #[serde(default)]
     attempts: Vec<DispatchAttempt>,
+    /// Answer delivery keys (`<ticket>:<id>:<hash>`) already handed to a
+    /// brief (ticket #44). `#[serde(default)]` keeps pre-answer ledgers
+    /// parsing; single-use depends on this surviving restarts.
+    #[serde(default)]
+    delivered_answers: Vec<String>,
 }
 
 /// Implementer/reviewer seam: shell out only, never an API client.
@@ -5402,6 +5407,215 @@ enum TicketOutcome {
     Skipped,
 }
 
+// --- answer delivery (ticket #44, spec #41) -------------------------------
+//
+// Proof that a Bea reply reaches running work. The loop reads Bea's
+// answers HERE (see the read site in `cmd_dispatch_ticket`, just above the
+// brief composition): structured `Answer[id]` lines in the ticket's issue
+// comments, snapshotted once per attempt and appended to the brief.
+//
+// Locked routing rule (spec #41):
+// - Structured `Answer[id]` (legacy shapes tolerated, broken markers
+//   refused — see `parse_answer_line`).
+// - Atomic boundary: the snapshot happens at brief-composition time. An
+//   answer Bea posts mid-attempt structurally waits for the next attempt
+//   — the running worker never sees it.
+// - Single-use: delivery keys persist in the ledger BEFORE implement runs,
+//   so a crash or retry never redelivers an answer.
+// The same words travel bash-side inside the brief (`ANSWER_ROUTING_RULE`),
+// because the worker is a shell-out subprocess that reads only the brief.
+// If the tooling ever needs a format change, that is an upstream issue —
+// never a local invention.
+
+/// One parsed Bea reply: the question `id` it answers, her `body` words,
+/// and whether it arrived in a `legacy` (pre-structured) shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedAnswer {
+    pub id: String,
+    pub body: String,
+    pub legacy: bool,
+}
+
+/// What one comment line is: a deliverable answer, a broken marker with
+/// the reason it was refused, or chatter the loop must ignore.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnswerLine {
+    Valid(ParsedAnswer),
+    Malformed(String),
+    NotAnAnswer,
+}
+
+fn answer_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Parse one comment line. Structured `Answer[id]: body` (exact-case
+/// marker) is valid; a case-folded marker or the bracket-less
+/// `Answer id: body` shape is valid but flagged legacy; a line that
+/// reaches for the marker and misses (empty/bad id, missing colon, empty
+/// reply) is malformed with the reason; everything else is chatter. Pure.
+pub fn parse_answer_line(line: &str) -> AnswerLine {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return AnswerLine::NotAnAnswer;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let Some(after) = lower.strip_prefix("answer") else {
+        return AnswerLine::NotAnAnswer;
+    };
+    // Byte offset of the marker end; the marker is ASCII so lower and
+    // trimmed share indices. Keep the original case for id/body.
+    let rest = &trimmed["answer".len()..];
+    let marker_exact = trimmed.starts_with("Answer");
+    match after.chars().next() {
+        // `Answer[id]: body` (or case-folded marker → legacy).
+        Some('[') => {
+            let legacy = !marker_exact;
+            let Some(end) = rest.find(']') else {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: missing `]`"
+                ));
+            };
+            let id = rest[1..end].trim();
+            if id.is_empty() {
+                return AnswerLine::Malformed(format!("malformed Answer line {line:?}: empty id"));
+            }
+            if !answer_id_ok(id) {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: id {id:?} must be [A-Za-z0-9_-]+"
+                ));
+            }
+            let after_bracket = rest[end + 1..].trim_start();
+            let Some(body) = after_bracket.strip_prefix(':') else {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: missing `:` after id"
+                ));
+            };
+            let body = body.trim();
+            if body.is_empty() {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: empty reply"
+                ));
+            }
+            AnswerLine::Valid(ParsedAnswer {
+                id: id.to_string(),
+                body: body.to_string(),
+                legacy,
+            })
+        }
+        // Bare `Answer:` / `answer` with nothing after: a missed marker.
+        None | Some(':') => {
+            AnswerLine::Malformed(format!("malformed Answer line {line:?}: missing id"))
+        }
+        // Bracket-less legacy `Answer id: body` (any marker case).
+        Some(c) if c.is_whitespace() => {
+            let tail = rest.trim_start();
+            let token_end = tail.find(|c: char| c.is_whitespace()).unwrap_or(tail.len());
+            let token = &tail[..token_end];
+            let Some(id) = token.strip_suffix(':') else {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: missing `:` after id"
+                ));
+            };
+            if !answer_id_ok(id) {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: id {id:?} must be [A-Za-z0-9_-]+"
+                ));
+            }
+            let body = tail[token_end..].trim();
+            if body.is_empty() {
+                return AnswerLine::Malformed(format!(
+                    "malformed Answer line {line:?}: empty reply"
+                ));
+            }
+            AnswerLine::Valid(ParsedAnswer {
+                id: id.to_string(),
+                body: body.to_string(),
+                legacy: true,
+            })
+        }
+        // `Answers from Bea`, `answering ...`: chatter, not a marker.
+        _ => AnswerLine::NotAnAnswer,
+    }
+}
+
+/// Scan every line of every comment in order. First occurrence per id
+/// wins (one answer per question per snapshot); broken markers accumulate
+/// reasons and deliver nothing. Pure.
+pub fn collect_answers(comments: &[String]) -> (Vec<ParsedAnswer>, Vec<String>) {
+    let mut valid = Vec::new();
+    let mut malformed = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for comment in comments {
+        for line in comment.lines() {
+            match parse_answer_line(line) {
+                AnswerLine::Valid(answer) => {
+                    if seen.insert(answer.id.clone()) {
+                        valid.push(answer);
+                    }
+                }
+                AnswerLine::Malformed(reason) => malformed.push(reason),
+                AnswerLine::NotAnAnswer => {}
+            }
+        }
+    }
+    (valid, malformed)
+}
+
+/// Delivery key for single-use: same id re-answered in new words is a new
+/// key (Bea corrected herself); anything else already handed out waits out.
+/// Pure.
+pub fn answer_delivery_key(ticket: u64, answer: &ParsedAnswer) -> String {
+    let hash = body_hash(&answer.body);
+    format!(
+        "{ticket}:{}:{}",
+        answer.id,
+        hash.chars().take(16).collect::<String>()
+    )
+}
+
+/// Answers not yet handed to any brief for this ticket. Pure.
+pub fn pending_answers(
+    all: &[ParsedAnswer],
+    delivered: &[String],
+    ticket: u64,
+) -> Vec<ParsedAnswer> {
+    all.iter()
+        .filter(|a| !delivered.contains(&answer_delivery_key(ticket, a)))
+        .cloned()
+        .collect()
+}
+
+/// The bash-side pin of the routing rule: injected into every brief that
+/// carries answers, because the worker is a shell-out subprocess that
+/// reads only the brief. If the tooling ever needs a format change, file
+/// an upstream issue — never invent a new format here.
+pub const ANSWER_ROUTING_RULE: &str = "Routing rule (pinned): Bea's replies arrive as structured `Answer[id]` issue comments. The loop snapshots them when composing this brief — anything posted mid-attempt waits for the next attempt (atomic boundary). Each answer is delivered once (single-use): consume it from this brief and never ask for it again. If this rule cannot be followed with the current tooling, stop and report instead of inventing a new format.";
+
+/// The brief section a worker reads: her answers verbatim, then the
+/// pinned rule. Pure over inputs so transcripts, stored briefs, and tests
+/// agree byte-for-byte.
+pub fn render_answers_section(answers: &[ParsedAnswer]) -> String {
+    let mut out = String::from("## Answers from Bea\n\n");
+    for answer in answers {
+        if answer.legacy {
+            out.push_str(&format!(
+                "- {}: {} (legacy format)\n",
+                answer.id, answer.body
+            ));
+        } else {
+            out.push_str(&format!("- {}: {}\n", answer.id, answer.body));
+        }
+    }
+    out.push('\n');
+    out.push_str(ANSWER_ROUTING_RULE);
+    out.push('\n');
+    out
+}
+
 fn finish_attempt(
     state: &std::path::Path,
     ledger: &mut DispatchLedger,
@@ -5430,7 +5644,7 @@ fn cmd_dispatch_ticket(
         "view",
         &ticket.to_string(),
         "--json",
-        "number,title,body,labels,state",
+        "number,title,body,labels,state,comments",
     ]) {
         Ok(t) => t,
         Err(e) => {
@@ -5644,7 +5858,44 @@ fn cmd_dispatch_ticket(
     let spec_label = spec
         .map(|s| s.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {branch} (base {base})\n\n{body}\n");
+    // Answer delivery (ticket #44, spec #41): the loop reads Bea's routing
+    // rule HERE. Structured `Answer[id]` lines in the ticket's issue
+    // comments snapshot once, now, into this brief: anything she posts
+    // mid-attempt structurally waits for the next attempt (atomic
+    // boundary). Delivered keys persist in the ledger BEFORE implement
+    // runs, so a crash or retry never redelivers an answer (single-use).
+    // The same words travel bash-side inside the brief
+    // (`ANSWER_ROUTING_RULE`), because the worker is a shell-out
+    // subprocess that reads only the brief.
+    let mut brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {branch} (base {base})\n\n{body}\n");
+    {
+        let comment_bodies: Vec<String> = view
+            .get("comments")
+            .and_then(|c| c.as_array())
+            .map(|comments| {
+                comments
+                    .iter()
+                    .filter_map(|c| c.get("body").and_then(|b| b.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (found, _) = collect_answers(&comment_bodies);
+        let pending = pending_answers(&found, &ledger.delivered_answers, ticket);
+        if !pending.is_empty() {
+            brief.push('\n');
+            brief.push_str(&render_answers_section(&pending));
+            for answer in &pending {
+                let key = answer_delivery_key(ticket, answer);
+                if !ledger.delivered_answers.contains(&key) {
+                    ledger.delivered_answers.push(key);
+                }
+            }
+            if let Err(e) = save_ledger(state, ledger) {
+                eprintln!("dispatch: {e}");
+            }
+        }
+    }
     let _ = std::fs::write(wt.join(".factory-brief.md"), &brief);
     let build_prompt = PathBuf::from(".pi/prompts/build.md");
     if build_prompt.is_file() {
