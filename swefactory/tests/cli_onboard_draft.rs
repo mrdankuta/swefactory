@@ -327,6 +327,150 @@ fn change_then_approve_freezes_v2() {
 }
 
 #[test]
+fn pending_draft_rerun_without_idea_preserves_seed_and_still_requires_decision() {
+    let h = setup("resume-no-idea");
+    onboard_cmd(
+        &h,
+        &["onboard", "--plain", "--new", "bea-resume", "--idea", IDEA],
+    )
+    .assert()
+    .failure();
+
+    let v1_before = fs::read(h.state.join("onboard-draft-v1.md")).unwrap();
+    let seed_before = fs::read(h.work.join("bea-resume/IDEA.md")).unwrap();
+    assert_eq!(seed_before, IDEA.as_bytes());
+
+    onboard_cmd(&h, &["onboard", "--plain", "--new", "bea-resume"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("review draft v1"))
+        .stderr(predicates::str::contains("--approve"));
+
+    let state = onboard_state(&h);
+    assert_eq!(state["idea"], IDEA);
+    assert_eq!(state["draft_version"], 1);
+    assert_eq!(state["approved_version"], 0);
+    assert_eq!(state["changes"], serde_json::json!([]));
+    assert_eq!(
+        fs::read(h.state.join("onboard-draft-v1.md")).unwrap(),
+        v1_before
+    );
+    assert_eq!(
+        fs::read(h.work.join("bea-resume/IDEA.md")).unwrap(),
+        seed_before
+    );
+    assert!(!h.state.join("onboard-draft-v2.md").exists());
+}
+
+#[test]
+fn approved_plan_ignores_later_idea_restatement() {
+    let h = setup("approved-restatement");
+    onboard_cmd(
+        &h,
+        &["onboard", "--plain", "--new", "bea-frozen", "--idea", IDEA],
+    )
+    .assert()
+    .failure();
+    onboard_cmd(
+        &h,
+        &[
+            "onboard",
+            "--plain",
+            "--new",
+            "bea-frozen",
+            "--idea",
+            IDEA,
+            "--approve",
+        ],
+    )
+    .assert()
+    .success();
+
+    let state_before = onboard_state(&h);
+    let v1_before = fs::read(h.state.join("onboard-draft-v1.md")).unwrap();
+    let seed_before = fs::read(h.work.join("bea-frozen/IDEA.md")).unwrap();
+    let new_idea = "I changed my mind entirely about everything.";
+    onboard_cmd(
+        &h,
+        &[
+            "onboard",
+            "--plain",
+            "--new",
+            "bea-frozen",
+            "--idea",
+            new_idea,
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(predicates::str::contains("already approved"));
+
+    assert_eq!(onboard_state(&h), state_before);
+    assert_eq!(
+        fs::read(h.state.join("onboard-draft-v1.md")).unwrap(),
+        v1_before
+    );
+    assert_eq!(
+        fs::read(h.work.join("bea-frozen/IDEA.md")).unwrap(),
+        seed_before
+    );
+    assert!(!v1_before
+        .windows(new_idea.len())
+        .any(|window| window == new_idea.as_bytes()));
+}
+
+#[test]
+fn cli_change_after_approval_is_refused_without_new_version() {
+    let h = setup("change-after-approval");
+    onboard_cmd(
+        &h,
+        &["onboard", "--plain", "--new", "bea-locked", "--idea", IDEA],
+    )
+    .assert()
+    .failure();
+    onboard_cmd(
+        &h,
+        &[
+            "onboard",
+            "--plain",
+            "--new",
+            "bea-locked",
+            "--idea",
+            IDEA,
+            "--approve",
+        ],
+    )
+    .assert()
+    .success();
+
+    let state_before = onboard_state(&h);
+    let v1_before = fs::read(h.state.join("onboard-draft-v1.md")).unwrap();
+    onboard_cmd(
+        &h,
+        &[
+            "onboard",
+            "--plain",
+            "--new",
+            "bea-locked",
+            "--idea",
+            IDEA,
+            "--change",
+            "A post-approval change",
+        ],
+    )
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("already approved"));
+
+    assert_eq!(onboard_state(&h), state_before);
+    assert_eq!(
+        fs::read(h.state.join("onboard-draft-v1.md")).unwrap(),
+        v1_before
+    );
+    assert!(!h.state.join("onboard-draft-v2.md").exists());
+}
+
+#[test]
 fn default_path_without_approve_or_change_keeps_backbone_ready() {
     // No --idea: the T42 backbone contract — ready without a decision.
     let h = setup("legacy");

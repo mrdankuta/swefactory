@@ -196,13 +196,60 @@ fn ui_change_and_approve_round_trip_the_same_files_as_plain() {
 }
 
 #[test]
-fn handlers_serve_the_onboard_screen_through_the_router_code_path() {
+fn approved_draft_refuses_change_and_reapprove_preserves_freeze() {
     let _guard = env_lock();
-    let root = tmpdir("handlers");
+    let root = tmpdir("approved-lock");
+    let state = root.join("state");
     seed_state(&root, &draft_fixture());
     // SAFETY: static lock held; no other test in this binary touches env.
     unsafe {
-        std::env::set_var("FACTORY_STATE_DIR", root.join("state"));
+        std::env::set_var("FACTORY_STATE_DIR", &state);
+    }
+
+    let (approved_version, approved_hash) = onboard_apply_approve().expect("first approval");
+    assert_eq!(approved_version, 1);
+    let before = fs::read_to_string(state.join("onboard.json")).unwrap();
+    let v1_before = fs::read(state.join("onboard-draft-v1.md")).unwrap();
+
+    let err = onboard_apply_change("change after approval").unwrap_err();
+    assert!(err.contains("already approved"), "plain refusal: {err}");
+    assert_eq!(
+        fs::read_to_string(state.join("onboard.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(state.join("onboard-draft-v1.md")).unwrap(),
+        v1_before
+    );
+    assert!(!state.join("onboard-draft-v2.md").exists());
+
+    assert_eq!(
+        onboard_apply_approve().expect("repeat approval is idempotent"),
+        (approved_version, approved_hash)
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("onboard.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(state.join("onboard-draft-v1.md")).unwrap(),
+        v1_before
+    );
+
+    unsafe {
+        std::env::remove_var("FACTORY_STATE_DIR");
+    }
+}
+
+#[test]
+fn handlers_serve_the_onboard_screen_through_the_router_code_path() {
+    let _guard = env_lock();
+    let root = tmpdir("handlers");
+    let state = root.join("state");
+    seed_state(&root, &draft_fixture());
+    // SAFETY: static lock held; no other test in this binary touches env.
+    unsafe {
+        std::env::set_var("FACTORY_STATE_DIR", &state);
     }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -242,6 +289,26 @@ fn handlers_serve_the_onboard_screen_through_the_router_code_path() {
     assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
     let current = onboard_current_draft().expect("approve handler freezes the draft");
     assert_eq!(current.approved_version, 2);
+    let v2_before = fs::read(state.join("onboard-draft-v2.md")).unwrap();
+
+    // Direct POSTs remain harmless after approval even though the UI hides
+    // the forms: the shared applier enforces the freeze, not presentation.
+    let resp = rt.block_on(onboard_change_handler(axum::Form(OnboardChangeForm {
+        change: "post-approval change must be refused".to_string(),
+    })));
+    let (status, _) = rt.block_on(response_body_text(resp.into_response()));
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(onboard_current_draft().as_ref(), Some(&current));
+    assert_eq!(
+        fs::read(state.join("onboard-draft-v2.md")).unwrap(),
+        v2_before
+    );
+    assert!(!state.join("onboard-draft-v3.md").exists());
+
+    let resp = rt.block_on(factory_lib::onboard_approve_handler());
+    let (status, _) = rt.block_on(response_body_text(resp.into_response()));
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(onboard_current_draft().as_ref(), Some(&current));
 
     unsafe {
         std::env::remove_var("FACTORY_STATE_DIR");

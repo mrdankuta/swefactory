@@ -2879,8 +2879,19 @@ fn onboard_step_repo(
         opts.visibility.clone(),
         "FACTORY_ONBOARD_VISIBILITY",
     ))?;
-    let idea = onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
-        .unwrap_or_else(|| onboard_default_idea().to_string());
+    let requested_idea = onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
+        .filter(|idea| !idea.trim().is_empty());
+    // A rerun continues from the stored words. Once approved, even an
+    // explicit replacement is ignored so the seed and frozen draft agree.
+    let idea = if progress.approved_version > 0 && !progress.idea.is_empty() {
+        progress.idea.clone()
+    } else if let Some(idea) = requested_idea {
+        idea
+    } else if !progress.idea.is_empty() {
+        progress.idea.clone()
+    } else {
+        onboard_default_idea().to_string()
+    };
 
     if let Some(name) = pick {
         let name = name.trim().to_string();
@@ -3066,20 +3077,38 @@ fn onboard_step_idea(
     opts: &OnboardOpts,
 ) -> Result<&'static str, String> {
     println!("[onboard:idea] Capturing your idea in your own words.");
-    let idea = onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
-        .unwrap_or_else(|| onboard_default_idea().to_string());
-    let restated = progress.draft_version > 0
-        && progress.approved_version == 0
-        && !progress.idea.is_empty()
-        && progress.idea != idea;
-    progress.idea = idea.clone();
-    if restated {
-        progress
-            .changes
-            .push(format!("Restated idea: {}", idea.trim()));
-        progress.draft_version += 1;
-        let state = dispatch_state_dir();
-        onboard_write_draft(&state, progress)?;
+    let supplied_idea = onboard_choice(opts.idea.clone(), "FACTORY_ONBOARD_IDEA")
+        .filter(|idea| !idea.trim().is_empty());
+    if progress.approved_version > 0 {
+        if supplied_idea
+            .as_ref()
+            .is_some_and(|idea| idea != &progress.idea)
+        {
+            println!(
+                "[onboard:idea] This plan is already approved and frozen — keeping the approved idea."
+            );
+        }
+    } else {
+        // Absence of --idea on a resume means keep Bea's stored words; it
+        // is not a restatement with the default idea.
+        let idea = supplied_idea.unwrap_or_else(|| {
+            if progress.idea.is_empty() {
+                onboard_default_idea().to_string()
+            } else {
+                progress.idea.clone()
+            }
+        });
+        let restated =
+            progress.draft_version > 0 && !progress.idea.is_empty() && progress.idea != idea;
+        progress.idea = idea.clone();
+        if restated {
+            progress
+                .changes
+                .push(format!("Restated idea: {}", idea.trim()));
+            progress.draft_version += 1;
+            let state = dispatch_state_dir();
+            onboard_write_draft(&state, progress)?;
+        }
     }
     onboard_note_step(progress, "idea");
     if let Err(e) = onboard_save(&dispatch_state_dir(), progress) {
@@ -3163,6 +3192,12 @@ pub fn onboard_apply_change(feedback: &str) -> Result<u64, String> {
     }
     let state = dispatch_state_dir();
     let mut progress = onboard_load(&state);
+    if progress.approved_version > 0 {
+        return Err(format!(
+            "factory onboard: plan v{} is already approved and frozen — changes are not applied after approval.",
+            progress.approved_version
+        ));
+    }
     if progress.draft_version == 0 {
         return Err(
             "factory onboard: no draft to change yet — start one: factory onboard --idea TEXT"
@@ -3183,6 +3218,11 @@ pub fn onboard_apply_change(feedback: &str) -> Result<u64, String> {
 pub fn onboard_apply_approve() -> Result<(u64, String), String> {
     let state = dispatch_state_dir();
     let mut progress = onboard_load(&state);
+    if progress.approved_version > 0 {
+        // Approval freezes an immutable version. Repeated approvals are a
+        // no-op and must never hash a newer, unapproved draft.
+        return Ok((progress.approved_version, progress.draft_hash));
+    }
     if progress.draft_version == 0 {
         return Err(
             "factory onboard: no draft to approve yet — start one: factory onboard --idea TEXT"
@@ -3207,8 +3247,19 @@ pub fn onboard_apply_approve() -> Result<(u64, String), String> {
 fn onboard_step_approve(
     progress: &mut OnboardState,
     opts: &OnboardOpts,
+    pending_draft_on_entry: bool,
 ) -> Result<&'static str, String> {
     if progress.approved_version > 0 {
+        if let Some(feedback) = onboard_choice(opts.change.clone(), "FACTORY_ONBOARD_CHANGE") {
+            onboard_apply_change(&feedback).map_err(|e| e.to_string())?;
+        }
+        if onboard_wants_approve(opts) {
+            let (version, hash) = onboard_apply_approve().map_err(|e| e.to_string())?;
+            println!(
+                "[onboard:approve] Plan v{version} is already approved and frozen ({}).",
+                hash.chars().take(12).collect::<String>()
+            );
+        }
         return Ok("ready");
     }
     if let Some(feedback) = onboard_choice(opts.change.clone(), "FACTORY_ONBOARD_CHANGE") {
@@ -3219,7 +3270,7 @@ fn onboard_step_approve(
         println!("[onboard:draft] Draft v{version} \u{2014} with your change:");
         println!("{body}");
         return Err(format!(
-            "factory onboard: draft v{version} is ready to review \u{2014} approve it: factory onboard --approve \u{2014} or change it again: factory onboard --change TEXT"
+            "factory onboard: draft v{version} is ready to review — rerun with the same repo and idea using `factory onboard --new NAME --idea TEXT --approve` (or `--change TEXT`); for an existing repo, use `--repo OWNER/NAME` instead of `--new NAME`."
         ));
     }
     if onboard_wants_approve(opts) {
@@ -3231,7 +3282,7 @@ fn onboard_step_approve(
         );
         return Ok("ready");
     }
-    if onboard_explicit_idea(opts) {
+    if onboard_explicit_idea(opts) || pending_draft_on_entry {
         let body = std::fs::read_to_string(onboard_draft_path(
             &dispatch_state_dir(),
             progress.draft_version,
@@ -3243,7 +3294,7 @@ fn onboard_step_approve(
         );
         println!("{body}");
         return Err(format!(
-            "factory onboard: review draft v{} above \u{2014} approve it: factory onboard --approve \u{2014} or change something: factory onboard --change TEXT",
+            "factory onboard: review draft v{} above — rerun with the same repo and idea using `factory onboard --new NAME --idea TEXT --approve` (or `--change TEXT`); for an existing repo, use `--repo OWNER/NAME` instead of `--new NAME`.",
             progress.draft_version
         ));
     }
@@ -3388,6 +3439,13 @@ pub async fn onboard_change_handler(
 pub fn cmd_onboard(json: bool, opts: OnboardOpts) -> i32 {
     let state = dispatch_state_dir();
     let mut progress = onboard_load(&state);
+    // Remember that this invocation is resuming an unapproved draft. The
+    // legacy no-idea first run still reaches ready; a later resume cannot
+    // bypass the decision merely because --idea was omitted.
+    let pending_draft_on_entry = progress.draft_version > 0
+        && progress.approved_version == 0
+        && progress.steps.iter().any(|step| step == "draft")
+        && !progress.steps.iter().any(|step| step == "ready");
     if opts.plain {
         println!("[onboard] Plain mode: every step in plain words, no visuals.");
     }
@@ -3400,7 +3458,7 @@ pub fn cmd_onboard(json: bool, opts: OnboardOpts) -> i32 {
             "repo" => onboard_step_repo(&mut progress, &opts),
             "idea" => onboard_step_idea(&mut progress, &opts),
             "draft" => onboard_step_draft(&mut progress),
-            "approve" => onboard_step_approve(&mut progress, &opts),
+            "approve" => onboard_step_approve(&mut progress, &opts, pending_draft_on_entry),
             "ready" => break,
             other => {
                 return fail_onboard(json, &format!("factory onboard: unknown step {other:?}"))
