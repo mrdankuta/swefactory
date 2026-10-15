@@ -5,6 +5,15 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+### 0.1.0-rc.6 — styled board + outcome metrics (spec #56, tickets #57–#58)
+
+- Board and all nine page shells restyled in the kanban design language
+  (embedded hermetic stylesheet, Trello-style lanes, status accents,
+  dark transcripts); prototype variants B/C discarded after review.
+- Outcome metrics dashboard (query-only, reconcile-shaped): per-ticket
+  cycle time, attempt minutes, and a caveated autonomy verdict — no new
+  instrumentation, dual-audience figures for CLI now and cards later.
+
 ### 0.1.0-rc.5 — init learns the project (spec #45, tickets #46–#50)
 
 - `factory init` auto-detects the project stack from manifest files

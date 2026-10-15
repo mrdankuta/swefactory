@@ -1,6 +1,6 @@
 [package]
 name = "factory"
-version = "0.1.0-rc.5"
+version = "0.1.0-rc.6"
 edition = "2021"
 description = "swefactory — the software factory as a product (single static binary)"
 license = "MIT"
