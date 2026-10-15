@@ -4,10 +4,10 @@
 //! arg once rendered CSS inside `<title>`).
 
 use factory_lib::{
-    BoardCard, BoardColumn, DispatcherData, GitData, TrainReviewData, board_page_html,
-    dispatcher_page_html, files_page_html, git_page_html, onboard_page_html,
+    board_page_html, dispatcher_page_html, files_page_html, git_page_html, onboard_page_html,
     ticket_detail_page_html, ticket_missing_page_html, train_landed_page_html,
-    train_review_page_html, TicketDetail,
+    train_review_page_html, BoardCard, BoardColumn, DispatcherData, GitData, TicketDetail,
+    TrainReviewData,
 };
 
 fn assert_site_shell(name: &str, page: &str) {
