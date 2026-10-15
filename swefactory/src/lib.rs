@@ -5344,6 +5344,182 @@ pub fn cmd_reconcile(json: bool) -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// OUTCOME FIGURES (ticket #57, spec #56)
+//
+// One pure computation seam: assembled loop history in, per-ticket figures
+// out. All fetching stays behind the read paths the reconcile view already
+// uses; this section performs no network, filesystem, or tracker calls —
+// it observes only its argument. Cycle time is issue creation (signal) to
+// the landing merge; attempt minutes are per-attempt finish-minus-start.
+// Tickets not yet landed yield blanks (None) for landed figures, never
+// guesses; attempts with missing timestamps yield blanks for minutes.
+// Cost is explicitly absent: `OUTCOME_COST_TEXT` states it plainly, never
+// zero-filled, until the session-id join lands as separate instrumentation.
+// ---------------------------------------------------------------------------
+
+/// Caveat that ships in the output copy with every autonomy verdict:
+/// manual work outside the loop is invisible to the rule.
+/// Single source: the rule and its caveat change together or not at all.
+pub const OUTCOME_AUTONOMY_CAVEAT: &str = "manual work outside the loop is invisible to the rule";
+
+/// Plain statement carried where a cost figure would go. Spend tracking
+/// needs the session-id join (separate, later instrumentation decision),
+/// so cost is reported as not-yet-wired, never zero.
+pub const OUTCOME_COST_TEXT: &str = "spend tracking not yet wired";
+
+/// A timeline signal reduced to what the autonomy rule observes.
+/// Assembled by the caller from issue timeline events; the computation
+/// never fetches them itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutcomeSignal {
+    Clarification,
+    Blocked,
+    Other,
+}
+
+/// One dispatch attempt row, assembled by the caller from the ledger.
+/// `None` timestamps mean the log has rotated or was never written:
+/// minutes read as blank, never interpolated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeAttemptInput {
+    pub attempt_no: u64,
+    pub started_epoch_secs: Option<i64>,
+    pub finished_epoch_secs: Option<i64>,
+    /// First-review accept for this attempt, sourced from the persisted
+    /// logs and issue-posted reports (never ephemeral temp files).
+    pub review_accepted: bool,
+}
+
+/// Assembled loop history for one ticket: attempt rows, timeline signals,
+/// and merge dates. Plain data in, figures out — no I/O inside.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeHistoryInput {
+    pub ticket: u64,
+    /// Issue creation: the signal end of the signal-to-production span.
+    pub signal_epoch_secs: i64,
+    /// Landing merge: `None` while the ticket has not landed yet.
+    pub landed_epoch_secs: Option<i64>,
+    pub attempts: Vec<OutcomeAttemptInput>,
+    /// Timeline events reduced to rule-observed signals.
+    pub signals: Vec<OutcomeSignal>,
+}
+
+/// Per-attempt machine minutes. `None` means the attempt's logs are
+/// missing — a gap, not a zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeAttemptMinutes {
+    pub attempt_no: u64,
+    pub minutes: Option<f64>,
+}
+
+/// Per-ticket outcome figures. `None` fields are blanks for unlanded or
+/// unlogged history, never guesses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeFigures {
+    pub ticket: u64,
+    /// Signal-to-production cycle time in days. Blank until landed.
+    pub cycle_days: Option<f64>,
+    pub attempt_minutes: Vec<OutcomeAttemptMinutes>,
+    /// Sum of per-attempt minutes. Blank when any attempt's logs are
+    /// missing — a partial sum would read as a confident total.
+    pub total_attempt_minutes: Option<f64>,
+    pub autonomous: bool,
+    pub autonomy_verdict: &'static str,
+    pub autonomy_caveat: &'static str,
+    pub cost_text: &'static str,
+}
+
+/// The single named autonomy predicate (spec #56): one attempt,
+/// first-review accept, no clarification or blocked signals. Landing is
+/// deliberately not part of the rule: unlanded tickets blank their landed
+/// figures while the verdict still follows this predicate exactly.
+/// Pure over its argument: no network, filesystem, or tracker calls.
+pub fn is_autonomous(history: &OutcomeHistoryInput) -> bool {
+    if history.attempts.len() != 1 {
+        return false;
+    }
+    if !history.attempts[0].review_accepted {
+        return false;
+    }
+    !history
+        .signals
+        .iter()
+        .any(|s| matches!(s, OutcomeSignal::Clarification | OutcomeSignal::Blocked))
+}
+
+/// Turn assembled loop history into per-ticket outcome figures.
+/// Pure over its argument: no network, filesystem, or tracker calls.
+pub fn outcome_figures(history: &OutcomeHistoryInput) -> OutcomeFigures {
+    let cycle_days = match history.landed_epoch_secs {
+        Some(landed) if landed >= history.signal_epoch_secs => {
+            Some((landed - history.signal_epoch_secs) as f64 / 86_400.0)
+        }
+        _ => None,
+    };
+    let attempt_minutes: Vec<OutcomeAttemptMinutes> = history
+        .attempts
+        .iter()
+        .map(|a| {
+            let minutes = match (a.started_epoch_secs, a.finished_epoch_secs) {
+                (Some(started), Some(finished)) if finished >= started => {
+                    Some((finished - started) as f64 / 60.0)
+                }
+                _ => None,
+            };
+            OutcomeAttemptMinutes {
+                attempt_no: a.attempt_no,
+                minutes,
+            }
+        })
+        .collect();
+    let total_attempt_minutes =
+        if attempt_minutes.is_empty() || attempt_minutes.iter().any(|m| m.minutes.is_none()) {
+            None
+        } else {
+            Some(
+                attempt_minutes
+                    .iter()
+                    .map(|m| m.minutes.unwrap_or(0.0))
+                    .sum(),
+            )
+        };
+    let autonomous = is_autonomous(history);
+    OutcomeFigures {
+        ticket: history.ticket,
+        cycle_days,
+        attempt_minutes,
+        total_attempt_minutes,
+        autonomous,
+        autonomy_verdict: if autonomous {
+            "autonomous"
+        } else {
+            "not autonomous"
+        },
+        autonomy_caveat: OUTCOME_AUTONOMY_CAVEAT,
+        cost_text: OUTCOME_COST_TEXT,
+    }
+}
+
+/// One human-readable line carrying the figures, the verdict, its caveat,
+/// and the cost statement together — the copy a future view renders.
+/// Pure over its argument.
+pub fn outcome_human_line(figures: &OutcomeFigures) -> String {
+    let cycle = figures
+        .cycle_days
+        .map(|d| format!("{d:.1} days"))
+        .unwrap_or_else(|| "not yet landed".to_string());
+    let minutes = figures
+        .total_attempt_minutes
+        .map(|m| format!("{m:.1} minutes"))
+        .unwrap_or_else(|| "logs missing".to_string());
+    format!(
+        "Ticket #{}: signal-to-production cycle {}, attempt machine minutes {}. Autonomy: {} ({}). Cost: {}.",
+        figures.ticket, cycle, minutes, figures.autonomy_verdict, figures.autonomy_caveat,
+        figures.cost_text,
+    )
+}
+
 /// Slugify a ticket title into a branch-safe slug (parity with bash `start`).
 fn slugify(title: &str) -> String {
     let mut slug = String::new();
@@ -9468,5 +9644,183 @@ mod guided_tests {
         assert_eq!(parse_choice_line("99\n", 11, 8), 8);
         assert_eq!(parse_choice_line("rust\n", 11, 8), 8);
         assert_eq!(parse_choice_line("-1\n", 11, 8), 8);
+    }
+}
+
+// --- outcome figures, TDD red (ticket #57, spec #56) ------------------------
+// Fixture histories pinning the exact per-ticket figures. These tests fail
+// until the pure `outcome_figures` computation below them exists.
+#[cfg(test)]
+mod outcome_tests {
+    use super::{
+        is_autonomous, outcome_figures, outcome_human_line, OutcomeAttemptInput,
+        OutcomeHistoryInput, OutcomeSignal, OUTCOME_AUTONOMY_CAVEAT, OUTCOME_COST_TEXT,
+    };
+
+    fn attempt(
+        no: u64,
+        started: Option<i64>,
+        finished: Option<i64>,
+        accepted: bool,
+    ) -> OutcomeAttemptInput {
+        OutcomeAttemptInput {
+            attempt_no: no,
+            started_epoch_secs: started,
+            finished_epoch_secs: finished,
+            review_accepted: accepted,
+        }
+    }
+
+    fn history(
+        ticket: u64,
+        landed: Option<i64>,
+        attempts: Vec<OutcomeAttemptInput>,
+        signals: Vec<OutcomeSignal>,
+    ) -> OutcomeHistoryInput {
+        OutcomeHistoryInput {
+            ticket,
+            signal_epoch_secs: 0,
+            landed_epoch_secs: landed,
+            attempts,
+            signals,
+        }
+    }
+
+    #[test]
+    fn single_attempt_accept_pins_exact_figures() {
+        let figures = outcome_figures(&history(
+            7,
+            Some(259_200),
+            vec![attempt(1, Some(0), Some(2_700), true)],
+            vec![],
+        ));
+        assert_eq!(figures.ticket, 7);
+        assert_eq!(figures.cycle_days, Some(3.0));
+        assert_eq!(figures.attempt_minutes.len(), 1);
+        assert_eq!(figures.attempt_minutes[0].minutes, Some(45.0));
+        assert_eq!(figures.total_attempt_minutes, Some(45.0));
+        assert!(figures.autonomous);
+        assert!(is_autonomous(&history(
+            7,
+            Some(259_200),
+            vec![attempt(1, Some(0), Some(2_700), true)],
+            vec![],
+        )));
+        assert_eq!(figures.autonomy_verdict, "autonomous");
+        assert_eq!(figures.autonomy_caveat, OUTCOME_AUTONOMY_CAVEAT);
+        assert_eq!(figures.cost_text, OUTCOME_COST_TEXT);
+    }
+
+    #[test]
+    fn multi_attempt_is_not_autonomous_but_pins_totals() {
+        let figures = outcome_figures(&history(
+            8,
+            Some(172_800),
+            vec![
+                attempt(1, Some(0), Some(1_800), false),
+                attempt(2, Some(3_600), Some(7_200), true),
+            ],
+            vec![],
+        ));
+        assert_eq!(figures.cycle_days, Some(2.0));
+        assert_eq!(figures.attempt_minutes.len(), 2);
+        assert_eq!(figures.attempt_minutes[0].minutes, Some(30.0));
+        assert_eq!(figures.attempt_minutes[1].minutes, Some(60.0));
+        assert_eq!(figures.total_attempt_minutes, Some(90.0));
+        assert!(!figures.autonomous);
+        assert_eq!(figures.autonomy_verdict, "not autonomous");
+    }
+
+    #[test]
+    fn clarification_signal_present_is_not_autonomous() {
+        let input = history(
+            9,
+            Some(86_400),
+            vec![attempt(1, Some(0), Some(1_200), true)],
+            vec![OutcomeSignal::Clarification],
+        );
+        let figures = outcome_figures(&input);
+        assert_eq!(figures.cycle_days, Some(1.0));
+        assert_eq!(figures.total_attempt_minutes, Some(20.0));
+        assert!(!is_autonomous(&input));
+        assert!(!figures.autonomous);
+    }
+
+    #[test]
+    fn blocked_signal_present_is_not_autonomous() {
+        let input = history(
+            10,
+            Some(86_400),
+            vec![attempt(1, Some(0), Some(600), true)],
+            vec![OutcomeSignal::Blocked],
+        );
+        assert!(!is_autonomous(&input));
+        assert!(!outcome_figures(&input).autonomous);
+    }
+
+    #[test]
+    fn missing_land_merge_blanks_cycle_but_keeps_minutes() {
+        let figures = outcome_figures(&history(
+            11,
+            None,
+            vec![attempt(1, Some(0), Some(900), true)],
+            vec![],
+        ));
+        assert_eq!(figures.cycle_days, None);
+        assert_eq!(figures.total_attempt_minutes, Some(15.0));
+    }
+
+    #[test]
+    fn missing_logs_blank_minutes_never_guess() {
+        let figures = outcome_figures(&history(
+            12,
+            Some(86_400),
+            vec![attempt(1, None, None, false)],
+            vec![],
+        ));
+        assert_eq!(figures.cycle_days, Some(1.0));
+        assert_eq!(figures.attempt_minutes[0].minutes, None);
+        assert_eq!(figures.total_attempt_minutes, None);
+        assert!(!figures.autonomous);
+    }
+
+    #[test]
+    fn human_line_carries_verdict_caveat_and_cost() {
+        let figures = outcome_figures(&history(
+            7,
+            Some(259_200),
+            vec![attempt(1, Some(0), Some(2_700), true)],
+            vec![],
+        ));
+        let line = outcome_human_line(&figures);
+        assert!(
+            line.contains("autonomous"),
+            "line names the verdict: {line}"
+        );
+        assert!(
+            line.contains(OUTCOME_AUTONOMY_CAVEAT),
+            "line carries the caveat: {line}"
+        );
+        assert!(line.contains(OUTCOME_COST_TEXT), "line states cost: {line}");
+    }
+
+    #[test]
+    fn computation_reads_no_environment_or_filesystem() {
+        // Purity probe: point every seam override at garbage. A pure
+        // computation over its arguments cannot notice.
+        std::env::set_var("FACTORY_STATE_DIR", "/nonexistent-t57-purity-probe");
+        std::env::set_var("FACTORY_GH_BIN", "/nonexistent-t57-purity-probe");
+        let input = history(
+            7,
+            Some(259_200),
+            vec![attempt(1, Some(0), Some(2_700), true)],
+            vec![],
+        );
+        let figures = outcome_figures(&input);
+        assert_eq!(figures.cycle_days, Some(3.0));
+        assert_eq!(figures.total_attempt_minutes, Some(45.0));
+        assert!(figures.autonomous);
+        std::env::remove_var("FACTORY_STATE_DIR");
+        std::env::remove_var("FACTORY_GH_BIN");
     }
 }
