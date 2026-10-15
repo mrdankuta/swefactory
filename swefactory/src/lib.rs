@@ -682,15 +682,26 @@ pub fn web_health_response() -> String {
 /// binary is hermetic, so no frameworks and no external fonts. Trello-style
 /// lanes: horizontal strip, fixed-width lanes with their own vertical
 /// scroll. Selectors hook the same `data-*` attributes the tests pin.
-const BOARD_CSS: &str = "\
-*{box-sizing:border-box}body{margin:0;background:#faf8f4;color:#2b2721;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;line-height:1.45}\n\
+const SITE_CSS: &str = "*{box-sizing:border-box}body{margin:0;background:#faf8f4;color:#2b2721;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;line-height:1.45}\n\
 header.site{padding:20px 28px 12px;border-bottom:1px solid #e5e1d8}\n\
 header.site h1{margin:0;font-size:22px;letter-spacing:-.01em}\n\
 header.site p{margin:4px 0;color:#6b655a;font-size:14px}\n\
 header.site nav{margin-top:10px;font-size:14px}\n\
 header.site nav a{color:#3b6fd4;text-decoration:none;margin-right:4px}\n\
 header.site nav a:hover{text-decoration:underline}\n\
-main{padding:20px 28px 96px}\n\
+main{padding:20px 28px 96px;max-width:1280px}\n\
+code{background:#f1ede4;border-radius:4px;padding:1px 6px;font-size:.92em}\n\
+pre{background:#232228;color:#e8e6e1;border-radius:10px;padding:14px 16px;overflow-x:auto;font-size:12.5px;line-height:1.5;max-width:100%}\n\
+table{border-collapse:collapse;font-size:14px}\n\
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#6b655a;padding:8px 10px;border-bottom:2px solid #e5e1d8}\n\
+td{padding:8px 10px;border-bottom:1px solid #ece7db;vertical-align:top}\n\
+button,input[type=submit]{font:inherit;font-weight:600;border:1px solid #d8d2c4;background:#fff;color:#2b2721;border-radius:999px;padding:8px 18px;cursor:pointer}\n\
+button:hover,input[type=submit]:hover{background:#f1ede4}\n\
+input[type=text],input:not([type]),textarea,select{font:inherit;border:1px solid #d8d2c4;border-radius:8px;padding:8px 12px;background:#fff;color:#2b2721;max-width:100%}\n\
+form{margin:12px 0}\n\
+label{display:block;font-size:13px;font-weight:600;margin:10px 0 4px;color:#4a4438}\n\
+details{margin:12px 0}\n\
+summary{cursor:pointer;color:#4a4438;font-weight:600}\n\
 [data-board-columns]{display:flex;gap:16px;overflow-x:auto;padding-bottom:16px;scroll-snap-type:x proximity}\n\
 [data-column]{flex:0 0 300px;scroll-snap-align:start;max-height:calc(100vh - 240px);overflow-y:auto;background:#fff;border:1px solid #e5e1d8;border-radius:12px;padding:12px;margin:0}\n\
 [data-column]>h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#6b655a}\n\
@@ -703,8 +714,35 @@ main{padding:20px 28px 96px}\n\
 [data-card] [data-status]{display:inline-block;margin:0 0 6px;font-size:12px;font-weight:600;background:#f1ede4;border-radius:999px;padding:2px 10px;color:#4a4438}\n\
 [data-card] [data-cost],[data-card] [data-changed]{margin:2px 0;font-size:13px;color:#6b655a}\n\
 [data-card] [data-detail-link]{display:inline-block;margin-top:8px;font-size:13px;font-weight:600;color:#3b6fd4;text-decoration:none}\n\
-[data-empty-column],[data-board-empty] p{color:#8a8378;font-size:13px;font-style:italic}\n";
-
+[data-empty-column],[data-board-empty] p,[data-attempts-empty] p,[data-git-empty] p,[data-empty-tree],[data-no-train] p,[data-onboard-empty]{color:#8a8378;font-size:14px;font-style:italic}\n\
+[data-ticket]>h2{margin-top:0}\n\
+[data-ticket-body]{background:#fff;border:1px solid #e5e1d8;border-radius:12px;padding:14px 18px;max-width:860px}\n\
+ol[data-attempts]{list-style:none;margin:16px 0 0;padding:0;max-width:960px}\n\
+li[data-attempt]{border-left:3px solid #d8d2c4;padding:0 0 4px 16px;margin:0 0 16px}\n\
+li[data-attempt] [data-summary]{font-weight:600;margin:0 0 8px}\n\
+[data-truncated]{font-size:13px;color:#8a8378}\n\
+[data-attempt]{background:#fff;border:1px solid #e5e1d8;border-radius:12px;padding:12px 16px;margin:0 0 12px;max-width:960px}\n\
+[data-attempt]>h3{margin:0 0 8px;font-size:15px}\n\
+[data-attempt][data-status*=\"fail\"]{border-left:4px solid #b91c1c}\n\
+[data-attempt][data-status*=\"accept\"],[data-attempt][data-status*=\"done\"]{border-left:4px solid #4d7c0f}\n\
+[data-stop-controls]{display:flex;gap:10px}\n\
+[data-stop-controls] form{margin:0}\n\
+[data-stop=\"halted\"]{background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:10px 14px;max-width:960px}\n\
+[data-stop=\"running\"]{color:#4d7c0f}\n\
+[data-where]{font-size:13px;color:#6b655a}\n\
+[data-worktrees]{margin-top:20px;max-width:960px}\n\
+[data-worktrees] ul{list-style:none;padding:0}\n\
+[data-worktrees] li{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;background:#fff;border:1px solid #e5e1d8;border-radius:8px;padding:6px 10px;margin:0 0 6px;overflow-x:auto;white-space:nowrap}\n\
+[data-git-log],[data-branches]{max-width:960px}\n\
+[data-commit],[data-branch]{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;background:#fff;border:1px solid #e5e1d8;border-radius:8px;padding:6px 10px;margin:0 0 6px;overflow-x:auto;white-space:nowrap}\n\
+[data-file-view] pre{max-width:1100px}\n\
+[data-diff]{max-width:1100px}\n\
+[data-member]{background:#fff;border:1px solid #e5e1d8;border-radius:10px;padding:10px 14px;margin:0 0 10px;max-width:960px}\n\
+[data-member-verdict]{display:inline-block;font-size:12px;font-weight:700;border-radius:999px;padding:2px 10px;background:#f1ede4}\n\
+[data-member-verdict*=\"accept\"]{background:#dcfce7;color:#365314}\n\
+[data-done-feed]{margin-top:16px}\n\
+[data-done-feed] summary{cursor:pointer;color:#6b655a;font-size:14px}\n\
+\n";
 /// Full board page: columns plus the polling hook that refreshes only
 /// the fragment (no full reloads). Pure over columns for testing.
 pub fn board_page_html(columns: &[BoardColumn]) -> String {
@@ -723,7 +761,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
     <script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
     setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
     </body></html>",
-        BOARD_CSS,
+        SITE_CSS,
         BOARD_POLL_MS,
     )
 }
@@ -1175,8 +1213,8 @@ pub fn ticket_detail_page_html(detail: &TicketDetail) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Ticket #{} \u{2014} Factory</title></head>\
-<body><header><h1>Ticket #{}</h1>\
+<title>Ticket #{} \u{2014} Factory</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Ticket #{}</h1>\
 <p>Body, attempts, and transcript tails. Matches <code>factory log {}</code>.</p>\
 <p data-version>factory {version}</p></header>\
 <main><div id=\"ticket\" data-ticket-fragment=\"/fragments/ticket/{}\" data-poll-ms=\"{}\">\
@@ -1184,7 +1222,8 @@ pub fn ticket_detail_page_html(detail: &TicketDetail) -> String {
 <script>(function(){{var el=document.getElementById('ticket');if(!el)return;var url=el.getAttribute('data-ticket-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
-        detail.number, detail.number, detail.number, detail.number, BOARD_POLL_MS,
+        detail.number, SITE_CSS,
+        detail.number, detail.number, detail.number, BOARD_POLL_MS,
     )
 }
 
@@ -1194,8 +1233,9 @@ pub fn ticket_missing_page_html(raw: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Ticket not found \u{2014} Factory</title></head>\
-<body><header><h1>Ticket not found</h1></header><main>{fragment}</main></body></html>",
+<title>Ticket not found \u{2014} Factory</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Ticket not found</h1></header><main>{fragment}</main></body></html>",
+        SITE_CSS,
     )
 }
 
@@ -1264,8 +1304,8 @@ pub fn dispatcher_page_html(data: &DispatcherData) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory dispatcher</title></head>\
-<body><header><h1>Factory dispatcher</h1>\
+<title>Factory dispatcher</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Factory dispatcher</h1>\
 <p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
@@ -1274,6 +1314,7 @@ pub fn dispatcher_page_html(data: &DispatcherData) -> String {
 <script>(function(){{var el=document.getElementById('dispatch');if(!el)return;var url=el.getAttribute('data-dispatch-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'3000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
+        SITE_CSS,
         DISPATCHER_POLL_MS,
     )
 }
@@ -1747,8 +1788,8 @@ pub fn git_page_html(data: &GitData) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory git</title></head>\
-<body><header><h1>Factory git</h1>\
+<title>Factory git</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Factory git</h1>\
 <p>Log, branches, and worktrees with ticket links. Matches <code>git log --graph --decorate</code> + <code>git branch -vv</code> + <code>git worktree list</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
@@ -1757,6 +1798,7 @@ pub fn git_page_html(data: &GitData) -> String {
 <script>(function(){{var el=document.getElementById('git');if(!el)return;var url=el.getAttribute('data-git-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
+        SITE_CSS,
         GIT_POLL_MS,
     )
 }
@@ -2347,8 +2389,8 @@ pub fn files_page_html(tree: &[String], gitref: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory files</title></head>\
-<body><header><h1>Factory files</h1>\
+<title>Factory files</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Factory files</h1>\
 <p>Tree, viewer, and search from any branch. Matches <code>git ls-tree</code> + <code>git show &lt;ref&gt;:&lt;path&gt;</code> + <code>git grep</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
@@ -2368,6 +2410,7 @@ var t=document.getElementById(b.getAttribute('data-copy-target'));if(!t)return;\
 var text=t.innerText||t.textContent||'';\
 if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(text).then(function(){{b.textContent='Copied';}}).catch(function(){{}});}}}});</script>\
 </body></html>",
+        SITE_CSS,
         url_encode(gitref),
         FILES_POLL_MS,
         escape_html(gitref),
@@ -2429,8 +2472,8 @@ pub fn train_review_page_html(data: &TrainReviewData) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Train review \u{2014} Factory</title></head>\
-<body><header><h1>Train review</h1>\
+<title>Train review \u{2014} Factory</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Train review</h1>\
 <p>Members, verdicts, diffs, and the human land. Matches <code>factory land</code> + <code>release status</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
@@ -2439,6 +2482,7 @@ pub fn train_review_page_html(data: &TrainReviewData) -> String {
 <script>(function(){{var el=document.getElementById('train');if(!el)return;var url=el.getAttribute('data-train-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'5000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
+        SITE_CSS,
         TRAIN_POLL_MS,
     )
 }
@@ -2455,13 +2499,14 @@ pub fn train_landed_page_html(train: &str, closed: &[u64], note: &str) -> String
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Train landed \u{2014} Factory</title></head>\
-<body><header><h1>Train landed</h1>\
+<title>Train landed \u{2014} Factory</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Train landed</h1>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
 <main><section data-released><p>Train {} landed into dev. Closed members: {}.</p><p data-release-note>{}</p>\
 <p>Matches <code>factory land</code>. Cleanup commands were printed to the land log (branches are never deleted by automation).</p></section></main>\
 </body></html>",
+        SITE_CSS,
         escape_html(train),
         escape_html(&members),
         escape_html(note),
@@ -3419,8 +3464,8 @@ pub fn onboard_page_html(draft: Option<&OnboardDraft>) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory onboard</title></head>\
-<body><header><h1>Factory onboard</h1>\
+<title>Factory onboard</title><style>{}</style></head>\
+<body><header class=\"site\"><h1>Factory onboard</h1>\
 <p>Your idea, your draft, your decision. Matches <code>factory onboard --plain</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/onboard\">Onboard</a> | <a href=\"/dispatch\">Dispatcher live</a></nav>\
 <p data-version>factory {version}</p></header>\
@@ -3429,6 +3474,7 @@ pub fn onboard_page_html(draft: Option<&OnboardDraft>) -> String {
 <script>(function(){{var el=document.getElementById('onboard');if(!el)return;var url=el.getAttribute('data-onboard-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
+        SITE_CSS,
         ONBOARD_POLL_MS,
     )
 }
