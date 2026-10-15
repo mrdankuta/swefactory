@@ -5280,6 +5280,9 @@ struct ReconcileOutput {
     base: String,
     issues: Vec<ReconcileIssue>,
     branches: Vec<String>,
+    /// Per-ticket outcome figures (ticket #58, spec #56): the identical
+    /// figure set the human-readable metrics section renders.
+    metrics: Vec<OutcomeFigures>,
 }
 
 /// Best-effort fetch (read-only); failures are ignored like the bash parity.
@@ -5382,10 +5385,15 @@ pub fn cmd_reconcile(json: bool) -> i32 {
         })
         .unwrap_or_default();
     if json {
+        let metrics: Vec<OutcomeFigures> = entries
+            .iter()
+            .map(|e| outcome_figures(&reconcile_history_for(e.number, &base)))
+            .collect();
         let out = ReconcileOutput {
             base,
             issues: entries,
             branches,
+            metrics,
         };
         println!(
             "{}",
@@ -5411,6 +5419,14 @@ pub fn cmd_reconcile(json: bool) -> i32 {
             for b in &branches {
                 println!("{b}");
             }
+        }
+        println!();
+        println!("== outcome metrics ==");
+        for e in &entries {
+            println!(
+                "{}",
+                outcome_human_line(&outcome_figures(&reconcile_history_for(e.number, &base)))
+            );
         }
         println!();
         println!("Suggested actions (human decides): close landed issues, delete merged branches.");
@@ -5481,7 +5497,7 @@ pub struct OutcomeHistoryInput {
 
 /// Per-attempt machine minutes. `None` means the attempt's logs are
 /// missing — a gap, not a zero.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OutcomeAttemptMinutes {
     pub attempt_no: u64,
     pub minutes: Option<f64>,
@@ -5489,7 +5505,7 @@ pub struct OutcomeAttemptMinutes {
 
 /// Per-ticket outcome figures. `None` fields are blanks for unlanded or
 /// unlogged history, never guesses.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OutcomeFigures {
     pub ticket: u64,
     /// Signal-to-production cycle time in days. Blank until landed.
@@ -5592,6 +5608,221 @@ pub fn outcome_human_line(figures: &OutcomeFigures) -> String {
         figures.ticket, cycle, minutes, figures.autonomy_verdict, figures.autonomy_caveat,
         figures.cost_text,
     )
+}
+
+// ---------------------------------------------------------------------------
+// RECONCILE METRICS SECTION (ticket #58, spec #56)
+//
+// The reconcile view extended with per-ticket outcome figures, computed
+// through #57's pure `outcome_figures` seam. Assembly below is the only
+// impure part: it reads the live stores behind the read paths reconcile
+// already uses — the dispatch ledger (attempt rows + persisted
+// transcripts for first-review accept), the issue timeline (`gh issue
+// view`: signal date + clarification/blocked markers), and merge history
+// (landing date via the drift grep seam). Every fetch failure degrades to
+// a gap, never an error; cost stays not-yet-wired, never zero.
+// ---------------------------------------------------------------------------
+
+/// Days since the Unix epoch for a civil date (Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `+HH:MM` / `-HHMM` style zone suffix to seconds east of UTC.
+fn parse_tz_offset(s: &str) -> Option<i64> {
+    let sign = match s.as_bytes().first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    let digits: String = s[1..].chars().filter(|c| *c != ':').collect();
+    if digits.len() != 2 && digits.len() != 4 {
+        return None;
+    }
+    let hh: i64 = digits[..2].parse().ok()?;
+    let mm: i64 = if digits.len() == 4 {
+        digits[2..].parse().ok()?
+    } else {
+        0
+    };
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    Some(sign * (hh * 3_600 + mm * 60))
+}
+
+/// Strict ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±offset]`)
+/// to epoch seconds. A missing zone reads as a gap (`None`): assuming
+/// UTC would print a confident span from an imprecise record.
+fn parse_iso8601_epoch(s: &str) -> Option<i64> {
+    let (date_part, time_part) = s.split_once('T').or_else(|| s.split_once('t'))?;
+    let mut d = date_part.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let (clock, offset_secs) = if let Some(t) = time_part
+        .strip_suffix('Z')
+        .or_else(|| time_part.strip_suffix('z'))
+    {
+        (t, 0)
+    } else {
+        let i = time_part.find(['+', '-'])?;
+        let (c, z) = time_part.split_at(i);
+        (c, parse_tz_offset(z)?)
+    };
+    let mut c = clock.split(':');
+    let hh: i64 = c.next()?.parse().ok()?;
+    let mm: i64 = c.next()?.parse().ok()?;
+    let ss: i64 = c.next()?.split('.').next()?.parse().ok()?;
+    if c.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, m, day) * 86_400 + hh * 3_600 + mm * 60 + ss - offset_secs)
+}
+
+/// Epoch seconds from the shapes the loop's own stores emit: bare
+/// integers (ledger `started_at`/`finished_at`) and the ISO-8601
+/// `createdAt` shape `gh issue view` returns. Anything else is a gap
+/// (`None`), never an error.
+fn parse_epoch_secs(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n);
+    }
+    parse_iso8601_epoch(s)
+}
+
+/// Reduce one `gh issue view --json number,createdAt,labels,comments`
+/// document to the signals the autonomy rule observes. Labels reuse the
+/// board's existing vocabulary (`blocked`, `needs-info`/`needs-you`);
+/// comments match the uppercase signal tokens the loop itself posts to the
+/// timeline (`NEEDS_CLARIFICATION`, `BLOCKED`, as in the `FACTORY:`
+/// handoff markers). Anything unparseable yields no signals — a gap.
+fn outcome_signals_from_view(view: &serde_json::Value) -> Vec<OutcomeSignal> {
+    let mut clarification = false;
+    let mut blocked = false;
+    if let Some(labels) = view.get("labels").and_then(|v| v.as_array()) {
+        for label in labels {
+            let name = if let Some(s) = label.as_str() {
+                s.to_string()
+            } else {
+                label
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            match name.to_lowercase().as_str() {
+                "blocked" => blocked = true,
+                "needs-info" | "needs-you" | "clarification" => clarification = true,
+                _ => {}
+            }
+        }
+    }
+    if let Some(comments) = view.get("comments").and_then(|v| v.as_array()) {
+        for comment in comments {
+            let body = comment.get("body").and_then(|b| b.as_str()).unwrap_or("");
+            if body.contains("NEEDS_CLARIFICATION") {
+                clarification = true;
+            }
+            if body.contains("BLOCKED") {
+                blocked = true;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if clarification {
+        out.push(OutcomeSignal::Clarification);
+    }
+    if blocked {
+        out.push(OutcomeSignal::Blocked);
+    }
+    out
+}
+
+/// Newest commit timestamp on `base` mentioning `#<ticket>` (the same grep
+/// seam the drift check uses). No match — or any git failure — reads as
+/// unlanded (`None`), never an error.
+fn reconcile_landed_epoch(ticket: u64, base: &str) -> Option<i64> {
+    let pattern = format!("#{ticket}");
+    let out = run_git(&["log", base, "--format=%ct", "--grep", &pattern], None).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
+/// Assemble one ticket's loop history from the live stores. First-review
+/// accept comes from the persisted transcripts (ledger log plus its
+/// sibling review log — never ephemeral temp files), matching the
+/// codebase's existing `VERDICT:` read paths. A missing signal date
+/// blanks the landing side too: without the signal end, no span is honest.
+fn reconcile_history_for(ticket: u64, base: &str) -> OutcomeHistoryInput {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let view: Option<serde_json::Value> = run_gh_output(&[
+        "issue",
+        "view",
+        &ticket.to_string(),
+        "--json",
+        "number,createdAt,labels,comments",
+    ])
+    .ok()
+    .filter(|out| out.status.success())
+    .and_then(|out| serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok());
+    let signal = view
+        .as_ref()
+        .and_then(|v| v.get("createdAt"))
+        .and_then(|c| c.as_str())
+        .and_then(parse_epoch_secs);
+    let signals = view
+        .as_ref()
+        .map(outcome_signals_from_view)
+        .unwrap_or_default();
+    let mut attempts: Vec<OutcomeAttemptInput> = ledger
+        .attempts
+        .iter()
+        .filter(|a| a.ticket == ticket)
+        .map(|a| OutcomeAttemptInput {
+            attempt_no: a.attempt_no,
+            started_epoch_secs: parse_epoch_secs(&a.started_at),
+            finished_epoch_secs: parse_epoch_secs(&a.finished_at),
+            review_accepted: parse_verdict(&log_read_transcript(&state, a)).as_deref()
+                == Some("accept"),
+        })
+        .collect();
+    attempts.sort_by_key(|a| a.attempt_no);
+    let landed = match signal {
+        Some(_) => reconcile_landed_epoch(ticket, base),
+        None => None,
+    };
+    OutcomeHistoryInput {
+        ticket,
+        signal_epoch_secs: signal.unwrap_or(0),
+        landed_epoch_secs: landed,
+        attempts,
+        signals,
+    }
 }
 
 /// Slugify a ticket title into a branch-safe slug (parity with bash `start`).
