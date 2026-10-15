@@ -678,6 +678,33 @@ pub fn web_health_response() -> String {
     .expect("health template renders")
 }
 
+/// Board stylesheet (spec #27 Bea-first): hand-written embedded CSS — the
+/// binary is hermetic, so no frameworks and no external fonts. Trello-style
+/// lanes: horizontal strip, fixed-width lanes with their own vertical
+/// scroll. Selectors hook the same `data-*` attributes the tests pin.
+const BOARD_CSS: &str = "\
+*{box-sizing:border-box}body{margin:0;background:#faf8f4;color:#2b2721;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;line-height:1.45}\n\
+header.site{padding:20px 28px 12px;border-bottom:1px solid #e5e1d8}\n\
+header.site h1{margin:0;font-size:22px;letter-spacing:-.01em}\n\
+header.site p{margin:4px 0;color:#6b655a;font-size:14px}\n\
+header.site nav{margin-top:10px;font-size:14px}\n\
+header.site nav a{color:#3b6fd4;text-decoration:none;margin-right:4px}\n\
+header.site nav a:hover{text-decoration:underline}\n\
+main{padding:20px 28px 96px}\n\
+[data-board-columns]{display:flex;gap:16px;overflow-x:auto;padding-bottom:16px;scroll-snap-type:x proximity}\n\
+[data-column]{flex:0 0 300px;scroll-snap-align:start;max-height:calc(100vh - 240px);overflow-y:auto;background:#fff;border:1px solid #e5e1d8;border-radius:12px;padding:12px;margin:0}\n\
+[data-column]>h2{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#6b655a}\n\
+[data-card]{background:#fffdf8;border:1px solid #e5e1d8;border-left:4px solid #b9b2a4;border-radius:8px;padding:10px 12px;margin:0 0 10px}\n\
+[data-column=\"needs-you\"] [data-card]{border-left-color:#c2410c}\n\
+[data-column=\"review\"] [data-card]{border-left-color:#6d5bd0}\n\
+[data-column=\"done\"] [data-card]{border-left-color:#4d7c0f}\n\
+[data-column=\"running\"] [data-card]{border-left-color:#0284c7}\n\
+[data-card] h3{margin:0 0 6px;font-size:15px}\n\
+[data-card] [data-status]{display:inline-block;margin:0 0 6px;font-size:12px;font-weight:600;background:#f1ede4;border-radius:999px;padding:2px 10px;color:#4a4438}\n\
+[data-card] [data-cost],[data-card] [data-changed]{margin:2px 0;font-size:13px;color:#6b655a}\n\
+[data-card] [data-detail-link]{display:inline-block;margin-top:8px;font-size:13px;font-weight:600;color:#3b6fd4;text-decoration:none}\n\
+[data-empty-column],[data-board-empty] p{color:#8a8378;font-size:13px;font-style:italic}\n";
+
 /// Full board page: columns plus the polling hook that refreshes only
 /// the fragment (no full reloads). Pure over columns for testing.
 pub fn board_page_html(columns: &[BoardColumn]) -> String {
@@ -685,17 +712,18 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
     let version = env!("CARGO_PKG_VERSION");
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Factory board</title></head>\
-<body><header><h1>Factory board</h1>\
-<p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
-<nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
-<p data-version>factory {version}</p></header>\
-<main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
-{fragment}</div></main>\
-<script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
-setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
-</body></html>",
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+    <title>Factory board</title><style>{}</style></head>\
+    <body><header class=\"site\"><h1>Factory board</h1>\
+    <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
+    <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
+    <p data-version>factory {version}</p></header>\
+    <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
+    {fragment}</div></main>\
+    <script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
+    setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
+    </body></html>",
+        BOARD_CSS,
         BOARD_POLL_MS,
     )
 }
