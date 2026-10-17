@@ -61,6 +61,9 @@ fn dispatch_self_test_proves_release_mechanics_hermetically() {
         "PASS: abandon closes unmerged train",
         "PASS: abandon never deletes branches",
         "PASS: second abandon refused",
+        "PASS: dispatch kill-mid-phase interrupts (resumable)",
+        "PASS: dispatch resume completes the same attempt",
+        "PASS: dispatch resume spends nothing (no network, fake implementer only)",
         "PASS: no gh invoked",
         "SELF-TEST ALL PASS",
     ] {
@@ -92,7 +95,7 @@ fn dispatch_self_test_json_is_machine_parseable() {
         .and_then(|c| c.as_array())
         .expect("json self-test must carry a checks array");
     assert!(
-        checks.len() >= 18,
+        checks.len() >= 21,
         "expected all mechanics checks, got {checks:?}"
     );
     for c in checks {

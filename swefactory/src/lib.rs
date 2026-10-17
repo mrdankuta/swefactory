@@ -271,6 +271,10 @@ pub enum ReleaseAction {
 #[derive(Subcommand, Debug)]
 pub enum DispatchAction {
     /// Single scheduling pass over ready tickets.
+    ///
+    /// Resume replays the interrupted phase only where the underlying step
+    /// is replay-safe; anything else waits for the next decision instead of
+    /// repeating a side effect.
     Once {
         /// Survey only: no worktrees, subprocesses, or writes.
         #[arg(long)]
@@ -6214,6 +6218,27 @@ fn resumed_suffix(a: &DispatchAttempt) -> String {
     }
 }
 
+/// Calm words for paused-and-will-resume states (ticket #63, spec #59):
+/// a restart must never read as breakage to Builder Bea. The
+/// replay-safety blind spot stays in output copy, not docs alone:
+/// resume replays the interrupted phase only where the underlying step
+/// is replay-safe, and anything else waits for the next decision
+/// instead of repeating a side effect.
+const PAUSED_CALM_LINE: &str =
+    "Paused, not broken \u{2014} this attempt will resume on the next pass.";
+const REPLAY_BLIND_SPOT_LINE: &str =
+    "Resume replays the interrupted phase only where the underlying step is replay-safe; anything else waits for the next decision instead of repeating a side effect.";
+
+/// Print the calm footer on a human surface that lists attempts, only
+/// when a resumable row exists. Machine modes already carry the same
+/// phase/interrupted/resumed facts; this adds no new facts, only tone.
+fn print_paused_copy(resumable_present: bool) {
+    if resumable_present {
+        println!("{PAUSED_CALM_LINE}");
+        println!("{REPLAY_BLIND_SPOT_LINE}");
+    }
+}
+
 /// Commit the phase checkpoint before side-effecting work begins. Atomic
 /// (tmp + rename): a crash between the two leaves the previous ledger.
 fn checkpoint_phase(
@@ -8158,6 +8183,7 @@ pub fn cmd_status(json: bool) -> i32 {
             }
         }
     }
+    print_paused_copy(ledger.attempts.iter().any(is_resumable));
     if stopped {
         println!("STOP: dispatch loop is halted (STOP file present).");
     } else {
@@ -8363,6 +8389,7 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
             println!("---");
         }
     }
+    print_paused_copy(entries.iter().any(|a| is_resumable(a)));
     0
 }
 
@@ -8409,6 +8436,7 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
                 a.started_at
             );
         }
+        print_paused_copy(ledger.attempts.iter().any(is_resumable));
         println!();
         println!("== worktrees ==");
         print!("{worktrees}");
@@ -8963,6 +8991,127 @@ pub fn cmd_dispatch_selftest(json: bool) -> i32 {
         !out.status.success() && stderr.contains("no open train"),
         "refused (no open train)",
         selftest_got(&out, &stderr),
+    );
+
+    // --- replayable attempts (ticket #63, spec #59): kill mid-phase plus
+    // --- resume, hermetically. A fake gh serves one canned ticket view
+    // --- from local files, a fake implementer stands in for `pi` (no
+    // --- model, no spend), and a fake adapter stands in for the checks —
+    // --- so green here proves the guarantee with no network and no spend,
+    // --- exactly like the release mechanics above.
+    let gh_views = tmp.join("dispatch-views");
+    let gh_dispatch_log = tmp.join("gh-dispatch.log");
+    let pi_dispatch_log = tmp.join("pi-dispatch.log");
+    let _ = std::fs::create_dir_all(&gh_views);
+    let _ = std::fs::write(
+        gh_views.join("71.json"),
+        r#"{"number":71,"title":"Widget","body":"Build it.","labels":[{"name":"ticket"},{"name":"ready"}],"state":"OPEN","comments":[]}"#,
+    );
+    let fake_gh = tmp.join("fake-gh.sh");
+    let _ = std::fs::write(
+        &fake_gh,
+        "#!/bin/sh\necho \"GH-DISPATCH: $*\" >> \"$GH_DISPATCH_LOG\"\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"list\" ]; then printf '[{\"number\":71}]'; exit 0; fi\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"view\" ]; then cat \"$GH_DISPATCH_VIEWS/$3.json\"; exit 0; fi\nexit 0\n",
+    );
+    let fake_pi = tmp.join("fake-pi.sh");
+    let _ = std::fs::write(
+        &fake_pi,
+        "#!/bin/sh\necho \"PI-DISPATCH: cwd=$(pwd)\" >> \"$PI_DISPATCH_LOG\"\necho \"change from hermetic implementer\" >> change.txt\necho \"notes\"\necho \"VERDICT: accept\"\n",
+    );
+    let fake_adapter = tmp.join("fake-adapter.sh");
+    let _ = std::fs::write(
+        &fake_adapter,
+        "#!/bin/sh\necho \"adapter ran\" >> \"$PI_DISPATCH_LOG\"\necho \"FACTORY-CHECK PASSED\"\nexit 0\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for p in [&fake_gh, &fake_pi, &fake_adapter] {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let dispatch_env = |cmd: &mut Command| {
+        cmd.env("FACTORY_GH_BIN", &fake_gh)
+            .env("FACTORY_PI_BIN", &fake_pi)
+            .env("FACTORY_CHECK_ADAPTER", &fake_adapter)
+            .env("GH_DISPATCH_LOG", &gh_dispatch_log)
+            .env("GH_DISPATCH_VIEWS", &gh_views)
+            .env("PI_DISPATCH_LOG", &pi_dispatch_log);
+    };
+    // Pass 1: a kill mid-implement interrupts (resumable), never fails.
+    let mut kill = Command::new(&st.exe);
+    kill.args(["dispatch", "once"]).current_dir(&st.proj);
+    st.base_env(&mut kill);
+    dispatch_env(&mut kill);
+    kill.env("FACTORY_KILL_PHASE", "implement");
+    let out = kill.output().expect("self-test dispatch kill must spawn");
+    let (stdout, _stderr) = selftest_text(&out);
+    let kill_status = std::fs::read_to_string(state.join("dispatch.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("attempts")?
+                .as_array()?
+                .iter()
+                .find(|a| a.get("ticket").and_then(|t| t.as_u64()) == Some(71))?
+                .get("status")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    st.check(
+        "dispatch kill-mid-phase interrupts (resumable)",
+        out.status.success()
+            && stdout.contains("interrupted")
+            && stdout.contains("resumable")
+            && kill_status == "implement_interrupted",
+        "implement_interrupted (resumable)",
+        format!(
+            "status={kill_status} out={}",
+            stdout.lines().last().unwrap_or("(empty)")
+        ),
+    );
+    // Pass 2: the next pass resumes the same attempt to completion —
+    // no fork, transcript preserved, resumed marked for the audit.
+    let mut resume = Command::new(&st.exe);
+    resume.args(["dispatch", "once"]).current_dir(&st.proj);
+    st.base_env(&mut resume);
+    dispatch_env(&mut resume);
+    let out = resume
+        .output()
+        .expect("self-test dispatch resume must spawn");
+    let ledger_text = std::fs::read_to_string(state.join("dispatch.json")).unwrap_or_default();
+    let attempts: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&ledger_text)
+        .ok()
+        .and_then(|v| v.get("attempts")?.as_array().cloned())
+        .map(|all| {
+            all.into_iter()
+                .filter(|a| a.get("ticket").and_then(|t| t.as_u64()) == Some(71))
+                .collect()
+        })
+        .unwrap_or_default();
+    let resumed_ok = attempts.len() == 1
+        && attempts[0].get("resumed").and_then(|r| r.as_u64()) == Some(1)
+        && attempts[0].get("status").and_then(|s| s.as_str()) == Some("review_done");
+    st.check(
+        "dispatch resume completes the same attempt",
+        out.status.success() && resumed_ok,
+        "one attempt, resumed=1, review_done",
+        format!("ledger={ledger_text}"),
+    );
+    // No network, no spend: the gh bomb never fired (the dispatch fakes
+    // answered everything from local files) and only the fake
+    // implementer ran (no model, no tokens in env by construction).
+    let pi_log = std::fs::read_to_string(&pi_dispatch_log).unwrap_or_default();
+    let bomb_after = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    st.check(
+        "dispatch resume spends nothing (no network, fake implementer only)",
+        bomb_after.trim().is_empty() && pi_log.contains("PI-DISPATCH:"),
+        "gh never called, fake implementer ran",
+        format!(
+            "bomb={} pi={}",
+            bomb_after.lines().next().unwrap_or("(empty)"),
+            pi_log.lines().next().unwrap_or("(empty)")
+        ),
     );
 
     // --- the gh bomb never fired: the mechanics needed no gh ---

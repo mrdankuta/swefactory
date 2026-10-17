@@ -1138,3 +1138,59 @@ fn newest_resumable_wins_and_older_history_untouched() {
         "older transcript untouched"
     );
 }
+
+/// Paused-and-will-resume states read as calm sentences on every human
+/// surface, and the replay-safety blind spot is stated in output copy
+/// rather than docs alone (ticket #63, spec #59): a restart must never
+/// look like breakage, and the "replays only where replay-safe" limit
+/// must stay visible where Engineer Eli already looks.
+#[test]
+fn paused_states_read_calm_and_name_the_replay_safety_blind_spot() {
+    let h = setup("calm-blind-spot");
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+    repo_branch(&h, "factory/T11-widget");
+    let resumable = crafted_attempt(
+        &h,
+        11,
+        1,
+        "implement_interrupted",
+        "implement",
+        Some("interrupted during implement (slot T11-a1) — resumable\n"),
+    );
+    write_ledger(&h, &format!(r#"{{"attempts":[{resumable}]}}"#));
+
+    for args in [
+        &["dispatch", "status"][..],
+        &["status"][..],
+        &["log", "11"][..],
+    ] {
+        let out = factory_cmd(&h, args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("Paused") && out.to_lowercase().contains("will resume"),
+            "paused state must read as a calm sentence ({args:?}):\n{out}"
+        );
+        assert!(
+            out.contains("replay-safe"),
+            "output copy must state the replay-safety blind spot ({args:?}):\n{out}"
+        );
+    }
+
+    // The blind spot is also stated where the pass is surveyed.
+    let help = factory_cmd(&h, &["dispatch", "once", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help_text = String::from_utf8(help).unwrap();
+    assert!(
+        help_text.contains("replay-safe"),
+        "dispatch once help must state the blind spot:\n{help_text}"
+    );
+}

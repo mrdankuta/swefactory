@@ -652,3 +652,73 @@ fn land_green_open_train_lands_end_to_end() {
         );
     }
 }
+
+/// Resume history changes no land guard (ticket #63, spec #59): with
+/// resumed and interrupted rows in the ledger, the red-head, dirty-tree,
+/// and automation refusals fire exactly as before — and a green train
+/// still lands. Land never reads attempt phases.
+fn write_resume_ledger(h: &Harness, train: &str) {
+    fs::create_dir_all(&h.state).unwrap();
+    fs::write(
+        h.state.join("dispatch.json"),
+        format!(
+            r#"{{"attempts":[
+{{"id":1,"ticket":11,"attempt_no":1,"base_commit":"b","head_commit":"h","branch":"factory/T11-work","worktree":"","status":"review_done","exit_code":0,"log_path":"","started_at":"s","finished_at":"f","train_branch":"{train}","phase":"review","resumed":2}},
+{{"id":2,"ticket":12,"attempt_no":1,"base_commit":"b","head_commit":"","branch":"factory/T12-work","worktree":"","status":"implement_interrupted","exit_code":0,"log_path":"","started_at":"s","finished_at":"f","train_branch":"","phase":"implement","resumed":0}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn land_guards_unchanged_by_resume_history() {
+    // Dirty tree still refuses with resume history present.
+    let h = setup("resume-dirty");
+    let train = cut_train(&h);
+    write_resume_ledger(&h, &train);
+    fs::write(h.repo.join("unrelated.txt"), "wip\n").unwrap();
+    land_cmd(&h, &["land"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("dirty"));
+    assert_no_mutations(&h);
+
+    // Red head still refuses with resume history present.
+    let h = setup("resume-red");
+    let train = cut_train(&h);
+    write_resume_ledger(&h, &train);
+    let mut cmd = land_cmd(&h, &["land"]);
+    cmd.env("ADAPTER_FAIL", "1");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("checks failed"));
+    assert_no_mutations(&h);
+
+    // Automation still refuses with resume history present.
+    let h = setup("resume-auto");
+    let train = cut_train(&h);
+    write_resume_ledger(&h, &train);
+    let mut cmd = land_cmd(&h, &["land"]);
+    cmd.env("FACTORY_SLOT", "T11-a1");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("automation"));
+    assert_no_mutations(&h);
+
+    // Green still lands with resume history present (guards neither
+    // weakened nor strengthened by resume).
+    let h = setup("resume-green");
+    let train = cut_train(&h);
+    git_real(&h.repo, &["checkout", "-qb", "factory/T11-work"]);
+    fs::write(h.repo.join("w11.txt"), "eleven\n").unwrap();
+    git_real(&h.repo, &["add", "-A"]);
+    git_real(&h.repo, &["commit", "-qm", "feat(T11): widget"]);
+    git_real(&h.repo, &["checkout", "-q", "dev"]);
+    write_resume_ledger(&h, &train);
+    write_view(&h, 11, "Demo widget", "Build the widget.", "OPEN");
+    land_cmd(&h, &["release", "merge", "11"]).assert().success();
+    land_cmd(&h, &["land"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("landed"));
+}
