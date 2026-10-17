@@ -1,5 +1,5 @@
-//! Replayable attempts, slice 1: phase checkpoints + interrupted (ticket #60,
-//! spec #59).
+//! Replayable attempts, slices 1-2: phase checkpoints + interrupted (ticket
+//! #60, spec #59) and resume-from-checkpoint (ticket #61, spec #59).
 //!
 //! Seam: argv in -> exit code + stdout out + state-dir files out, over a
 //! fixture ledger plus a scratch repo. `gh` is a fake script (no network),
@@ -12,6 +12,7 @@ use assert_cmd::Command;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcCommand;
 
 fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -312,7 +313,8 @@ fn kill_mid_implement_surfaces_interrupted_naming_phase_everywhere() {
     );
 
     // The ticket stays resumable: labels untouched (still ready, never
-    // blocked) and the next pass without the kill resumes with a new attempt.
+    // blocked) and the next pass without the kill resumes the SAME attempt
+    // (ticket #61, spec #59) instead of opening a fresh one.
     let gh = fs::read_to_string(&h.gh_log).unwrap();
     assert!(
         gh.contains("interrupted") && gh.contains("implement"),
@@ -326,13 +328,18 @@ fn kill_mid_implement_surfaces_interrupted_naming_phase_everywhere() {
     let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
     assert_eq!(
         attempts.len(),
-        2,
-        "resume must admit a new attempt:\n{ledger}"
+        1,
+        "resume must continue the same attempt, never fork a new one:\n{ledger}"
     );
     assert_eq!(
-        attempts[1].get("attempt_no").and_then(|v| v.as_u64()),
-        Some(2),
-        "resumed attempt must not collide on attempt_no:\n{ledger}"
+        attempts[0].get("attempt_no").and_then(|v| v.as_u64()),
+        Some(1),
+        "resumed attempt keeps its number:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "resume must be counted on the record:\n{ledger}"
     );
 }
 
@@ -460,5 +467,674 @@ fn legacy_ledger_without_phase_reads_unknown_and_runs() {
             .unwrap_or("")
             != "unknown",
         "new attempt must checkpoint a real phase:\n{ledger}"
+    );
+}
+
+// --- replayable attempts, slice 2: resume-from-checkpoint (ticket #61,
+// --- spec #59). Same seam: argv in -> exit code + stdout out + state-dir
+// --- files out. A chatty prompt-logging `pi` stands in for the implementer
+// --- so resumed briefs and tail bounds are observable without spending.
+
+fn write_fake_pi_capture(dir: &Path) -> PathBuf {
+    write_exe(
+        dir,
+        "pi",
+        r#"#!/bin/sh
+printf '=== PROMPT ===\n%s\n' "$2" >> "$PROMPTS_LOG"
+echo "change from pi" >> change.txt
+i=1; while [ $i -le 100 ]; do echo "implement line $i"; i=$((i+1)); done
+echo "notes"
+echo "VERDICT: ${PI_VERDICT:-accept}"
+"#,
+    )
+}
+
+fn write_view_with_comments(
+    h: &Harness,
+    number: u64,
+    title: &str,
+    body: &str,
+    labels: &[&str],
+    state: &str,
+    comments: &[&str],
+) {
+    let labels_json = labels
+        .iter()
+        .map(|l| format!(r#"{{"name":"{l}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let comments_json = comments
+        .iter()
+        .map(|c| format!(r#"{{"body":{}}}"#, serde_json::to_string(c).unwrap()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body_esc = body
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    fs::write(
+        h.views.join(format!("{number}.json")),
+        format!(
+            r#"{{"number":{number},"title":"{title}","body":"{body_esc}","labels":[{labels_json}],"state":"{state}","comments":[{comments_json}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+fn repo_head(h: &Harness) -> String {
+    let out = ProcCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&h.repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn repo_branch(h: &Harness, name: &str) {
+    let st = ProcCommand::new("git")
+        .args(["branch", name])
+        .current_dir(&h.repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(st.success(), "git branch {name} failed");
+}
+
+fn write_ledger(h: &Harness, text: &str) {
+    fs::create_dir_all(&h.state).unwrap();
+    fs::write(h.state.join("dispatch.json"), text).unwrap();
+}
+
+fn ledger_raw(h: &Harness) -> String {
+    fs::read_to_string(h.state.join("dispatch.json")).expect("ledger must exist")
+}
+
+fn crafted_attempt(
+    h: &Harness,
+    ticket: u64,
+    attempt_no: u64,
+    status: &str,
+    phase: &str,
+    log_marker: Option<&str>,
+) -> String {
+    let log_path = h
+        .state
+        .join("logs")
+        .join(format!("T{ticket}-a{attempt_no}-impl.log"));
+    fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    if let Some(marker) = log_marker {
+        fs::write(&log_path, marker).unwrap();
+    }
+    format!(
+        r#"{{"id":{attempt_no},"ticket":{ticket},"attempt_no":{attempt_no},"base_commit":"{}","head_commit":"","branch":"factory/T{ticket}-widget","worktree":"","status":"{status}","exit_code":0,"log_path":"{}","started_at":"s","finished_at":"","train_branch":"","phase":"{phase}"}}"#,
+        repo_head(h),
+        log_path.to_string_lossy()
+    )
+}
+
+fn prompts_log(h: &Harness) -> PathBuf {
+    h.state.parent().unwrap().join("prompts.log")
+}
+
+fn clear_prompts(h: &Harness) {
+    fs::write(prompts_log(h), "").unwrap();
+}
+
+fn read_prompts(h: &Harness) -> Vec<String> {
+    fs::read_to_string(prompts_log(h))
+        .unwrap()
+        .split("=== PROMPT ===")
+        .skip(1)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Kill mid-implement, then a pass: the SAME attempt continues its phase,
+/// the transcript survives under the existing tail bounds, and the resume
+/// is marked in log + status, human and machine-readable alike.
+#[test]
+fn resume_same_attempt_continues_phase_with_transcript_preserved() {
+    let h = setup("resume-same");
+    let cap = write_fake_pi_capture(h.state.parent().unwrap());
+    clear_prompts(&h);
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("FACTORY_PI_BIN", &cap)
+        .env("PROMPTS_LOG", prompts_log(&h))
+        .env("FACTORY_KILL_PHASE", "implement")
+        .assert()
+        .success();
+
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("FACTORY_PI_BIN", &cap)
+        .env("PROMPTS_LOG", prompts_log(&h))
+        .assert()
+        .success();
+
+    // Observable state: one attempt, same number, resumed once, completed.
+    let ledger = ledger_json(&h);
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "resume must not fork:\n{ledger}");
+    assert_eq!(
+        attempts[0].get("attempt_no").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "resume must be counted:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "resumed attempt runs to completion:\n{ledger}"
+    );
+
+    // Transcript: pre-kill lines survive, resume marker appended, still
+    // bounded by the existing default tail (50) and full on request.
+    let full = run_status_json(&h, &["log", "11", "--json", "--tail", "0"]);
+    let rows = full.get("attempts").and_then(|a| a.as_array()).unwrap();
+    let transcript = rows[0].get("transcript").and_then(|v| v.as_str()).unwrap();
+    assert!(
+        transcript.contains("interrupted during implement"),
+        "pre-kill story must survive the resume:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("resumed from implement checkpoint"),
+        "resume marker must land in the transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("implement line 100"),
+        "post-resume work must append to the same transcript:\n{}",
+        &transcript[transcript.len().saturating_sub(400)..]
+    );
+    let tail = run_status_json(&h, &["log", "11", "--json"]);
+    let trows = tail.get("attempts").and_then(|a| a.as_array()).unwrap();
+    let shown = trows[0].get("transcript").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(
+        shown.lines().count(),
+        50,
+        "default tail bound still holds after resume"
+    );
+    assert_eq!(
+        trows[0].get("truncated").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    // The bounded tail is exactly the last 50 lines of the full story:
+    // the bound is preserved, post-resume work is visible, and the
+    // resume marker itself lives in the full transcript and the summary.
+    let full_lines: Vec<&str> = transcript.lines().collect();
+    let expect = full_lines[full_lines.len() - 50..].join("\n") + "\n";
+    assert_eq!(
+        shown, expect,
+        "bounded tail must be the last 50 lines of the preserved transcript"
+    );
+    assert!(
+        shown.contains("implement line 100"),
+        "bounded tail must show post-resume work:\n{shown}"
+    );
+    assert_eq!(
+        trows[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "machine log must carry the resume count:\n{tail}"
+    );
+
+    // dispatch status: human + machine carry the resumed fact.
+    let human = factory_cmd(&h, &["dispatch", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("resumed"),
+        "dispatch status must mark the resumed pass:\n{human}"
+    );
+    let machine = run_status_json(&h, &["dispatch", "status", "--json"]);
+    let m_attempts = machine.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        m_attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "machine status must match the human story:\n{machine}"
+    );
+
+    // unified status --json: identical resumed fact.
+    let unified = run_status_json(&h, &["status", "--json"]);
+    let u_attempts = unified.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        u_attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "unified status must match:\n{unified}"
+    );
+
+    // ticket log human: the calm story names the resume.
+    let log_human = factory_cmd(&h, &["log", "11"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let log_human = String::from_utf8(log_human).unwrap();
+    assert!(
+        log_human.to_lowercase().contains("resum"),
+        "ticket log must tell the resume story:\n{log_human}"
+    );
+
+    // Audit trail: the ticket heard about the resume.
+    let gh = fs::read_to_string(&h.gh_log).unwrap();
+    assert!(
+        gh.contains("resumed from implement checkpoint"),
+        "ticket must hear about the resume:\n{gh}"
+    );
+}
+
+/// STOP mid-attempt leaves a resumable checkpoint; a later pass (after the
+/// loop restarts) resumes the same attempt instead of forking.
+#[test]
+fn stop_mid_attempt_leaves_resumable_then_later_pass_resumes() {
+    let h = setup("stop-resume");
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+    repo_branch(&h, "factory/T11-widget");
+    let running = crafted_attempt(
+        &h,
+        11,
+        1,
+        "impl_running",
+        "implement",
+        Some("dispatch attempt T11-a1 implement base=b branch=factory/T11-widget\n"),
+    );
+    write_ledger(&h, &format!(r#"{{"attempts":[{running}]}}"#));
+    fs::write(h.state.join("STOP"), "stopped\n").unwrap();
+
+    // The STOP pass does no work but leaves the resumable checkpoint.
+    let out = factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("STOP file present"),
+        "STOP pass must halt:\n{out}"
+    );
+    let ledger = ledger_json(&h);
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("implement_interrupted"),
+        "STOP mid-attempt must leave a resumable checkpoint:\n{ledger}"
+    );
+
+    // Restart the loop, then the next pass resumes the same attempt.
+    factory_cmd(&h, &["dispatch", "resume"]).assert().success();
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success();
+    let ledger = ledger_json(&h);
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "resume must not fork:\n{ledger}");
+    assert_eq!(
+        attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "STOP-interrupted attempt resumes:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "resumed attempt completes:\n{ledger}"
+    );
+}
+
+/// A stale lease (running record, dead worker) is reaped to resumable and
+/// resumed in the next pass — crashes never fork competing histories.
+#[test]
+fn stale_running_reaped_to_resumable_and_resumed() {
+    let h = setup("stale-resume");
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+    repo_branch(&h, "factory/T11-widget");
+    let running = crafted_attempt(
+        &h,
+        11,
+        1,
+        "impl_running",
+        "implement",
+        Some("dispatch attempt T11-a1 implement base=b branch=factory/T11-widget\n"),
+    );
+    write_ledger(&h, &format!(r#"{{"attempts":[{running}]}}"#));
+
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success();
+
+    let ledger = ledger_json(&h);
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "stale lease must not fork:\n{ledger}");
+    assert_eq!(
+        attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "stale lease resumes on the same record:\n{ledger}"
+    );
+    let gh = fs::read_to_string(&h.gh_log).unwrap();
+    assert!(
+        gh.to_lowercase().contains("stale") || gh.to_lowercase().contains("lease"),
+        "the reaping must stay audible:\n{gh}"
+    );
+}
+
+/// The slot gate holds for resumes: at capacity, a resume is deferred
+/// (dry-run admits nothing and writes nothing); capacity freed, it resumes.
+#[test]
+fn slot_gate_blocks_resume_before_admission() {
+    let h = setup("gate-resume");
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+    write_view(&h, 22, "Gadget", "Build it.", &["ticket", "ready"], "OPEN");
+    repo_branch(&h, "factory/T11-widget");
+    let resumable = crafted_attempt(
+        &h,
+        11,
+        1,
+        "implement_interrupted",
+        "implement",
+        Some("interrupted during implement (slot T11-a1) — resumable\n"),
+    );
+    let live = crafted_attempt(&h, 22, 1, "impl_running", "implement", Some("working\n"));
+    write_ledger(&h, &format!(r#"{{"attempts":[{resumable},{live}]}}"#));
+    let before = ledger_raw(&h);
+
+    // Dry-run at capacity: the gate bites before any resume is admitted,
+    // and nothing is written anywhere.
+    let out = factory_cmd(&h, &["dispatch", "once", "--dry-run"])
+        .env("GH_LIST_JSON", r#"[{"number":11},{"number":22}]"#)
+        .env("MAX_CONCURRENT", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.to_lowercase().contains("capacity"),
+        "slot gate must refuse the resume first:\n{out}"
+    );
+    assert!(
+        !out.contains("would resume"),
+        "no resume may be admitted at capacity:\n{out}"
+    );
+    assert_eq!(
+        ledger_raw(&h),
+        before,
+        "dry-run must write no checkpoints and admit nothing"
+    );
+    assert!(
+        fs::read_to_string(&h.gh_log).unwrap().is_empty(),
+        "dry-run must not touch the ticket"
+    );
+
+    // Dry-run with capacity: the resume is announced, still nothing written.
+    // (A ledger with only the resumable row: no stale lease occupies a slot.)
+    write_ledger(&h, &format!(r#"{{"attempts":[{resumable}]}}"#));
+    let before = ledger_raw(&h);
+    let out = factory_cmd(&h, &["dispatch", "once", "--dry-run"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("MAX_CONCURRENT", "1")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("would resume"),
+        "dry-run must announce the pending resume:\n{out}"
+    );
+    assert_eq!(
+        ledger_raw(&h),
+        before,
+        "dry-run announcement must not write"
+    );
+}
+
+/// Mid-attempt comments and structured answers wait for the next attempt
+/// boundary: a resume replays only already-delivered answers, and the next
+/// fresh attempt delivers the arrival exactly once.
+#[test]
+fn mid_attempt_answers_wait_for_next_attempt_boundary() {
+    let h = setup("answer-resume");
+    let cap = write_fake_pi_capture(h.state.parent().unwrap());
+    clear_prompts(&h);
+    write_view_with_comments(
+        &h,
+        11,
+        "Widget",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+        &["Answer[q1]: first answer words."],
+    );
+
+    // Pass 1: q1 delivered at admission, then killed mid-implement.
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("FACTORY_PI_BIN", &cap)
+        .env("PROMPTS_LOG", prompts_log(&h))
+        .env("FACTORY_KILL_PHASE", "implement")
+        .assert()
+        .success();
+    let delivered: Vec<String> = ledger_json(&h)
+        .get("delivered_answers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(delivered.len(), 1, "q1 delivered at admission");
+
+    // Bea replies mid-attempt: q2 must wait for the next attempt boundary.
+    write_view_with_comments(
+        &h,
+        11,
+        "Widget",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+        &[
+            "Answer[q1]: first answer words.",
+            "Answer[q2]: mid-attempt words.",
+        ],
+    );
+
+    // Pass 2 (resume): same attempt, q1 survives the restart, q2 waits.
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("FACTORY_PI_BIN", &cap)
+        .env("PROMPTS_LOG", prompts_log(&h))
+        .assert()
+        .success();
+    let ledger = ledger_json(&h);
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "resume must not fork:\n{ledger}");
+    let delivered_now: Vec<String> = ledger
+        .get("delivered_answers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(
+        delivered_now, delivered,
+        "resume must redeliver nothing new"
+    );
+    // Implement prompts start with the ticket brief; review prompts start
+    // with the worktree path. Only implement briefs carry answers.
+    let prompts = read_prompts(&h);
+    let implement: Vec<&String> = prompts
+        .iter()
+        .filter(|p| p.trim_start().starts_with("Ticket issue:"))
+        .collect();
+    assert_eq!(implement.len(), 1, "one resumed implement run");
+    assert!(
+        implement[0].contains("first answer words"),
+        "delivered q1 must survive the restart:\n{}",
+        implement[0]
+    );
+    assert!(
+        !implement[0].contains("mid-attempt words"),
+        "mid-attempt q2 must wait for the next boundary:\n{}",
+        implement[0]
+    );
+
+    // Pass 3 (fresh attempt): q2 delivered exactly once, q1 never again.
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("FACTORY_PI_BIN", &cap)
+        .env("PROMPTS_LOG", prompts_log(&h))
+        .assert()
+        .success();
+    let ledger = ledger_json(&h);
+    let delivered_after: Vec<String> = ledger
+        .get("delivered_answers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(
+        delivered_after.len(),
+        2,
+        "q2 delivered exactly once at the next boundary:\n{ledger}"
+    );
+    let prompts = read_prompts(&h);
+    let implement: Vec<&String> = prompts
+        .iter()
+        .filter(|p| p.trim_start().starts_with("Ticket issue:"))
+        .collect();
+    assert_eq!(implement.len(), 2, "resume run plus one fresh attempt");
+    let last = implement.last().unwrap();
+    assert!(
+        last.contains("mid-attempt words"),
+        "next attempt must carry q2:\n{last}"
+    );
+    assert!(
+        !last.contains("first answer words"),
+        "q1 must stay single-use:\n{last}"
+    );
+}
+
+/// A conflicting resume refuses instead of forking: with the pass lock
+/// held elsewhere, nothing is admitted and history is untouched.
+#[test]
+fn conflicting_resume_refuses_without_forking() {
+    let h = setup("conflict-resume");
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+    repo_branch(&h, "factory/T11-widget");
+    let resumable = crafted_attempt(
+        &h,
+        11,
+        1,
+        "implement_interrupted",
+        "implement",
+        Some("interrupted during implement (slot T11-a1) — resumable\n"),
+    );
+    write_ledger(&h, &format!(r#"{{"attempts":[{resumable}]}}"#));
+    fs::create_dir_all(h.state.join(".lock")).unwrap();
+    let before = ledger_raw(&h);
+
+    let out = factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("another dispatcher holds the lock"),
+        "conflicting pass must refuse:\n{out}"
+    );
+    assert_eq!(
+        ledger_raw(&h),
+        before,
+        "conflicting resume must not fork history"
+    );
+}
+
+/// The newest resumable checkpoint wins: older interrupted history is left
+/// untouched while the newest resumes on its own record.
+#[test]
+fn newest_resumable_wins_and_older_history_untouched() {
+    let h = setup("newest-resume");
+    write_view(&h, 11, "Widget", "Build it.", &["ticket", "ready"], "OPEN");
+    repo_branch(&h, "factory/T11-widget");
+    let older = crafted_attempt(
+        &h,
+        11,
+        1,
+        "plan_interrupted",
+        "plan",
+        Some("interrupted during plan (slot T11-a1) — resumable\n"),
+    );
+    let log2 = h.state.join("logs").join("T11-a2-impl.log");
+    fs::create_dir_all(log2.parent().unwrap()).unwrap();
+    fs::write(
+        &log2,
+        "interrupted during implement (slot T11-a2) — resumable\n",
+    )
+    .unwrap();
+    let newer = format!(
+        r#"{{"id":2,"ticket":11,"attempt_no":2,"base_commit":"{}","head_commit":"","branch":"factory/T11-widget","worktree":"","status":"implement_interrupted","exit_code":0,"log_path":"{}","started_at":"s","finished_at":"","train_branch":"","phase":"implement"}}"#,
+        repo_head(&h),
+        log2.to_string_lossy()
+    );
+    write_ledger(&h, &format!(r#"{{"attempts":[{older},{newer}]}}"#));
+    let older_log_before =
+        fs::read_to_string(h.state.join("logs").join("T11-a1-impl.log")).unwrap();
+
+    factory_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success();
+
+    let ledger = ledger_json(&h);
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 2, "resume must not fork:\n{ledger}");
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("plan_interrupted"),
+        "older history untouched:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(0),
+        "older record gains no resume mark:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[1].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "newest checkpoint resumes:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[1].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "newest resumes to completion:\n{ledger}"
+    );
+    assert_eq!(
+        fs::read_to_string(h.state.join("logs").join("T11-a1-impl.log")).unwrap(),
+        older_log_before,
+        "older transcript untouched"
     );
 }
