@@ -6014,6 +6014,11 @@ struct DispatchAttempt {
     finished_at: String,
     #[serde(default)]
     train_branch: String,
+    /// Checkpointed phase (ticket #60, spec #59): plan | implement |
+    /// verify | review. `#[serde(default)]` keeps pre-checkpoint ledgers
+    /// parsing; missing/empty reads as phase-unknown under the old rules.
+    #[serde(default)]
+    phase: String,
 }
 
 #[derive(Serialize, serde::Deserialize, Default)]
@@ -6110,6 +6115,79 @@ fn save_ledger(state: &std::path::Path, ledger: &DispatchLedger) -> Result<(), S
     std::fs::write(&tmp, text).map_err(|e| format!("cannot write ledger: {e}"))?;
     std::fs::rename(&tmp, ledger_path(state)).map_err(|e| format!("cannot replace ledger: {e}"))?;
     Ok(())
+}
+
+// --- replayable attempts, slice 1: phase checkpoints (ticket #60, spec #59)
+//
+// Each attempt records its phase as it moves (plan, implement, verify,
+// review); the checkpoint is committed BEFORE side-effecting work begins,
+// never after. A kill mid-tool surfaces as interrupted (resumable) —
+// visibly distinct from failed (a negative tool, test, or review verdict,
+// which keeps its existing *_failed status byte-for-byte).
+//
+// Atomicity: the checkpoint rides the same temp-file + rename as every
+// ledger write, so a crash during the checkpoint itself leaves either the
+// old or the new ledger on disk, never a torn one. The
+// FACTORY_CHECKPOINT_CRASH seam below exists only to pin that guarantee
+// in tests: it writes tmp and exits before the rename, exactly like a
+// kill -9 at that instant.
+
+/// Attempt phases in run order. The checkpoint is committed before each
+/// phase's side-effecting work begins.
+const ATTEMPT_PHASES: &[&str] = &["plan", "implement", "verify", "review"];
+
+/// Phase on the record, or "unknown" for ledgers written before
+/// checkpoints existed (no migration: old rows behave under the old rules).
+fn attempt_phase(a: &DispatchAttempt) -> &str {
+    if a.phase.is_empty() {
+        "unknown"
+    } else {
+        a.phase.as_str()
+    }
+}
+
+/// `true` for `{phase}_interrupted`: killed, expired, or stopped mid-tool
+/// (resumable). Negative verdicts stay `{stage}_failed` (needs a fix).
+fn is_interrupted_status(status: &str) -> bool {
+    status.ends_with("_interrupted")
+}
+
+/// Resumable machines read: interrupted attempts may run again without
+/// consuming the attempt budget. Shared by human and JSON modes.
+fn is_resumable(a: &DispatchAttempt) -> bool {
+    is_interrupted_status(&a.status)
+}
+
+/// Commit the phase checkpoint before side-effecting work begins. Atomic
+/// (tmp + rename): a crash between the two leaves the previous ledger.
+fn checkpoint_phase(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    idx: usize,
+    phase: &str,
+) -> Result<(), String> {
+    debug_assert!(ATTEMPT_PHASES.contains(&phase), "unknown phase {phase}");
+    ledger.attempts[idx].phase = phase.to_string();
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let tmp = state.join("dispatch.json.tmp");
+    let text = serde_json::to_string_pretty(&*ledger)
+        .map_err(|e| format!("cannot serialize ledger: {e}"))?;
+    std::fs::write(&tmp, &text).map_err(|e| format!("cannot write ledger: {e}"))?;
+    // Test-only kill seam: behave exactly like a crash after the tmp
+    // write but before the rename (orphaned tmp, previous ledger intact).
+    if std::env::var("FACTORY_CHECKPOINT_CRASH").as_deref() == Ok(phase) {
+        std::process::exit(1);
+    }
+    std::fs::rename(&tmp, ledger_path(state)).map_err(|e| format!("cannot replace ledger: {e}"))?;
+    Ok(())
+}
+
+/// Test-only kill seam: when FACTORY_KILL_PHASE names this phase, behave
+/// exactly like a kill mid-tool — the checkpointed phase is already on
+/// disk, the attempt reads interrupted (resumable), never failed.
+fn simulated_kill_phase(phase: &str) -> bool {
+    std::env::var("FACTORY_KILL_PHASE").as_deref() == Ok(phase)
 }
 
 /// Atomic mkdir lock so two concurrent `dispatch once` processes serialize
@@ -6601,6 +6679,42 @@ fn finish_attempt(
     }
 }
 
+/// Mark the checkpointed attempt interrupted (resumable) after a kill
+/// mid-tool (ticket #60, spec #59): the phase on the record names where it
+/// stopped, the status stays visibly distinct from failed, the ticket keeps
+/// its ready label so the next pass resumes, and the worktree is released
+/// (resume recreates it from the recorded phase). Counts as attempted.
+fn interrupt_attempt(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    idx: usize,
+    log_path: &std::path::Path,
+    worktree: &std::path::Path,
+    ticket: u64,
+    phase: &str,
+) -> TicketOutcome {
+    let attempt_no = ledger.attempts[idx].attempt_no;
+    let slot = format!("T{ticket}-a{attempt_no}");
+    append_log(
+        log_path,
+        &format!("interrupted during {phase} (slot {slot}) — resumable\n"),
+    );
+    ledger.attempts[idx].status = format!("{phase}_interrupted");
+    ledger.attempts[idx].finished_at = now_stamp();
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+    }
+    println!("  interrupted during {phase} — resumable next pass");
+    gh_comment(
+        ticket,
+        &format!(
+            "DISPATCH: attempt {attempt_no} interrupted during {phase} (resumable) — the next pass resumes from the checkpoint."
+        ),
+    );
+    remove_worktree(worktree);
+    TicketOutcome::Done
+}
+
 #[allow(clippy::too_many_lines)]
 fn cmd_dispatch_ticket(
     state: &std::path::Path,
@@ -6702,7 +6816,18 @@ fn cmd_dispatch_ticket(
         return TicketOutcome::Skipped;
     }
     let spec = linked_spec(&body);
-    let attempt_no = past + 1;
+    // Numbering follows the newest record, not the budget count: an
+    // interrupted attempt is resumable (outside the done/failed budget)
+    // but still occupies its number. Identical to past + 1 when no
+    // interrupted row exists.
+    let attempt_no = ledger
+        .attempts
+        .iter()
+        .filter(|a| a.ticket == ticket)
+        .map(|a| a.attempt_no)
+        .max()
+        .unwrap_or(0)
+        + 1;
     let slot = format!("T{ticket}-a{attempt_no}");
     if dry_run {
         println!(
@@ -6737,6 +6862,7 @@ fn cmd_dispatch_ticket(
                 started_at: now_stamp(),
                 finished_at: now_stamp(),
                 train_branch: open_train_branch.clone(),
+                phase: "unknown".to_string(),
             });
             log_event(&log_path, id, ticket, "spec-gate", 1);
             gh_comment(ticket, &format!("DISPATCH: linked spec #{s} body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs."));
@@ -6818,10 +6944,17 @@ fn cmd_dispatch_ticket(
         started_at: now_stamp(),
         finished_at: String::new(),
         train_branch: open_train_branch.clone(),
+        phase: "plan".to_string(),
     });
     let idx = ledger.attempts.len() - 1;
-    if let Err(e) = save_ledger(state, ledger) {
+    // Plan checkpoint: committed before any side-effecting work begins.
+    if let Err(e) = checkpoint_phase(state, ledger, idx, "plan") {
         eprintln!("dispatch: {e}");
+        remove_worktree(&wt);
+        return TicketOutcome::Skipped;
+    }
+    if simulated_kill_phase("plan") {
+        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "plan");
     }
 
     // --- implement ---
@@ -6879,6 +7012,15 @@ fn cmd_dispatch_ticket(
         &log_path,
         &format!("dispatch attempt {slot} implement base={base} branch={branch}\n"),
     );
+    // Implement checkpoint: committed before the implementer runs.
+    if let Err(e) = checkpoint_phase(state, ledger, idx, "implement") {
+        eprintln!("dispatch: {e}");
+        remove_worktree(&wt);
+        return TicketOutcome::Skipped;
+    }
+    if simulated_kill_phase("implement") {
+        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "implement");
+    }
     println!("  implement: pi -p (slot {slot})");
     let (ok, _) = run_phase(
         &pi_bin(),
@@ -6914,6 +7056,15 @@ fn cmd_dispatch_ticket(
         remove_worktree(&wt);
         return TicketOutcome::Done;
     };
+    // Verify checkpoint: committed before the check adapter runs.
+    if let Err(e) = checkpoint_phase(state, ledger, idx, "verify") {
+        eprintln!("dispatch: {e}");
+        remove_worktree(&wt);
+        return TicketOutcome::Skipped;
+    }
+    if simulated_kill_phase("verify") {
+        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "verify");
+    }
     let (vok, _) = run_phase(
         &adapter.to_string_lossy(),
         &[],
@@ -7035,6 +7186,17 @@ fn cmd_dispatch_ticket(
         }
     }
     let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
+    // Review checkpoint: committed before the reviewer runs.
+    if let Err(e) = checkpoint_phase(state, ledger, idx, "review") {
+        eprintln!("dispatch: {e}");
+        remove_worktree(&rwt);
+        remove_worktree(&wt);
+        return TicketOutcome::Skipped;
+    }
+    if simulated_kill_phase("review") {
+        remove_worktree(&rwt);
+        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "review");
+    }
     println!("  review: pi -p");
     let (_, rout) = run_phase(
         &pi_bin(),
@@ -7369,6 +7531,8 @@ pub fn cmd_status(json: bool) -> i32 {
                 "attempt": a.attempt_no,
                 "slot": format!("T{}-a{}", a.ticket, a.attempt_no),
                 "status": a.status,
+                "phase": attempt_phase(a),
+                "resumable": is_resumable(a),
                 "base": a.base_commit,
                 "head": a.head_commit,
                 "started": a.started_at,
@@ -7466,6 +7630,14 @@ pub fn cmd_status(json: bool) -> i32 {
                     "Ticket {} attempt {} is being reviewed (slot {}, started {}).",
                     a.ticket, a.attempt_no, slot, a.started_at
                 ),
+                s if is_interrupted_status(s) => println!(
+                    "Ticket {} attempt {} interrupted during {} (slot {}, started {}, resumable).",
+                    a.ticket,
+                    a.attempt_no,
+                    attempt_phase(a),
+                    slot,
+                    a.started_at
+                ),
                 other => {
                     if a.finished_at.is_empty() {
                         println!(
@@ -7528,6 +7700,13 @@ fn log_summary(a: &DispatchAttempt) -> String {
         "review_failed" => format!(
             "Ticket {} attempt {} failed review: changes requested or merge blocked.",
             a.ticket, a.attempt_no
+        ),
+        s if is_interrupted_status(s) => format!(
+            "Ticket {} attempt {} interrupted during {} (slot {}, resumable).",
+            a.ticket,
+            a.attempt_no,
+            attempt_phase(a),
+            slot
         ),
         other => format!(
             "Ticket {} attempt {} finished: {other} (slot {}).",
@@ -7615,6 +7794,8 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
             "slot": format!("T{}-a{}", a.ticket, a.attempt_no),
             "status": a.status,
             "summary": log_summary(a),
+            "phase": attempt_phase(a),
+            "resumable": is_resumable(a),
             "base": a.base_commit,
             "head": a.head_commit,
             "started": a.started_at,
@@ -7702,9 +7883,18 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
         for a in &ledger.attempts {
             let base8: String = a.base_commit.chars().take(8).collect();
             let head8: String = a.head_commit.chars().take(8).collect();
+            let resumable = if is_resumable(a) { " resumable" } else { "" };
             println!(
-                "#{} T{} a{} {} base={} head={} {}",
-                a.id, a.ticket, a.attempt_no, a.status, base8, head8, a.started_at
+                "#{} T{} a{} {} phase={}{} base={} head={} {}",
+                a.id,
+                a.ticket,
+                a.attempt_no,
+                a.status,
+                attempt_phase(a),
+                resumable,
+                base8,
+                head8,
+                a.started_at
             );
         }
         println!();
