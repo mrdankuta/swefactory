@@ -6019,6 +6019,12 @@ struct DispatchAttempt {
     /// parsing; missing/empty reads as phase-unknown under the old rules.
     #[serde(default)]
     phase: String,
+    /// Resume count (ticket #61, spec #59): how many dispatch passes have
+    /// resumed this attempt from its checkpoint. `#[serde(default)]` keeps
+    /// pre-resume ledgers parsing (0 = never resumed); surfaced in every
+    /// human and machine status/log row so an audit tells a resume apart.
+    #[serde(default)]
+    resumed: u64,
 }
 
 #[derive(Serialize, serde::Deserialize, Default)]
@@ -6156,6 +6162,31 @@ fn is_interrupted_status(status: &str) -> bool {
 /// consuming the attempt budget. Shared by human and JSON modes.
 fn is_resumable(a: &DispatchAttempt) -> bool {
     is_interrupted_status(&a.status)
+}
+
+/// Newest resumable checkpoint wins (ticket #61, spec #59): the newest
+/// record for this ticket, when it reads interrupted. An older
+/// interrupted row under a newer running/done/failed row never resumes —
+/// the newer history stands and no fork is admitted.
+fn newest_resumable_index(ledger: &DispatchLedger, ticket: u64) -> Option<usize> {
+    let newest = ledger
+        .attempts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.ticket == ticket)
+        .max_by_key(|(_, a)| (a.attempt_no, a.id))
+        .map(|(i, _)| i)?;
+    is_resumable(&ledger.attempts[newest]).then_some(newest)
+}
+
+/// Words shared by every human surface when an attempt carries resume
+/// history; empty for never-resumed rows so old output is byte-identical.
+fn resumed_suffix(a: &DispatchAttempt) -> String {
+    if a.resumed == 0 {
+        String::new()
+    } else {
+        format!(" Resumed from checkpoint {} time(s).", a.resumed)
+    }
 }
 
 /// Commit the phase checkpoint before side-effecting work begins. Atomic
@@ -6679,6 +6710,49 @@ fn finish_attempt(
     }
 }
 
+/// Reap stale leases at pass start (ticket #61, spec #59): any record
+/// still reading running while this pass holds the lock belongs to a dead
+/// worker (kill -9, reboot, STOP between passes) — no live pass can exist
+/// beside the lock holder. Reaping marks it `{phase}_interrupted`
+/// (resumable) with an audible log line and ticket comment, and never
+/// deletes anything. Skipped under dry-run, which writes nothing.
+fn reap_stale_leases(state: &std::path::Path, ledger: &mut DispatchLedger) -> usize {
+    let mut reaped = 0;
+    for i in 0..ledger.attempts.len() {
+        let status = ledger.attempts[i].status.clone();
+        if status != "impl_running" && status != "review_running" {
+            continue;
+        }
+        let phase = attempt_phase(&ledger.attempts[i]).to_string();
+        let ticket = ledger.attempts[i].ticket;
+        let attempt_no = ledger.attempts[i].attempt_no;
+        let slot = format!("T{ticket}-a{attempt_no}");
+        let log_path = ledger.attempts[i].log_path.clone();
+        append_log(
+            Path::new(&log_path),
+            &format!(
+                "lease expired during {phase} (slot {slot}, stale worker) — marked resumable\n"
+            ),
+        );
+        ledger.attempts[i].status = format!("{phase}_interrupted");
+        ledger.attempts[i].finished_at = now_stamp();
+        println!(
+            "dispatch: #{ticket} attempt {attempt_no} stale (was {status}) — marked {phase}_interrupted (resumable)"
+        );
+        gh_comment(
+            ticket,
+            &format!("DISPATCH: attempt {attempt_no} lease expired during {phase} (stale worker) — marked resumable; the next pass resumes from the checkpoint."),
+        );
+        reaped += 1;
+    }
+    if reaped > 0 {
+        if let Err(e) = save_ledger(state, ledger) {
+            eprintln!("dispatch: {e}");
+        }
+    }
+    reaped
+}
+
 /// Mark the checkpointed attempt interrupted (resumable) after a kill
 /// mid-tool (ticket #60, spec #59): the phase on the record names where it
 /// stopped, the status stays visibly distinct from failed, the ticket keeps
@@ -6713,6 +6787,531 @@ fn interrupt_attempt(
     );
     remove_worktree(worktree);
     TicketOutcome::Done
+}
+
+/// Phase context for one attempt run (ticket #61, spec #59): everything a
+/// pass needs to (re)run phases, whether the attempt is fresh or resumed
+/// from its checkpoint.
+struct PhaseCtx {
+    ticket: u64,
+    attempt_no: u64,
+    id: u64,
+    slot: String,
+    branch: String,
+    base: String,
+    title: String,
+    spec_label: String,
+    log_path: PathBuf,
+    wt: PathBuf,
+    tmpdir: PathBuf,
+    open_train_branch: String,
+    max_attempts: u64,
+}
+
+/// Run attempt phases from `start_phase` onward (ticket #61, spec #59).
+/// Fresh attempts start at implement (plan checkpoints before this call);
+/// resumes start at their checkpointed phase, so completed phases are not
+/// repeated — the same record, log file, and slot continue. Unknown phases
+/// replay from implement, the safe superset.
+fn run_attempt_phases(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    idx: usize,
+    ctx: &PhaseCtx,
+    start_phase: &str,
+    brief: &str,
+) -> TicketOutcome {
+    let ticket = ctx.ticket;
+    let attempt_no = ctx.attempt_no;
+    let id = ctx.id;
+    let max_attempts = ctx.max_attempts;
+    let slot = ctx.slot.as_str();
+    let branch = ctx.branch.as_str();
+    let base = ctx.base.as_str();
+    let title = ctx.title.as_str();
+    let spec_label = ctx.spec_label.as_str();
+    let open_train_branch = ctx.open_train_branch.as_str();
+    let log_path = ctx.log_path.as_path();
+    let wt = ctx.wt.as_path();
+    let tmpdir = ctx.tmpdir.as_path();
+    let from = ATTEMPT_PHASES
+        .iter()
+        .position(|p| *p == start_phase)
+        .unwrap_or(1);
+    let _ = std::fs::write(wt.join(".factory-brief.md"), brief);
+    let build_prompt = PathBuf::from(".pi/prompts/build.md");
+    if build_prompt.is_file() {
+        if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
+            let _ = std::fs::write(wt.join(".factory-prompt.md"), format!("{prefix}{brief}"));
+        }
+    }
+    let prompt = std::fs::read_to_string(wt.join(".factory-prompt.md"))
+        .unwrap_or_else(|_| brief.to_string());
+    if from <= 1 {
+        append_log(
+            log_path,
+            &format!("dispatch attempt {slot} implement base={base} branch={branch}\n"),
+        );
+        // Implement checkpoint: committed before the implementer runs.
+        if let Err(e) = checkpoint_phase(state, ledger, idx, "implement") {
+            eprintln!("dispatch: {e}");
+            remove_worktree(wt);
+            return TicketOutcome::Skipped;
+        }
+        if simulated_kill_phase("implement") {
+            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "implement");
+        }
+        println!("  implement: pi -p (slot {slot})");
+        let (ok, _) = run_phase(
+            &pi_bin(),
+            &["-p", &prompt],
+            wt,
+            slot,
+            tmpdir,
+            log_path,
+            "implement",
+            id,
+            ticket,
+        );
+        if !ok {
+            println!("  implement failed — will retry next pass");
+            gh_comment(ticket, &format!("DISPATCH: implementer failed (attempt {attempt_no}/{max_attempts}). Log kept in dispatcher state."));
+            finish_attempt(state, ledger, idx, "impl_failed", 1);
+            remove_worktree(wt);
+            return TicketOutcome::Done;
+        }
+    }
+    if from <= 2 {
+        println!("  verify: check adapter");
+        let adapter = std::env::var_os("FACTORY_CHECK_ADAPTER")
+            .map(PathBuf::from)
+            .or_else(discover_adapter);
+        let Some(adapter) = adapter else {
+            append_log(log_path, "verify: no check adapter found\n");
+            gh_comment(
+                ticket,
+                &format!("DISPATCH: no check adapter found (attempt {attempt_no}/{max_attempts})."),
+            );
+            finish_attempt(state, ledger, idx, "impl_failed", 1);
+            remove_worktree(wt);
+            return TicketOutcome::Done;
+        };
+        // Verify checkpoint: committed before the check adapter runs.
+        if let Err(e) = checkpoint_phase(state, ledger, idx, "verify") {
+            eprintln!("dispatch: {e}");
+            remove_worktree(wt);
+            return TicketOutcome::Skipped;
+        }
+        if simulated_kill_phase("verify") {
+            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "verify");
+        }
+        let (vok, _) = run_phase(
+            &adapter.to_string_lossy(),
+            &[],
+            wt,
+            slot,
+            tmpdir,
+            log_path,
+            "verify",
+            id,
+            ticket,
+        );
+        if !vok {
+            println!("  checks FAILED — routing back");
+            let log_text = std::fs::read_to_string(log_path).unwrap_or_default();
+            gh_comment(ticket, &format!("DISPATCH: factory-check failed (attempt {attempt_no}/{max_attempts}). Tail:\n```\n{}\n```", last_lines(&log_text, 30)));
+            finish_attempt(state, ledger, idx, "impl_failed", 1);
+            remove_worktree(wt);
+            return TicketOutcome::Done;
+        }
+    }
+    // Review resumes straight onto the recorded head; earlier phases overwrite it above.
+    let mut head = ledger.attempts[idx].head_commit.clone();
+    if from <= 2 {
+        // --- evidence: HANDOFF.md goes to the issue, scaffolding never commits ---
+        let mut handoff_text = String::new();
+        let handoff_path = wt.join("HANDOFF.md");
+        if handoff_path.is_file() {
+            handoff_text = std::fs::read_to_string(&handoff_path).unwrap_or_default();
+            gh_comment(ticket, &handoff_text);
+            println!("  handoff posted to #{ticket}");
+        }
+        let _ = std::fs::remove_file(wt.join(".factory-brief.md"));
+        let _ = std::fs::remove_file(wt.join(".factory-prompt.md"));
+        let _ = std::fs::remove_file(&handoff_path);
+
+        // --- head must exist ---
+        let cur = git_head(wt);
+        let _ = run_git(&["add", "-A"], Some(wt));
+        let staged_clean = run_git(&["diff", "--cached", "--quiet"], Some(wt))
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        head = cur.clone();
+        if staged_clean && cur == base {
+            if handoff_text.is_empty() {
+                println!("  no changes produced — releasing");
+                gh_comment(
+                    ticket,
+                    "DISPATCH: implementer produced no changes. Human decision required.",
+                );
+                finish_attempt(state, ledger, idx, "impl_done", 0);
+                remove_worktree(wt);
+                return TicketOutcome::Done;
+            }
+            let _ = run_git(
+                &[
+                    "-c",
+                    "user.name=factory-dispatch",
+                    "-c",
+                    "user.email=factory@local",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    &format!("feat(T{ticket}): {title} [handoff-only]"),
+                ],
+                Some(wt),
+            );
+            head = git_head(wt);
+        } else if !staged_clean {
+            let _ = run_git(
+                &[
+                    "-c",
+                    "user.name=factory-dispatch",
+                    "-c",
+                    "user.email=factory@local",
+                    "commit",
+                    "-qm",
+                    &format!("feat(T{ticket}): {title}"),
+                ],
+                Some(wt),
+            );
+            head = git_head(wt);
+        }
+        ledger.attempts[idx].head_commit = head.clone();
+        ledger.attempts[idx].exit_code = 0;
+        ledger.attempts[idx].status = "impl_done".to_string();
+        if let Err(e) = save_ledger(state, ledger) {
+            eprintln!("dispatch: {e}");
+        }
+        gh_relabel(ticket, Some("ready"), "review");
+    }
+    // --- review (second detached worktree, reviewer output parsed, posted) ---
+    let short = head.chars().take(8).collect::<String>();
+    let rwt = state.join("worktrees").join(format!("review-{short}"));
+    let rwt_s = rwt.to_string_lossy().to_string();
+    if run_git(&["worktree", "add", "--detach", &rwt_s, &head], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        // worktree ready
+    } else {
+        println!("  review worktree failed — routing back to ready");
+        gh_relabel(ticket, Some("review"), "ready");
+        finish_attempt(state, ledger, idx, "review_failed", 1);
+        remove_worktree(wt);
+        return TicketOutcome::Done;
+    }
+    ledger.attempts[idx].status = "review_running".to_string();
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+    }
+    let rlog = state
+        .join("logs")
+        .join(format!("T{ticket}-a{attempt_no}-review.log"));
+    let report_path = state
+        .join("logs")
+        .join(format!("T{ticket}-a{attempt_no}-report.md"));
+    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with: VERDICT: accept|changes_requested\n\n", report_path.display());
+    let review_prompt = PathBuf::from(".pi/prompts/review.md");
+    if review_prompt.is_file() {
+        if let Ok(suffix) = std::fs::read_to_string(&review_prompt) {
+            review_brief.push_str(&suffix);
+        }
+    }
+    let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
+    // Review checkpoint: committed before the reviewer runs.
+    if let Err(e) = checkpoint_phase(state, ledger, idx, "review") {
+        eprintln!("dispatch: {e}");
+        remove_worktree(&rwt);
+        remove_worktree(wt);
+        return TicketOutcome::Skipped;
+    }
+    if simulated_kill_phase("review") {
+        remove_worktree(&rwt);
+        return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "review");
+    }
+    println!("  review: pi -p");
+    let (_, rout) = run_phase(
+        &pi_bin(),
+        &["-p", &review_brief],
+        &rwt,
+        slot,
+        tmpdir,
+        &rlog,
+        "review",
+        id,
+        ticket,
+    );
+    let _ = std::fs::remove_file(rwt.join(".factory-review-brief.md"));
+    let verdict = parse_verdict(&rout);
+    if report_path.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&report_path) {
+            gh_comment(ticket, &text);
+        }
+    } else {
+        gh_comment(
+            ticket,
+            &format!(
+                "DISPATCH: reviewer verdict: {}. Review log kept in dispatcher state.",
+                verdict.as_deref().unwrap_or("none")
+            ),
+        );
+    }
+    remove_worktree(&rwt);
+    remove_worktree(wt);
+    if verdict.as_deref() == Some("accept") {
+        // Accept path: with an open train, auto-merge cleanly or route to
+        // blocked on conflict (never forced). With no open train, auto-cut
+        // a default-slug train (T35) and merge there instead of waiting;
+        // a concurrently opened train is merged into, never duplicated.
+        // Never merges into dev/main, never pushes.
+        if !open_train_branch.is_empty() {
+            match do_train_merge(ticket, branch, open_train_branch, state) {
+                Ok(short) => {
+                    gh_relabel(ticket, Some("review"), "integrated");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted; merged into train `{open_train_branch}` ({short}). Human: covered by the train→dev review."));
+                    println!("  ACCEPTED + INTEGRATED into {open_train_branch} — #{ticket}");
+                    finish_attempt(state, ledger, idx, "review_done", 0);
+                }
+                Err(e) => {
+                    println!("  merge into train failed — routing to blocked (never forced)");
+                    gh_relabel(ticket, Some("review"), "blocked");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted but merge into train `{open_train_branch}` failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
+                    finish_attempt(state, ledger, idx, "review_failed", 0);
+                }
+            }
+        } else {
+            // Auto-cut (T35): no open train, so cut one (default slug)
+            // and merge the accepted ticket into it. A concurrent open
+            // refuses the cut — merge into that train instead, never a
+            // second train. Any other cut failure falls back to the old
+            // accepted-only record (base→head, human owns the land).
+            let train = match cut_train(state, None) {
+                Ok(t) => {
+                    println!("  auto-cut train {t} (no open train)");
+                    Some(t)
+                }
+                Err(e) if e.contains("already open") => {
+                    match load_open_train(state) {
+                        Some(t) => {
+                            println!(
+                            "  train opened concurrently ({}) — merging there, never a second train",
+                            t.branch
+                        );
+                            Some(t.branch)
+                        }
+                        None => {
+                            eprintln!("dispatch: auto-cut race ({e}) with no open train — recording accepted");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dispatch: auto-cut failed ({e}) — recording accepted");
+                    None
+                }
+            };
+            match train {
+                Some(t) => {
+                    ledger.attempts[idx].train_branch = t.clone();
+                    if let Err(e) = save_ledger(state, ledger) {
+                        eprintln!("dispatch: {e}");
+                    }
+                    match do_train_merge(ticket, branch, &t, state) {
+                        Ok(short) => {
+                            gh_relabel(ticket, Some("review"), "integrated");
+                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` and merged into it ({short}). Human: covered by the train→dev review."));
+                            println!("  ACCEPTED + INTEGRATED into {t} (auto-cut) — #{ticket}");
+                            finish_attempt(state, ledger, idx, "review_done", 0);
+                        }
+                        Err(e) => {
+                            println!("  merge into auto-cut train failed — routing to blocked (never forced)");
+                            gh_relabel(ticket, Some("review"), "blocked");
+                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` but merge failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
+                            finish_attempt(state, ledger, idx, "review_failed", 0);
+                        }
+                    }
+                }
+                None => {
+                    // Accepted: human owns the land. Record base→head, never merge/push.
+                    gh_relabel(ticket, Some("review"), "accepted");
+                    gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
+                    println!("  ACCEPTED — #{ticket} awaiting human land");
+                    finish_attempt(state, ledger, idx, "review_done", 0);
+                }
+            }
+        }
+    } else {
+        println!("  changes_requested (or unreadable verdict) — back to ready");
+        gh_relabel(ticket, Some("review"), "ready");
+        finish_attempt(state, ledger, idx, "review_failed", 0);
+    }
+    TicketOutcome::Done
+}
+/// Resume the newest resumable checkpoint (ticket #61, spec #59): the same
+/// attempt continues its phase with its transcript preserved, instead of
+/// opening a fresh attempt. The slot gate holds (no resume is admitted at
+/// capacity), dry-run announces but writes nothing, and mid-attempt answers
+/// still wait for the next attempt boundary — only already-delivered
+/// answers are replayed into the resumed brief, so a restart never loses
+/// them and never redelivers anything new.
+fn resume_ticket_attempt(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    ticket: u64,
+    idx: usize,
+    view: &serde_json::Value,
+    dry_run: bool,
+) -> TicketOutcome {
+    let attempt_no = ledger.attempts[idx].attempt_no;
+    let phase = attempt_phase(&ledger.attempts[idx]).to_string();
+    let slot = format!("T{ticket}-a{attempt_no}");
+    // Slot gate: a resume is admitted exactly like fresh work — never past
+    // capacity. The pass loop checks this too; this is the enforcement at
+    // the admission point itself.
+    if dispatch_active(ledger) >= dispatch_max_concurrent() {
+        println!("dispatch: #{ticket} resume deferred — slot gate at capacity");
+        return TicketOutcome::Skipped;
+    }
+    if dry_run {
+        println!("dry-run: would resume #{ticket} attempt {attempt_no} from {phase} checkpoint (no writes)");
+        return TicketOutcome::Skipped;
+    }
+    let record_branch = ledger.attempts[idx].branch.clone();
+    let record_base = ledger.attempts[idx].base_commit.clone();
+    let record_log = ledger.attempts[idx].log_path.clone();
+    let wt = state.join("worktrees").join(&slot);
+    let tmpdir = state.join("tmp").join(&slot);
+    let _ = std::fs::create_dir_all(&tmpdir);
+    // Recreate the worktree the interruption released. The branch survives
+    // every interruption, so resume re-attaches; a missing branch (never
+    // observed, but cheap to survive) is cut fresh from the recorded base.
+    remove_worktree(&wt);
+    let branch_exists = run_git(&["rev-parse", "--verify", "--quiet", &record_branch], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let wt_s = wt.to_string_lossy().to_string();
+    let base = if record_base.is_empty() {
+        "HEAD".to_string()
+    } else {
+        record_base.clone()
+    };
+    let added = if branch_exists {
+        run_git(&["worktree", "add", &wt_s, &record_branch], None)
+    } else {
+        run_git(
+            &["worktree", "add", &wt_s, "-b", &record_branch, &base],
+            None,
+        )
+    };
+    match added {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            println!(
+                "dispatch: #{ticket} resume worktree add failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return TicketOutcome::Skipped;
+        }
+        Err(e) => {
+            println!("dispatch: #{ticket} resume worktree add failed: {e}");
+            return TicketOutcome::Skipped;
+        }
+    }
+    let n = ledger.attempts[idx].resumed + 1;
+    ledger.attempts[idx].resumed = n;
+    ledger.attempts[idx].status = if phase == "review" {
+        "review_running".to_string()
+    } else {
+        "impl_running".to_string()
+    };
+    ledger.attempts[idx].finished_at = String::new();
+    append_log(
+        Path::new(&record_log),
+        &format!(
+            "resumed from {phase} checkpoint (slot {slot}, resume #{n}) — transcript preserved\n"
+        ),
+    );
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("dispatch: {e}");
+        remove_worktree(&wt);
+        return TicketOutcome::Skipped;
+    }
+    println!("  resumed from {phase} checkpoint (resume #{n}) — continuing attempt {attempt_no}");
+    gh_comment(
+        ticket,
+        &format!("DISPATCH: attempt {attempt_no} resumed from {phase} checkpoint (resume #{n}) — continuing the same attempt, transcript preserved."),
+    );
+    // Answer boundary (ticket #44, unchanged): the resumed brief replays
+    // only answers already delivered to this ticket — anything Bea posted
+    // mid-attempt structurally waits for the next attempt. Delivery keys
+    // are untouched, so single-use still holds and the next fresh attempt
+    // picks the arrival up exactly once.
+    let title = view
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let body = view
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or("")
+        .to_string();
+    let spec_label = linked_spec(&body)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let comment_bodies: Vec<String> = view
+        .get("comments")
+        .and_then(|c| c.as_array())
+        .map(|comments| {
+            comments
+                .iter()
+                .filter_map(|c| c.get("body").and_then(|b| b.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (found, _) = collect_answers(&comment_bodies);
+    let replay: Vec<ParsedAnswer> = found
+        .into_iter()
+        .filter(|a| {
+            ledger
+                .delivered_answers
+                .contains(&answer_delivery_key(ticket, a))
+        })
+        .collect();
+    let mut brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {record_branch} (base {base})\n\n{body}\n");
+    if !replay.is_empty() {
+        brief.push('\n');
+        brief.push_str(&render_answers_section(&replay));
+    }
+    let live_train: String = load_open_train(state).map(|t| t.branch).unwrap_or_default();
+    let ctx = PhaseCtx {
+        ticket,
+        attempt_no,
+        id: ledger.attempts[idx].id,
+        slot,
+        branch: record_branch,
+        base,
+        title,
+        spec_label,
+        log_path: PathBuf::from(record_log),
+        wt,
+        tmpdir,
+        open_train_branch: live_train,
+        max_attempts: dispatch_max_attempts(),
+    };
+    run_attempt_phases(state, ledger, idx, &ctx, &phase, &brief)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6759,6 +7358,14 @@ fn cmd_dispatch_ticket(
     {
         println!("dispatch: #{ticket} already active — skip");
         return TicketOutcome::Skipped;
+    }
+    // Resume (ticket #61, spec #59): the newest resumable checkpoint wins —
+    // the same attempt continues its phase with its transcript preserved,
+    // instead of opening a fresh attempt. Admission gates (budget, deps,
+    // spec) were passed when the attempt opened; the slot gate is enforced
+    // inside before anything is admitted.
+    if let Some(r_idx) = newest_resumable_index(ledger, ticket) {
+        return resume_ticket_attempt(state, ledger, ticket, r_idx, &view, dry_run);
     }
     let past = ledger
         .attempts
@@ -6863,6 +7470,7 @@ fn cmd_dispatch_ticket(
                 finished_at: now_stamp(),
                 train_branch: open_train_branch.clone(),
                 phase: "unknown".to_string(),
+                resumed: 0,
             });
             log_event(&log_path, id, ticket, "spec-gate", 1);
             gh_comment(ticket, &format!("DISPATCH: linked spec #{s} body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs."));
@@ -6945,6 +7553,7 @@ fn cmd_dispatch_ticket(
         finished_at: String::new(),
         train_branch: open_train_branch.clone(),
         phase: "plan".to_string(),
+        resumed: 0,
     });
     let idx = ledger.attempts.len() - 1;
     // Plan checkpoint: committed before any side-effecting work begins.
@@ -6999,321 +7608,22 @@ fn cmd_dispatch_ticket(
             }
         }
     }
-    let _ = std::fs::write(wt.join(".factory-brief.md"), &brief);
-    let build_prompt = PathBuf::from(".pi/prompts/build.md");
-    if build_prompt.is_file() {
-        if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
-            let _ = std::fs::write(wt.join(".factory-prompt.md"), format!("{prefix}{brief}"));
-        }
-    }
-    let prompt =
-        std::fs::read_to_string(wt.join(".factory-prompt.md")).unwrap_or_else(|_| brief.clone());
-    append_log(
-        &log_path,
-        &format!("dispatch attempt {slot} implement base={base} branch={branch}\n"),
-    );
-    // Implement checkpoint: committed before the implementer runs.
-    if let Err(e) = checkpoint_phase(state, ledger, idx, "implement") {
-        eprintln!("dispatch: {e}");
-        remove_worktree(&wt);
-        return TicketOutcome::Skipped;
-    }
-    if simulated_kill_phase("implement") {
-        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "implement");
-    }
-    println!("  implement: pi -p (slot {slot})");
-    let (ok, _) = run_phase(
-        &pi_bin(),
-        &["-p", &prompt],
-        &wt,
-        &slot,
-        &tmpdir,
-        &log_path,
-        "implement",
-        id,
+    let ctx = PhaseCtx {
         ticket,
-    );
-    if !ok {
-        println!("  implement failed — will retry next pass");
-        gh_comment(ticket, &format!("DISPATCH: implementer failed (attempt {attempt_no}/{max_attempts}). Log kept in dispatcher state."));
-        finish_attempt(state, ledger, idx, "impl_failed", 1);
-        remove_worktree(&wt);
-        return TicketOutcome::Done;
-    }
-
-    // --- verify ---
-    println!("  verify: check adapter");
-    let adapter = std::env::var_os("FACTORY_CHECK_ADAPTER")
-        .map(PathBuf::from)
-        .or_else(discover_adapter);
-    let Some(adapter) = adapter else {
-        append_log(&log_path, "verify: no check adapter found\n");
-        gh_comment(
-            ticket,
-            &format!("DISPATCH: no check adapter found (attempt {attempt_no}/{max_attempts})."),
-        );
-        finish_attempt(state, ledger, idx, "impl_failed", 1);
-        remove_worktree(&wt);
-        return TicketOutcome::Done;
+        attempt_no,
+        id,
+        slot: slot.clone(),
+        branch: branch.clone(),
+        base: base.clone(),
+        title: title.clone(),
+        spec_label: spec_label.clone(),
+        log_path: log_path.clone(),
+        wt,
+        tmpdir,
+        open_train_branch: open_train_branch.clone(),
+        max_attempts,
     };
-    // Verify checkpoint: committed before the check adapter runs.
-    if let Err(e) = checkpoint_phase(state, ledger, idx, "verify") {
-        eprintln!("dispatch: {e}");
-        remove_worktree(&wt);
-        return TicketOutcome::Skipped;
-    }
-    if simulated_kill_phase("verify") {
-        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "verify");
-    }
-    let (vok, _) = run_phase(
-        &adapter.to_string_lossy(),
-        &[],
-        &wt,
-        &slot,
-        &tmpdir,
-        &log_path,
-        "verify",
-        id,
-        ticket,
-    );
-    if !vok {
-        println!("  checks FAILED — routing back");
-        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
-        gh_comment(ticket, &format!("DISPATCH: factory-check failed (attempt {attempt_no}/{max_attempts}). Tail:\n```\n{}\n```", last_lines(&log_text, 30)));
-        finish_attempt(state, ledger, idx, "impl_failed", 1);
-        remove_worktree(&wt);
-        return TicketOutcome::Done;
-    }
-
-    // --- evidence: HANDOFF.md goes to the issue, scaffolding never commits ---
-    let mut handoff_text = String::new();
-    let handoff_path = wt.join("HANDOFF.md");
-    if handoff_path.is_file() {
-        handoff_text = std::fs::read_to_string(&handoff_path).unwrap_or_default();
-        gh_comment(ticket, &handoff_text);
-        println!("  handoff posted to #{ticket}");
-    }
-    let _ = std::fs::remove_file(wt.join(".factory-brief.md"));
-    let _ = std::fs::remove_file(wt.join(".factory-prompt.md"));
-    let _ = std::fs::remove_file(&handoff_path);
-
-    // --- head must exist ---
-    let cur = git_head(&wt);
-    let _ = run_git(&["add", "-A"], Some(&wt));
-    let staged_clean = run_git(&["diff", "--cached", "--quiet"], Some(&wt))
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let mut head = cur.clone();
-    if staged_clean && cur == base {
-        if handoff_text.is_empty() {
-            println!("  no changes produced — releasing");
-            gh_comment(
-                ticket,
-                "DISPATCH: implementer produced no changes. Human decision required.",
-            );
-            finish_attempt(state, ledger, idx, "impl_done", 0);
-            remove_worktree(&wt);
-            return TicketOutcome::Done;
-        }
-        let _ = run_git(
-            &[
-                "-c",
-                "user.name=factory-dispatch",
-                "-c",
-                "user.email=factory@local",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                &format!("feat(T{ticket}): {title} [handoff-only]"),
-            ],
-            Some(&wt),
-        );
-        head = git_head(&wt);
-    } else if !staged_clean {
-        let _ = run_git(
-            &[
-                "-c",
-                "user.name=factory-dispatch",
-                "-c",
-                "user.email=factory@local",
-                "commit",
-                "-qm",
-                &format!("feat(T{ticket}): {title}"),
-            ],
-            Some(&wt),
-        );
-        head = git_head(&wt);
-    }
-    ledger.attempts[idx].head_commit = head.clone();
-    ledger.attempts[idx].exit_code = 0;
-    ledger.attempts[idx].status = "impl_done".to_string();
-    if let Err(e) = save_ledger(state, ledger) {
-        eprintln!("dispatch: {e}");
-    }
-    gh_relabel(ticket, Some("ready"), "review");
-
-    // --- review (second detached worktree, reviewer output parsed, posted) ---
-    let short = head.chars().take(8).collect::<String>();
-    let rwt = state.join("worktrees").join(format!("review-{short}"));
-    let rwt_s = rwt.to_string_lossy().to_string();
-    if run_git(&["worktree", "add", "--detach", &rwt_s, &head], None)
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        // worktree ready
-    } else {
-        println!("  review worktree failed — routing back to ready");
-        gh_relabel(ticket, Some("review"), "ready");
-        finish_attempt(state, ledger, idx, "review_failed", 1);
-        remove_worktree(&wt);
-        return TicketOutcome::Done;
-    }
-    ledger.attempts[idx].status = "review_running".to_string();
-    if let Err(e) = save_ledger(state, ledger) {
-        eprintln!("dispatch: {e}");
-    }
-    let rlog = state
-        .join("logs")
-        .join(format!("T{ticket}-a{attempt_no}-review.log"));
-    let report_path = state
-        .join("logs")
-        .join(format!("T{ticket}-a{attempt_no}-report.md"));
-    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with: VERDICT: accept|changes_requested\n\n", report_path.display());
-    let review_prompt = PathBuf::from(".pi/prompts/review.md");
-    if review_prompt.is_file() {
-        if let Ok(suffix) = std::fs::read_to_string(&review_prompt) {
-            review_brief.push_str(&suffix);
-        }
-    }
-    let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
-    // Review checkpoint: committed before the reviewer runs.
-    if let Err(e) = checkpoint_phase(state, ledger, idx, "review") {
-        eprintln!("dispatch: {e}");
-        remove_worktree(&rwt);
-        remove_worktree(&wt);
-        return TicketOutcome::Skipped;
-    }
-    if simulated_kill_phase("review") {
-        remove_worktree(&rwt);
-        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "review");
-    }
-    println!("  review: pi -p");
-    let (_, rout) = run_phase(
-        &pi_bin(),
-        &["-p", &review_brief],
-        &rwt,
-        &slot,
-        &tmpdir,
-        &rlog,
-        "review",
-        id,
-        ticket,
-    );
-    let _ = std::fs::remove_file(rwt.join(".factory-review-brief.md"));
-    let verdict = parse_verdict(&rout);
-    if report_path.is_file() {
-        if let Ok(text) = std::fs::read_to_string(&report_path) {
-            gh_comment(ticket, &text);
-        }
-    } else {
-        gh_comment(
-            ticket,
-            &format!(
-                "DISPATCH: reviewer verdict: {}. Review log kept in dispatcher state.",
-                verdict.as_deref().unwrap_or("none")
-            ),
-        );
-    }
-    remove_worktree(&rwt);
-    remove_worktree(&wt);
-    if verdict.as_deref() == Some("accept") {
-        // Accept path: with an open train, auto-merge cleanly or route to
-        // blocked on conflict (never forced). With no open train, auto-cut
-        // a default-slug train (T35) and merge there instead of waiting;
-        // a concurrently opened train is merged into, never duplicated.
-        // Never merges into dev/main, never pushes.
-        if !open_train_branch.is_empty() {
-            match do_train_merge(ticket, &branch, &open_train_branch, state) {
-                Ok(short) => {
-                    gh_relabel(ticket, Some("review"), "integrated");
-                    gh_comment(ticket, &format!("DISPATCH: review accepted; merged into train `{open_train_branch}` ({short}). Human: covered by the train→dev review."));
-                    println!("  ACCEPTED + INTEGRATED into {open_train_branch} — #{ticket}");
-                    finish_attempt(state, ledger, idx, "review_done", 0);
-                }
-                Err(e) => {
-                    println!("  merge into train failed — routing to blocked (never forced)");
-                    gh_relabel(ticket, Some("review"), "blocked");
-                    gh_comment(ticket, &format!("DISPATCH: review accepted but merge into train `{open_train_branch}` failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
-                    finish_attempt(state, ledger, idx, "review_failed", 0);
-                }
-            }
-        } else {
-            // Auto-cut (T35): no open train, so cut one (default slug)
-            // and merge the accepted ticket into it. A concurrent open
-            // refuses the cut — merge into that train instead, never a
-            // second train. Any other cut failure falls back to the old
-            // accepted-only record (base→head, human owns the land).
-            let train = match cut_train(state, None) {
-                Ok(t) => {
-                    println!("  auto-cut train {t} (no open train)");
-                    Some(t)
-                }
-                Err(e) if e.contains("already open") => {
-                    match load_open_train(state) {
-                        Some(t) => {
-                            println!(
-                            "  train opened concurrently ({}) — merging there, never a second train",
-                            t.branch
-                        );
-                            Some(t.branch)
-                        }
-                        None => {
-                            eprintln!("dispatch: auto-cut race ({e}) with no open train — recording accepted");
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("dispatch: auto-cut failed ({e}) — recording accepted");
-                    None
-                }
-            };
-            match train {
-                Some(t) => {
-                    ledger.attempts[idx].train_branch = t.clone();
-                    if let Err(e) = save_ledger(state, ledger) {
-                        eprintln!("dispatch: {e}");
-                    }
-                    match do_train_merge(ticket, &branch, &t, state) {
-                        Ok(short) => {
-                            gh_relabel(ticket, Some("review"), "integrated");
-                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` and merged into it ({short}). Human: covered by the train→dev review."));
-                            println!("  ACCEPTED + INTEGRATED into {t} (auto-cut) — #{ticket}");
-                            finish_attempt(state, ledger, idx, "review_done", 0);
-                        }
-                        Err(e) => {
-                            println!("  merge into auto-cut train failed — routing to blocked (never forced)");
-                            gh_relabel(ticket, Some("review"), "blocked");
-                            gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` but merge failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
-                            finish_attempt(state, ledger, idx, "review_failed", 0);
-                        }
-                    }
-                }
-                None => {
-                    // Accepted: human owns the land. Record base→head, never merge/push.
-                    gh_relabel(ticket, Some("review"), "accepted");
-                    gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
-                    println!("  ACCEPTED — #{ticket} awaiting human land");
-                    finish_attempt(state, ledger, idx, "review_done", 0);
-                }
-            }
-        }
-    } else {
-        println!("  changes_requested (or unreadable verdict) — back to ready");
-        gh_relabel(ticket, Some("review"), "ready");
-        finish_attempt(state, ledger, idx, "review_failed", 0);
-    }
-    TicketOutcome::Done
+    run_attempt_phases(state, ledger, idx, &ctx, "implement", &brief)
 }
 
 /// Auto-finish (T35): when the open train's head is an ancestor of dev,
@@ -7370,13 +7680,6 @@ fn maybe_auto_finish(state: &std::path::Path, dry_run: bool) -> bool {
 
 pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
     let state = dispatch_state_dir();
-    if state.join("STOP").is_file() {
-        println!("dispatch: STOP file present — exiting");
-        if json {
-            println!("{{\"stopped\":true,\"attempted\":0}}");
-        }
-        return 0;
-    }
     for sub in ["logs", "worktrees", "tmp"] {
         if let Err(e) = std::fs::create_dir_all(state.join(sub)) {
             eprintln!("dispatch: cannot create {}: {e}", state.join(sub).display());
@@ -7388,6 +7691,22 @@ pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
         return 0;
     };
     let mut ledger = load_ledger(&state);
+    // Stale-lease reaper (ticket #61, spec #59): running rows under the
+    // lock are dead workers, so they become resumable checkpoints before
+    // the STOP gate and the slot gate see them. Dry-run writes nothing.
+    if !dry_run {
+        reap_stale_leases(&state, &mut ledger);
+    }
+    // STOP mid-attempt leaves resumable checkpoints: the reaper above
+    // already converted any in-flight attempt, so halting here is safe
+    // and a later `dispatch resume` + pass resumes the same attempt.
+    if state.join("STOP").is_file() {
+        println!("dispatch: STOP file present — exiting");
+        if json {
+            println!("{{\"stopped\":true,\"attempted\":0}}");
+        }
+        return 0;
+    }
     // Auto-finish (T35) runs before the ticket survey so a human-merged
     // train closes even on passes with no open tickets. Read-only fetch
     // first, unmerged trains untouched, dry-run changes nothing.
@@ -7533,6 +7852,7 @@ pub fn cmd_status(json: bool) -> i32 {
                 "status": a.status,
                 "phase": attempt_phase(a),
                 "resumable": is_resumable(a),
+                "resumed": a.resumed,
                 "base": a.base_commit,
                 "head": a.head_commit,
                 "started": a.started_at,
@@ -7621,33 +7941,35 @@ pub fn cmd_status(json: bool) -> i32 {
     } else {
         for a in &ledger.attempts {
             let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+            let suffix = resumed_suffix(a);
             match a.status.as_str() {
                 "impl_running" => println!(
-                    "Ticket {} attempt {} is being implemented (slot {}, started {}).",
-                    a.ticket, a.attempt_no, slot, a.started_at
+                    "Ticket {} attempt {} is being implemented (slot {}, started {}).{}",
+                    a.ticket, a.attempt_no, slot, a.started_at, suffix
                 ),
                 "review_running" => println!(
-                    "Ticket {} attempt {} is being reviewed (slot {}, started {}).",
-                    a.ticket, a.attempt_no, slot, a.started_at
+                    "Ticket {} attempt {} is being reviewed (slot {}, started {}).{}",
+                    a.ticket, a.attempt_no, slot, a.started_at, suffix
                 ),
                 s if is_interrupted_status(s) => println!(
-                    "Ticket {} attempt {} interrupted during {} (slot {}, started {}, resumable).",
+                    "Ticket {} attempt {} interrupted during {} (slot {}, started {}, resumable).{}",
                     a.ticket,
                     a.attempt_no,
                     attempt_phase(a),
                     slot,
-                    a.started_at
+                    a.started_at,
+                    suffix
                 ),
                 other => {
                     if a.finished_at.is_empty() {
                         println!(
-                            "Ticket {} attempt {} finished: {other} (slot {}, started {}).",
-                            a.ticket, a.attempt_no, slot, a.started_at
+                            "Ticket {} attempt {} finished: {other} (slot {}, started {}).{}",
+                            a.ticket, a.attempt_no, slot, a.started_at, suffix
                         );
                     } else {
                         println!(
-                            "Ticket {} attempt {} finished: {other} (slot {}, started {}, finished {}).",
-                            a.ticket, a.attempt_no, slot, a.started_at, a.finished_at
+                            "Ticket {} attempt {} finished: {other} (slot {}, started {}, finished {}).{}",
+                            a.ticket, a.attempt_no, slot, a.started_at, a.finished_at, suffix
                         );
                     }
                 }
@@ -7676,7 +7998,7 @@ pub fn cmd_status(json: bool) -> i32 {
 /// Shared by human and JSON modes so no fact lives only in prose.
 fn log_summary(a: &DispatchAttempt) -> String {
     let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
-    match a.status.as_str() {
+    let base = match a.status.as_str() {
         "impl_running" => format!(
             "Ticket {} attempt {} is being implemented (slot {}, started {}).",
             a.ticket, a.attempt_no, slot, a.started_at
@@ -7712,7 +8034,8 @@ fn log_summary(a: &DispatchAttempt) -> String {
             "Ticket {} attempt {} finished: {other} (slot {}).",
             a.ticket, a.attempt_no, slot
         ),
-    }
+    };
+    format!("{base}{}", resumed_suffix(a))
 }
 
 /// Combined transcript for one attempt: the ledger's implement log plus the
@@ -7796,6 +8119,7 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
             "summary": log_summary(a),
             "phase": attempt_phase(a),
             "resumable": is_resumable(a),
+            "resumed": a.resumed,
             "base": a.base_commit,
             "head": a.head_commit,
             "started": a.started_at,
@@ -7884,14 +8208,20 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
             let base8: String = a.base_commit.chars().take(8).collect();
             let head8: String = a.head_commit.chars().take(8).collect();
             let resumable = if is_resumable(a) { " resumable" } else { "" };
+            let resumed = if a.resumed > 0 {
+                format!(" resumed={}", a.resumed)
+            } else {
+                String::new()
+            };
             println!(
-                "#{} T{} a{} {} phase={}{} base={} head={} {}",
+                "#{} T{} a{} {} phase={}{}{} base={} head={} {}",
                 a.id,
                 a.ticket,
                 a.attempt_no,
                 a.status,
                 attempt_phase(a),
                 resumable,
+                resumed,
                 base8,
                 head8,
                 a.started_at
