@@ -275,6 +275,12 @@ pub enum DispatchAction {
         /// Survey only: no worktrees, subprocesses, or writes.
         #[arg(long)]
         dry_run: bool,
+        /// Client-generated exactly-once key for this pass: a repeat with
+        /// the same key replays the stored outcome with a replay marker
+        /// instead of double-admitting. Keys are retained for 24 hours;
+        /// reuse of one key across different operations is rejected.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Loop single passes on the interval until the STOP file appears
     /// (Rust port of the bash `factory-dispatch daemon` loop).
@@ -6030,6 +6036,25 @@ struct DispatchLedger {
     /// parsing; single-use depends on this surviving restarts.
     #[serde(default)]
     delivered_answers: Vec<String>,
+    /// Exactly-once admission keys (ticket #62, spec #59): client-generated
+    /// keys bound to the operation fingerprint of the pass that first
+    /// carried them. `#[serde(default)]` keeps pre-key ledgers parsing;
+    /// records older than the retention horizon read as absent.
+    #[serde(default)]
+    idempotency_keys: Vec<IdempotencyRecord>,
+}
+
+/// One stored exactly-once outcome (ticket #62, spec #59): the key, the
+/// operation fingerprint it is bound to, and the admitted attempt facts a
+/// repeat replays with a replay marker instead of double-admitting.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct IdempotencyRecord {
+    key: String,
+    operation: String,
+    ticket: u64,
+    attempt_no: u64,
+    status: String,
+    stored_at: String,
 }
 
 /// Implementer/reviewer seam: shell out only, never an API client.
@@ -6181,6 +6206,44 @@ fn checkpoint_phase(
     }
     std::fs::rename(&tmp, ledger_path(state)).map_err(|e| format!("cannot replace ledger: {e}"))?;
     Ok(())
+}
+
+/// Exactly-once key retention horizon (ticket #62, spec #59): a repeat
+/// inside this window replays the stored outcome; older records read as
+/// absent so the same key admits anew. Stated in `dispatch once --help`.
+const IDEMPOTENCY_KEY_RETENTION_SECS: u64 = 24 * 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `true` while the record still guards its key: stored within the
+/// retention horizon. Older records read as absent (admit anew).
+fn idempotency_live(r: &IdempotencyRecord) -> bool {
+    r.stored_at
+        .parse::<u64>()
+        .map(|t| now_secs().saturating_sub(t) <= IDEMPOTENCY_KEY_RETENTION_SECS)
+        .unwrap_or(false)
+}
+
+/// Operation fingerprint a key binds to on first use: the sorted open
+/// ticket numbers this pass surveys. The same survey is the same
+/// operation (safe to replay); a different survey is a different
+/// operation (reusing the key is rejected).
+fn idempotency_operation(tickets: &[u64]) -> String {
+    let mut sorted = tickets.to_vec();
+    sorted.sort_unstable();
+    format!(
+        "dispatch-once:{}",
+        sorted
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 /// Test-only kill seam: when FACTORY_KILL_PHASE names this phase, behave
@@ -7368,7 +7431,7 @@ fn maybe_auto_finish(state: &std::path::Path, dry_run: bool) -> bool {
     }
 }
 
-pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
+pub fn cmd_dispatch_once(json: bool, dry_run: bool, idempotency_key: Option<&str>) -> i32 {
     let state = dispatch_state_dir();
     if state.join("STOP").is_file() {
         println!("dispatch: STOP file present — exiting");
@@ -7412,10 +7475,81 @@ pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
         }
     };
     let list: Vec<serde_json::Value> = serde_json::from_str(&list_text).unwrap_or_default();
+    // Exactly-once keys (ticket #62, spec #59): the key binds to this
+    // pass's operation fingerprint on first use. A repeat inside the
+    // retention window replays the stored outcome (no double-admit, no
+    // re-send); reuse across different operations is rejected. Expired
+    // records read as absent so the same key admits anew. Dry-run
+    // surveys stay side-effect free and record nothing.
+    let surveyed: Vec<u64> = list
+        .iter()
+        .map(|item| {
+            item.get("number")
+                .and_then(|n| n.as_u64())
+                .or_else(|| item.as_u64())
+                .unwrap_or(0)
+        })
+        .filter(|t| *t != 0)
+        .collect();
+    let operation = idempotency_operation(&surveyed);
+    let key: Option<String> = idempotency_key
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
+    ledger.idempotency_keys.retain(idempotency_live);
+    if let Some(ref k) = key {
+        if let Some(rec) = ledger
+            .idempotency_keys
+            .iter()
+            .find(|r| r.key == *k)
+            .cloned()
+        {
+            if rec.operation == operation {
+                println!(
+                    "dispatch: idempotency key '{k}' replayed attempt {} for ticket #{} (status {}) \u{2014} no new attempt admitted",
+                    rec.attempt_no, rec.ticket, rec.status
+                );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "stopped": false,
+                            "attempted": 0,
+                            "idempotency_key": k,
+                            "replayed": true,
+                            "operation": operation,
+                            "ticket": rec.ticket,
+                            "attempt_no": rec.attempt_no,
+                            "status": rec.status,
+                        })
+                    );
+                }
+                return 0;
+            }
+            println!(
+                "dispatch: idempotency key '{k}' already used for a different operation (stored '{}', this pass '{operation}') \u{2014} rejected",
+                rec.operation
+            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "stopped": false,
+                        "attempted": 0,
+                        "idempotency_key": k,
+                        "rejected": true,
+                        "error": format!("idempotency key '{k}' already used for a different operation"),
+                    })
+                );
+            }
+            return 1;
+        }
+    }
     if list.is_empty() {
         println!("dispatch: no open tickets");
         return 0;
     }
+    let attempts_before = ledger.attempts.len();
     let mut attempted = 0u64;
     for item in &list {
         if dispatch_active(&ledger) >= max_concurrent {
@@ -7442,7 +7576,55 @@ pub fn cmd_dispatch_once(json: bool, dry_run: bool) -> i32 {
         }
     }
     println!("dispatch: pass complete ({attempted} attempted)");
-    if json {
+    if let Some(k) = key {
+        if !dry_run {
+            let (ticket, attempt_no, status) = ledger.attempts[attempts_before..]
+                .first()
+                .map(|a| (a.ticket, a.attempt_no, a.status.clone()))
+                .unwrap_or((0, 0, "skipped".to_string()));
+            ledger.idempotency_keys.retain(|r| r.key != k);
+            ledger.idempotency_keys.push(IdempotencyRecord {
+                key: k.clone(),
+                operation: operation.clone(),
+                ticket,
+                attempt_no,
+                status: status.clone(),
+                stored_at: now_stamp(),
+            });
+            if let Err(e) = save_ledger(&state, &ledger) {
+                eprintln!("dispatch: {e}");
+                return 1;
+            }
+            if ticket == 0 {
+                println!("dispatch: idempotency key '{k}' admitted no attempts");
+            } else {
+                println!(
+                    "dispatch: idempotency key '{k}' admitted attempt {attempt_no} for ticket #{ticket} (status {status})"
+                );
+            }
+        }
+        if json {
+            let (ticket, attempt_no, status) = ledger
+                .idempotency_keys
+                .iter()
+                .find(|r| r.key == k)
+                .map(|r| (r.ticket, r.attempt_no, r.status.clone()))
+                .unwrap_or((0, 0, "skipped".to_string()));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "stopped": false,
+                    "attempted": attempted,
+                    "idempotency_key": k,
+                    "replayed": false,
+                    "operation": operation,
+                    "ticket": ticket,
+                    "attempt_no": attempt_no,
+                    "status": status,
+                })
+            );
+        }
+    } else if json {
         println!(
             "{{\"stopped\":false,\"attempted\":{attempted}}}",
             attempted = attempted
@@ -7462,7 +7644,7 @@ pub fn cmd_dispatch_daemon(json: bool, interval: u64) -> i32 {
         // same MAX_CONCURRENT slots. The lock is per-pass (acquired and
         // released inside `cmd_dispatch_once`), so concurrent `once`
         // processes share slots with the daemon exactly as they do today.
-        let code = cmd_dispatch_once(json, false);
+        let code = cmd_dispatch_once(json, false, None);
         if code != 0 {
             // Transient failure: report and retry next interval instead of
             // killing autonomous operation (bash `set -e` would abort here;
@@ -9195,7 +9377,10 @@ pub fn run() -> i32 {
         Commands::Reconcile => cmd_reconcile(cli.json),
         Commands::Start { ticket, worktree } => cmd_start(&ticket, worktree.as_ref(), cli.json),
         Commands::Dispatch { action } => match action {
-            DispatchAction::Once { dry_run } => cmd_dispatch_once(cli.json, dry_run),
+            DispatchAction::Once {
+                dry_run,
+                idempotency_key,
+            } => cmd_dispatch_once(cli.json, dry_run, idempotency_key.as_deref()),
             DispatchAction::Daemon { interval } => cmd_dispatch_daemon(cli.json, interval),
             DispatchAction::Status => cmd_dispatch_status(cli.json),
             DispatchAction::Stop => cmd_dispatch_stop(cli.json),
