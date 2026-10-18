@@ -364,6 +364,52 @@ pub enum FactsAction {
         #[arg(value_name = "PATH")]
         path: Option<String>,
     },
+    /// Create one facts path with the revision the reader observed.
+    /// Refuses when the path already exists (nothing changed). One
+    /// atomic path operation per invocation; the accepted write advances
+    /// the revision by exactly one. The global --json flag selects
+    /// machine output carrying the same value-plus-revision facts.
+    Create {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+        /// JSON value to store (e.g. 42, "done", {"a": 1}).
+        #[arg(long, value_name = "JSON")]
+        value: String,
+    },
+    /// Set (upsert) one facts path with the revision the reader observed.
+    /// Creates the path or any missing intermediate objects, overwrites
+    /// when it exists. One atomic path operation per invocation; the
+    /// accepted write advances the revision by exactly one. The global
+    /// --json flag selects machine output carrying the same
+    /// value-plus-revision facts.
+    Set {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+        /// JSON value to store (e.g. 42, "done", {"a": 1}).
+        #[arg(long, value_name = "JSON")]
+        value: String,
+    },
+    /// Delete one facts path with the revision the reader observed.
+    /// Refuses when the path has no value (nothing changed). One atomic
+    /// path operation per invocation; the accepted write advances the
+    /// revision by exactly one. The global --json flag selects machine
+    /// output carrying the same path-plus-revision facts.
+    Delete {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+    },
 }
 
 #[derive(Serialize)]
@@ -8932,6 +8978,239 @@ fn facts_pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// Store `value` at `path` (normalized, non-empty), creating any
+/// missing intermediate objects. Errors (nothing changed) when an
+/// intermediate segment exists as a non-object or the document root is
+/// not an object.
+fn facts_set_value(
+    facts: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (last, parents) = segments.split_last().expect("non-empty facts path");
+    if !facts.is_object() {
+        return Err(format!(
+            "facts: cannot write {path}: the facts document root is not an object; nothing changed."
+        ));
+    }
+    let mut current = facts;
+    for seg in parents {
+        if current.get(seg).is_none() {
+            current
+                .as_object_mut()
+                .expect("facts cursor stays an object")
+                .insert((*seg).to_string(), serde_json::json!({}));
+        }
+        current = current
+            .get_mut(seg)
+            .expect("just-inserted facts segment present");
+        if !current.is_object() {
+            return Err(format!(
+                "facts: cannot write {path}: '{seg}' is not an object; nothing changed."
+            ));
+        }
+    }
+    current
+        .as_object_mut()
+        .expect("facts parent stays an object")
+        .insert((*last).to_string(), value);
+    Ok(())
+}
+
+/// Remove the value at `path` (normalized, non-empty). `Ok(true)` is a
+/// removal; `Ok(false)` is a missing path (nothing changed, refused by
+/// the caller). Errors when the document root is not an object.
+fn facts_delete_value(facts: &mut serde_json::Value, path: &str) -> Result<bool, String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (last, parents) = segments.split_last().expect("non-empty facts path");
+    if !facts.is_object() {
+        return Err(format!(
+            "facts: cannot delete {path}: the facts document root is not an object; nothing changed."
+        ));
+    }
+    let mut current = facts;
+    for seg in parents {
+        match current.get_mut(seg) {
+            Some(next) if next.is_object() => current = next,
+            _ => return Ok(false),
+        }
+    }
+    Ok(current
+        .as_object_mut()
+        .expect("facts parent stays an object")
+        .remove(*last)
+        .is_some())
+}
+
+/// Atomic facts-document write (temp file + rename, the same durability
+/// guarantee as the ledger): a crash between the two leaves the previous
+/// document on disk, never a torn one. The FACTORY_FACTS_CRASH seam
+/// exists only to pin that guarantee in tests: with it set to `1`, this
+/// writes tmp and the process exits before the rename, exactly like a
+/// kill -9 at that instant (orphaned tmp, previous document intact).
+fn save_facts_document(state: &std::path::Path, doc: &FactsDocument) -> Result<(), String> {
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("facts: cannot create {}: {e}", state.display()))?;
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "revision": doc.revision,
+        "facts": doc.facts,
+    }))
+    .map_err(|e| format!("facts: cannot serialize facts document: {e}"))?;
+    let tmp = facts_doc_path(state).with_extension("json.tmp");
+    std::fs::write(&tmp, &text)
+        .map_err(|e| format!("facts: cannot stage {}: {e}", tmp.display()))?;
+    // Test-only kill seam: behave exactly like a crash after the tmp
+    // write but before the rename.
+    if std::env::var("FACTORY_FACTS_CRASH").as_deref() == Ok("1") {
+        std::process::exit(1);
+    }
+    std::fs::rename(&tmp, facts_doc_path(state)).map_err(|e| {
+        format!(
+            "facts: cannot replace {}: {e}",
+            facts_doc_path(state).display()
+        )
+    })?;
+    Ok(())
+}
+
+/// One guarded facts write: the shared path for create (refuses when the
+/// path exists), set (upserts), and delete. `value_raw` is `Some` for
+/// create/set (parsed as JSON) and `None` for delete.
+fn cmd_facts_write(
+    json: bool,
+    op: &str,
+    path_raw: &str,
+    revision: u64,
+    value_raw: Option<&str>,
+) -> i32 {
+    let state = dispatch_state_dir();
+    let doc = match load_facts_document(&state) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let path = normalize_facts_path(path_raw);
+    if path.is_empty() {
+        eprintln!(
+            "facts: cannot {op}: path must name one slash-separated value (e.g. costs/total); nothing changed."
+        );
+        return 1;
+    }
+    if revision != doc.revision {
+        eprintln!(
+            "facts: write conflict at {path}: presented revision {revision}, current revision {}; nothing changed. Reread the path and retry with the current revision.",
+            doc.revision
+        );
+        return 1;
+    }
+    let mut facts = doc.facts;
+    let stored: Option<serde_json::Value> = match op {
+        "create" | "set" => {
+            let raw = value_raw.unwrap_or("null");
+            let value: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("facts: cannot {op} {path}: --value is not valid JSON: {e}");
+                    return 1;
+                }
+            };
+            if op == "create" && facts_lookup(&facts, &path).is_some() {
+                eprintln!(
+                    "facts: cannot create {path}: path already exists at revision {}; nothing changed.",
+                    doc.revision
+                );
+                return 1;
+            }
+            if let Err(e) = facts_set_value(&mut facts, &path, value.clone()) {
+                eprintln!("{e}");
+                return 1;
+            }
+            Some(value)
+        }
+        _ => match facts_delete_value(&mut facts, &path) {
+            Ok(true) => None,
+            Ok(false) => {
+                eprintln!(
+                    "facts: cannot delete {path}: no value set at revision {}; nothing changed.",
+                    doc.revision
+                );
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        },
+    };
+    let new_revision = doc.revision + 1;
+    let new_doc = FactsDocument {
+        revision: new_revision,
+        facts,
+    };
+    if let Err(e) = save_facts_document(&state, &new_doc) {
+        eprintln!("{e}");
+        return 1;
+    }
+    match stored {
+        Some(value) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revision": new_revision,
+                        "path": path,
+                        "value": value,
+                    })
+                );
+                return 0;
+            }
+            println!("facts {path} at revision {new_revision}:");
+            println!("{}", facts_pretty(&value));
+            println!("{FACTS_LOCALITY_LINE}");
+            0
+        }
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revision": new_revision,
+                        "path": path,
+                        "deleted": true,
+                    })
+                );
+                return 0;
+            }
+            println!("facts {path} at revision {new_revision}: deleted.");
+            println!("{FACTS_LOCALITY_LINE}");
+            0
+        }
+    }
+}
+
+/// Create one facts path with the revision the reader observed.
+/// Refuses when the path already exists or the revision is stale, with
+/// the cause named; refusals change nothing.
+pub fn cmd_facts_create(json: bool, path: &str, revision: u64, value: &str) -> i32 {
+    cmd_facts_write(json, "create", path, revision, Some(value))
+}
+
+/// Set (upsert) one facts path with the revision the reader observed.
+/// Refuses on a stale revision, with presented and current revisions
+/// named; refusals change nothing.
+pub fn cmd_facts_set(json: bool, path: &str, revision: u64, value: &str) -> i32 {
+    cmd_facts_write(json, "set", path, revision, Some(value))
+}
+
+/// Delete one facts path with the revision the reader observed.
+/// Refuses when the path has no value or the revision is stale, with
+/// the cause named; refusals change nothing.
+pub fn cmd_facts_delete(json: bool, path: &str, revision: u64) -> i32 {
+    cmd_facts_write(json, "delete", path, revision, None)
+}
 /// Read the facts document: whole or one path, human or machine.
 /// Read-only like `status`/`log`: observing changes nothing.
 pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
@@ -10839,6 +11118,17 @@ pub fn run() -> i32 {
         Commands::Log { ticket, tail } => cmd_log(&ticket, tail, cli.json),
         Commands::Facts { action } => match action {
             FactsAction::Show { path } => cmd_facts_show(cli.json, path.as_deref()),
+            FactsAction::Create {
+                path,
+                revision,
+                value,
+            } => cmd_facts_create(cli.json, &path, revision, &value),
+            FactsAction::Set {
+                path,
+                revision,
+                value,
+            } => cmd_facts_set(cli.json, &path, revision, &value),
+            FactsAction::Delete { path, revision } => cmd_facts_delete(cli.json, &path, revision),
         },
         Commands::Init {
             stack,
