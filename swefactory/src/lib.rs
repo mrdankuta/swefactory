@@ -410,6 +410,25 @@ pub enum FactsAction {
         #[arg(long, value_name = "N")]
         revision: u64,
     },
+    /// Atomically add to the number at one facts path with the revision
+    /// the reader observed. A missing path starts from zero; a present
+    /// non-number is refused with nothing changed. One atomic path
+    /// operation per invocation; the accepted write advances the
+    /// revision by exactly one. Writes that would push the document
+    /// past 65536 bytes (64 KiB) are refused with the cap stated.
+    /// The global --json flag selects machine output carrying the same
+    /// value-plus-revision facts.
+    Increment {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+        /// Amount to add (JSON number, e.g. 5 or -2.5). Defaults to 1.
+        #[arg(long, value_name = "DELTA", default_value = "1")]
+        by: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -9114,6 +9133,20 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
 /// dispatch ledger, the logs dir, and the train file).
 const FACTS_FILENAME: &str = "facts.json";
 
+/// Document-size cap in bytes (ticket #79, spec #64): the serialized
+/// facts document (`{"revision": N, "facts": {...}}`, pretty-printed,
+/// exactly as written to disk) must fit in 65536 bytes (64 KiB).
+/// Writes that would exceed it are refused with the cap stated — never
+/// silently truncated. Deletes only shrink, so they skip the check.
+const FACTS_MAX_DOCUMENT_BYTES: usize = 65536;
+
+/// Accepted facts-path shape (ticket #79): slash-separated names like
+/// `costs/total`, each segment 1-64 chars of letters, digits, `_` or
+/// `-`, 1-16 segments. Shown verbatim on every path rejection so a
+/// typo never writes to a surprise location.
+const FACTS_PATH_SHAPE: &str =
+    "paths look like costs/total (slash-separated names of letters, digits, _ or -, e.g. costs/total)";
+
 /// Human footer on every facts read: the per-machine blind spot from
 /// spec #64 stays in user-facing copy wherever facts are shown, so Bea
 /// never mistakes local figures for shared ones. Machine output keeps
@@ -9166,18 +9199,34 @@ fn load_facts_document(state: &std::path::Path) -> Result<FactsDocument, String>
     })
 }
 
-/// Normalize a user-supplied facts path: ignore leading, trailing, and
-/// doubled slashes (`/costs/total/` reads as `costs/total`). Empty (or
-/// all-slash) input reads as the whole document. Strict path-syntax
-/// validation (accepted shape on rejection) belongs to a later ticket.
-fn normalize_facts_path(raw: &str) -> String {
-    raw.split('/')
-        .filter(|seg| !seg.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
+/// Strict facts-path validation (ticket #79): a raw path is accepted
+/// only when it already has the documented shape; nothing is
+/// normalized away, so a typo never writes to a surprise location.
+/// Returns the canonical path on success.
+fn validate_facts_path(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err(format!(
+            "facts: invalid path '{raw}': {FACTS_PATH_SHAPE}; nothing changed."
+        ));
+    }
+    let segments: Vec<&str> = raw.split('/').collect();
+    if segments.len() > 16
+        || segments.iter().any(|seg| {
+            seg.is_empty()
+                || seg.len() > 64
+                || !seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    {
+        return Err(format!(
+            "facts: invalid path '{raw}': {FACTS_PATH_SHAPE}; nothing changed."
+        ));
+    }
+    Ok(raw.to_string())
 }
 
-/// Traverse the facts tree along a normalized path. `None` is a missing
+/// Traverse the facts tree along a validated path. `None` is a missing
 /// fact (plain sentence, exit 0) — never synthesized, never zero-filled.
 fn facts_lookup<'a>(facts: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = facts;
@@ -9288,9 +9337,114 @@ fn save_facts_document(state: &std::path::Path, doc: &FactsDocument) -> Result<(
     Ok(())
 }
 
+/// Add `delta` to `current` for `facts increment` (ticket #79).
+/// Integers that fit stay integers; anything else goes float. Errors
+/// (nothing changed) on overflow or a non-finite result.
+fn facts_add_delta(
+    current: &serde_json::Value,
+    delta: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match (current.as_i64(), delta.as_i64()) {
+        (Some(a), Some(b)) => a
+            .checked_add(b)
+            .map(serde_json::Value::from)
+            .ok_or_else(|| {
+                "facts: cannot increment: the total would overflow; nothing changed.".to_string()
+            }),
+        _ => {
+            let a = current.as_f64().expect("caller checks numeric");
+            let b = delta.as_f64().expect("caller checks numeric");
+            let sum = a + b;
+            if !sum.is_finite() {
+                return Err(
+                    "facts: cannot increment: the total would overflow; nothing changed."
+                        .to_string(),
+                );
+            }
+            serde_json::Number::from_f64(sum)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| {
+                    "facts: cannot increment: the total would overflow; nothing changed."
+                        .to_string()
+                })
+        }
+    }
+}
+
+/// Refuse (exit 1, nothing written) when the prospective document would
+/// exceed [`FACTS_MAX_DOCUMENT_BYTES`]. The cap is stated in every
+/// refusal, human and machine alike; values are never truncated.
+/// Returns the refusal exit code, or `None` when the document fits.
+fn refuse_when_oversized(json: bool, op: &str, path: &str, doc: &FactsDocument) -> Option<i32> {
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "revision": doc.revision,
+        "facts": doc.facts,
+    }))
+    .unwrap_or_default();
+    if text.len() <= FACTS_MAX_DOCUMENT_BYTES {
+        return None;
+    }
+    eprintln!(
+        "facts: cannot {op} {path}: document would be {} bytes, over the {FACTS_MAX_DOCUMENT_BYTES} byte cap (64 KiB); nothing changed.",
+        text.len()
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path,
+                "cap": FACTS_MAX_DOCUMENT_BYTES,
+                "proposed": text.len(),
+                "oversized": true,
+            })
+        );
+    }
+    Some(1)
+}
+
+/// Calm conflict refusal (ticket #79, Bea's story): human output reads
+/// as contention, never breakage. Machine output keeps the exact
+/// revisions so scripts can retry. Always exit 1 with nothing changed.
+fn refuse_conflict(json: bool, path: &str, presented: u64, current: u64) -> i32 {
+    eprintln!(
+        "facts: someone else saved {path} first — you presented revision {presented}, current revision is {current}. Reread the path and retry; nothing changed."
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path,
+                "presented": presented,
+                "current": current,
+                "conflict": true,
+            })
+        );
+    }
+    1
+}
+
+/// Malformed-path refusal shared by every facts entry point: shows the
+/// accepted shape, changes nothing. Machine mode adds the same shape
+/// as JSON so scripts see it structurally.
+fn refuse_bad_path(json: bool, raw: &str, err: &str) -> i32 {
+    eprintln!("{err}");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": raw,
+                "expected": FACTS_PATH_SHAPE,
+                "invalid": true,
+            })
+        );
+    }
+    1
+}
+
 /// One guarded facts write: the shared path for create (refuses when the
-/// path exists), set (upserts), and delete. `value_raw` is `Some` for
-/// create/set (parsed as JSON) and `None` for delete.
+/// path exists), set (upserts), increment (numbers only), and delete.
+/// `value_raw` is `Some` for create/set (parsed as JSON), the delta for
+/// increment, and `None` for delete.
 fn cmd_facts_write(
     json: bool,
     op: &str,
@@ -9306,23 +9460,16 @@ fn cmd_facts_write(
             return 1;
         }
     };
-    let path = normalize_facts_path(path_raw);
-    if path.is_empty() {
-        eprintln!(
-            "facts: cannot {op}: path must name one slash-separated value (e.g. costs/total); nothing changed."
-        );
-        return 1;
-    }
+    let path = match validate_facts_path(path_raw) {
+        Ok(p) => p,
+        Err(e) => return refuse_bad_path(json, path_raw, &e),
+    };
     if revision != doc.revision {
-        eprintln!(
-            "facts: write conflict at {path}: presented revision {revision}, current revision {}; nothing changed. Reread the path and retry with the current revision.",
-            doc.revision
-        );
-        return 1;
+        return refuse_conflict(json, &path, revision, doc.revision);
     }
     let mut facts = doc.facts;
     let stored: Option<serde_json::Value> = match op {
-        "create" | "set" => {
+        "create" | "set" | "increment" => {
             let raw = value_raw.unwrap_or("null");
             let value: serde_json::Value = match serde_json::from_str(raw) {
                 Ok(v) => v,
@@ -9331,18 +9478,49 @@ fn cmd_facts_write(
                     return 1;
                 }
             };
-            if op == "create" && facts_lookup(&facts, &path).is_some() {
-                eprintln!(
-                    "facts: cannot create {path}: path already exists at revision {}; nothing changed.",
-                    doc.revision
-                );
-                return 1;
+            if op == "increment" {
+                if !value.is_number() {
+                    eprintln!(
+                        "facts: cannot increment {path}: --by must be a JSON number; nothing changed."
+                    );
+                    return 1;
+                }
+                let current = facts_lookup(&facts, &path)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::from(0));
+                if !current.is_number() {
+                    eprintln!(
+                        "facts: cannot increment {path}: current value is not a number at revision {}; nothing changed.",
+                        doc.revision
+                    );
+                    return 1;
+                }
+                let total = match facts_add_delta(&current, &value) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 1;
+                    }
+                };
+                if let Err(e) = facts_set_value(&mut facts, &path, total.clone()) {
+                    eprintln!("{e}");
+                    return 1;
+                }
+                Some(total)
+            } else {
+                if op == "create" && facts_lookup(&facts, &path).is_some() {
+                    eprintln!(
+                        "facts: cannot create {path}: path already exists at revision {}; nothing changed.",
+                        doc.revision
+                    );
+                    return 1;
+                }
+                if let Err(e) = facts_set_value(&mut facts, &path, value.clone()) {
+                    eprintln!("{e}");
+                    return 1;
+                }
+                Some(value)
             }
-            if let Err(e) = facts_set_value(&mut facts, &path, value.clone()) {
-                eprintln!("{e}");
-                return 1;
-            }
-            Some(value)
         }
         _ => match facts_delete_value(&mut facts, &path) {
             Ok(true) => None,
@@ -9364,6 +9542,11 @@ fn cmd_facts_write(
         revision: new_revision,
         facts,
     };
+    if op != "delete" {
+        if let Some(code) = refuse_when_oversized(json, op, &path, &new_doc) {
+            return code;
+        }
+    }
     if let Err(e) = save_facts_document(&state, &new_doc) {
         eprintln!("{e}");
         return 1;
@@ -9425,6 +9608,14 @@ pub fn cmd_facts_set(json: bool, path: &str, revision: u64, value: &str) -> i32 
 pub fn cmd_facts_delete(json: bool, path: &str, revision: u64) -> i32 {
     cmd_facts_write(json, "delete", path, revision, None)
 }
+
+/// Atomically add `by` (a JSON number) to the number at one facts
+/// path with the revision the reader observed. A missing path starts
+/// from zero; a present non-number is refused with nothing changed.
+/// Refusals change nothing.
+pub fn cmd_facts_increment(json: bool, path: &str, revision: u64, by: &str) -> i32 {
+    cmd_facts_write(json, "increment", path, revision, Some(by))
+}
 /// Read the facts document: whole or one path, human or machine.
 /// Read-only like `status`/`log`: observing changes nothing.
 pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
@@ -9436,7 +9627,13 @@ pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
             return 1;
         }
     };
-    let path = path_raw.map(normalize_facts_path).filter(|p| !p.is_empty());
+    let path = match path_raw {
+        None => None,
+        Some(raw) => match validate_facts_path(raw) {
+            Ok(p) => Some(p),
+            Err(e) => return refuse_bad_path(json, raw, &e),
+        },
+    };
 
     match path {
         None => {
@@ -10648,6 +10845,100 @@ pub fn cmd_dispatch_selftest(json: bool) -> i32 {
         ),
     );
 
+    // --- facts conflict path (ticket #79, spec #64): stale rejected,
+    // --- fresh retry succeeds, hermetically. The same child-`factory`
+    // --- seam as the release mechanics above, against the same isolated
+    // --- state dir — no issue-tracker calls, no network, no spend.
+    let out = st.factory(&[
+        "facts",
+        "create",
+        "costs/total",
+        "--revision",
+        "0",
+        "--value",
+        "42",
+    ]);
+    let (_stdout, _stderr) = selftest_text(&out);
+    let created_ok = out.status.success();
+    let out = st.factory(&[
+        "facts",
+        "set",
+        "costs/total",
+        "--revision",
+        "1",
+        "--value",
+        "43",
+    ]);
+    let (_stdout, _stderr2) = selftest_text(&out);
+    let advanced_ok = out.status.success();
+    // A loser presenting the stale revision 0 against current 2 is
+    // rejected naming both revisions, with the stored value intact.
+    let out = st.factory(&[
+        "facts",
+        "set",
+        "costs/total",
+        "--revision",
+        "0",
+        "--value",
+        "99",
+    ]);
+    let (_stdout, conflict_err) = selftest_text(&out);
+    let show = st.factory(&["facts", "show", "costs/total", "--json"]);
+    let (show_out, _) = selftest_text(&show);
+    let kept: bool = serde_json::from_str::<serde_json::Value>(&show_out)
+        .map(|v| v.get("value").and_then(|n| n.as_u64()) == Some(43))
+        .unwrap_or(false);
+    st.check(
+        "facts conflict rejects stale",
+        created_ok
+            && advanced_ok
+            && !out.status.success()
+            && conflict_err.contains('0')
+            && conflict_err.contains('2')
+            && kept,
+        "stale rev 0 refused against current 2, value 43 intact",
+        selftest_got(&out, &conflict_err),
+    );
+    // The loser rereads, observes revision 2, and retries: succeeds,
+    // advancing the revision by exactly one to 3.
+    let show = st.factory(&["facts", "show", "costs/total", "--json"]);
+    let (show_out, _) = selftest_text(&show);
+    let current = serde_json::from_str::<serde_json::Value>(&show_out)
+        .ok()
+        .and_then(|v| v.get("revision")?.as_u64())
+        .unwrap_or(u64::MAX);
+    let current_s = current.to_string();
+    let out = st.factory(&[
+        "facts",
+        "set",
+        "costs/total",
+        "--revision",
+        current_s.as_str(),
+        "--value",
+        "100",
+    ]);
+    let (_stdout, retry_err) = selftest_text(&out);
+    let show = st.factory(&["facts", "show", "costs/total", "--json"]);
+    let (show_out, _) = selftest_text(&show);
+    let (rev_after, val_after) = serde_json::from_str::<serde_json::Value>(&show_out)
+        .map(|v| {
+            (
+                v.get("revision").and_then(|r| r.as_u64()).unwrap_or(0),
+                v.get("value").and_then(|n| n.as_u64()).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    st.check(
+        "facts retry succeeds",
+        out.status.success() && current == 2 && rev_after == 3 && val_after == 100,
+        "retry at rev 2 commits rev 3 value 100",
+        if retry_err.trim().is_empty() {
+            format!("rev={rev_after} value={val_after}")
+        } else {
+            selftest_got(&out, &retry_err)
+        },
+    );
+
     // --- the gh bomb never fired: the mechanics needed no gh ---
     let bomb = std::fs::read_to_string(&gh_log).unwrap_or_default();
     st.check(
@@ -11343,6 +11634,9 @@ pub fn run() -> i32 {
                 value,
             } => cmd_facts_set(cli.json, &path, revision, &value),
             FactsAction::Delete { path, revision } => cmd_facts_delete(cli.json, &path, revision),
+            FactsAction::Increment { path, revision, by } => {
+                cmd_facts_increment(cli.json, &path, revision, &by)
+            }
         },
         Commands::Init {
             stack,
