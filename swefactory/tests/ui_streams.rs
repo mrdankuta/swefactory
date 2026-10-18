@@ -1,4 +1,5 @@
-//! Live event streams (ticket #83, spec #66): transport + per-scope streams.
+//! Live event streams (tickets #83-#85, spec #66): transport, per-scope
+//! streams, reconnects, slow viewers, and the read-only boundary.
 //!
 //! Seam: external behavior only against a loopback server — HTTP status
 //! codes, SSE event ordering (hello before snapshot before any delta),
@@ -175,6 +176,53 @@ fn body_of(raw: &str) -> &str {
         Some(pos) => &raw[pos + 4..],
         None => raw,
     }
+}
+
+/// Blocking std HTTP/1.1 request with any method over loopback (the
+/// read-only-boundary tests attempt mutations over the stream surface).
+/// Same blocking-thread discipline as `get`: never inline on the
+/// single-threaded `#[tokio::test]` runtime.
+async fn request(port: u16, method: &str, path: &str) -> String {
+    let (method, path) = (method.to_string(), path.to_string());
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+    .await
+    .unwrap()
+}
+
+/// Byte snapshot of a state dir: every file's relative path plus bytes,
+/// sorted. Rendering or refusing must never mutate: before and after
+/// must compare equal, so no ledger, log, worktree, or issue state moved.
+fn snapshot_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(top) = stack.pop() {
+        for entry in fs::read_dir(&top).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 /// One live stream connection: a plain OS thread owns the socket,
 /// splits the SSE byte flow into `\n\n`-terminated blocks, and forwards
@@ -1041,6 +1089,266 @@ async fn live_pages_carry_the_stream_hook_and_calm_reattach_copy() {
             "page {page} reads as calm copy with one action, got:\n{body:.500}"
         );
     }
+
+    server.abort();
+    clear_stream_env();
+}
+
+// --- ticket #85 (spec #66): read-only boundary + single-scope lock-in ---
+//
+// Streams are structurally read-only: the stream surface admits no
+// mutation (no writes, stops, lands, or dispatches), closing every
+// client leaves the running loop untouched, every scope pushes exactly
+// the bytes its polling fragment already shows, and one connection
+// serves one scope (multiplexing stays deferred). These tests pin that
+// boundary against the loopback server; the hermetic seams (seeded
+// ledger, fake `gh`/`git`, no model calls in the stream path) mean the
+// suite holds with no external network and no spend.
+
+#[tokio::test]
+async fn stream_surface_admits_no_mutation() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("readonly-boundary");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    let (port, server) = serve_port().await;
+
+    let before = snapshot_dir(&state);
+
+    // Every mutating method on every stream scope: refused, never opened.
+    for (method, path) in [
+        ("POST", "/streams/board"),
+        ("PUT", "/streams/board"),
+        ("DELETE", "/streams/board"),
+        ("PATCH", "/streams/board"),
+        ("POST", "/streams/ticket/9"),
+        ("PUT", "/streams/ticket/9"),
+        ("DELETE", "/streams/ticket/9"),
+        ("POST", "/streams/dispatch"),
+        ("PUT", "/streams/dispatch"),
+        ("DELETE", "/streams/dispatch"),
+    ] {
+        let resp = request(port, method, path).await;
+        let status = resp.lines().next().unwrap_or("").to_string();
+        assert!(
+            status.contains("405"),
+            "{method} {path} is refused at the method boundary, got: {status}"
+        );
+        assert!(
+            !resp.contains("event:"),
+            "{method} {path} opens no stream, got:\n{resp:.500}"
+        );
+    }
+
+    // The refusal changed no ledger, log, worktree, or issue state: the
+    // whole state dir compares byte-equal, so no new file (STOP flag or
+    // otherwise) appeared and no byte moved.
+    let after = snapshot_dir(&state);
+    assert_eq!(
+        before, after,
+        "refused mutations leave every ledger and log byte untouched"
+    );
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state.join("dispatch.json")).unwrap()).unwrap();
+    assert_eq!(
+        ledger["attempts"][0]["status"], "impl_running",
+        "the seeded attempt is exactly where the loop left it"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn stream_snapshots_push_only_what_polling_shows() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("no-new-facts");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    let (port, server) = serve_port().await;
+
+    // Structural, pinned by test: each scope's producer re-reads the same
+    // render call its polling fragment serves, so a stream can only ever
+    // push facts the views already show — no second pipeline exists to
+    // drift. Quiet ledger throughout: no rewrite between the snapshot
+    // and the fragment GET, so byte-equality is exact, not eventual.
+    for (stream_path, fragment_path) in [
+        ("/streams/board", "/fragments/board"),
+        ("/streams/ticket/9", "/fragments/ticket/9"),
+        ("/streams/dispatch", "/fragments/dispatch"),
+    ] {
+        let mut tap = LiveTap::attach(port, stream_path).await;
+        let (event, _) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "hello", "{stream_path} opens with hello");
+        let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "snapshot", "{stream_path} snapshots before deltas");
+        let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+        let pushed = snapshot["html"].as_str().unwrap().to_string();
+
+        let raw = get(port, fragment_path).await;
+        assert!(
+            raw.contains("200"),
+            "polling fragment {fragment_path} serves, got:\n{raw:.300}"
+        );
+        assert_eq!(
+            pushed,
+            body_of(&raw),
+            "{stream_path} pushes byte-identical bytes to {fragment_path}"
+        );
+    }
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn one_connection_serves_one_scope() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("single-scope");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    let (port, server) = serve_port().await;
+
+    // Each scope is independently verifiable: its snapshot carries its
+    // own section root and none of the other scopes' roots, so no
+    // connection multiplexes several scopes (deferred, not forbidden).
+    // Roots are the full `<section ...>` open tags: bare attribute
+    // substrings (e.g. `data-ticket="9"`) legitimately nest inside the
+    // dispatch cards, so only section roots prove isolation.
+    for (stream_path, own, others) in [
+        (
+            "/streams/board",
+            "<section data-board-columns>",
+            vec!["<section data-dispatch>", "<section data-ticket="],
+        ),
+        (
+            "/streams/ticket/9",
+            "<section data-ticket=\"9\">",
+            vec!["<section data-board-columns>", "<section data-dispatch>"],
+        ),
+        (
+            "/streams/dispatch",
+            "<section data-dispatch>",
+            vec!["<section data-board-columns>", "<section data-ticket="],
+        ),
+    ] {
+        let mut tap = LiveTap::attach(port, stream_path).await;
+        let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "hello");
+        let hello = hello_payload(&data);
+        let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "snapshot");
+        let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+        let html = snapshot["html"].as_str().unwrap().to_string();
+        assert!(
+            html.contains(own),
+            "{stream_path} serves its own scope ({own}), got:\n{html:.300}"
+        );
+        for other in others {
+            assert!(
+                !html.contains(other),
+                "{stream_path} carries no {other} facts (hello scope: {})",
+                hello["scope"]
+            );
+        }
+    }
+
+    // No scope-combining surface exists: the bare path 404s, and junk
+    // query params never switch a connection off its route's scope.
+    let bare = get(port, "/streams").await;
+    assert!(
+        bare.contains("404"),
+        "no multiplex endpoint at /streams, got:\n{bare:.300}"
+    );
+    let mut tap = LiveTap::attach(port, "/streams/board?scope=ticket&foo=bar").await;
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    assert_eq!(
+        hello_payload(&data)["scope"],
+        "board",
+        "the route fixes the scope, not the query string"
+    );
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-board-columns"),
+        "junk params leave the board scope on the board stream"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn closing_every_client_leaves_the_loop_running() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("close-all");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    let (port, server) = serve_port().await;
+
+    // One viewer per scope, every one provably live (hello received).
+    let mut board = LiveTap::attach(port, "/streams/board").await;
+    let mut ticket = LiveTap::attach(port, "/streams/ticket/9").await;
+    let mut live = LiveTap::attach(port, "/streams/dispatch").await;
+    for tap in [&mut board, &mut ticket, &mut live] {
+        let (event, _) = next_event(tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "hello", "every client is attached and live");
+    }
+
+    // Mid-attempt, every client closes at once: the running loop is not
+    // consulted, warned, or touched — viewers are observers, never owners.
+    board.kill();
+    ticket.kill();
+    live.kill();
+    drop(board);
+    drop(ticket);
+    drop(live);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The loop completes normally with nobody watching: the seeded
+    // transition lands exactly as it would with viewers attached.
+    set_attempt_status(&state, "impl_done");
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state.join("dispatch.json")).unwrap()).unwrap();
+    assert_eq!(
+        ledger["attempts"][0]["status"], "impl_done",
+        "the attempt completes with zero clients attached"
+    );
+
+    // Polling shows the completion, and a fresh attach lands on it: the
+    // server kept serving the whole time nobody watched.
+    let raw = get(port, "/fragments/dispatch").await;
+    assert!(
+        body_of(&raw).contains("data-status=\"impl_done\""),
+        "polling shows the completion, got:\n{}",
+        body_of(&raw)
+    );
+    let mut reattached = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-status=\"impl_done\""),
+        "fresh snapshot after close-all shows the completed loop"
+    );
 
     server.abort();
     clear_stream_env();
