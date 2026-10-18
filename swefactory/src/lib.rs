@@ -389,6 +389,19 @@ pub enum DispatchAction {
     Stop,
     /// Restart the loop after a stop.
     Resume,
+    /// Abort an attempt's current work bottom-up (ticket #86 rework of
+    /// #69, spec #59 follow-up). An ordinary abort stops foreground tasks
+    /// only and leaves background tasks running; `--background` also stops
+    /// background tasks and everything they own. Owned work aborts before
+    /// its owner and each task undoes its own effects; a kill mid-abort
+    /// resumes the same order from persisted progress.
+    Abort {
+        /// Ticket issue number (e.g. 11 or #11).
+        ticket: String,
+        /// Also stop background tasks and everything they own.
+        #[arg(long)]
+        background: bool,
+    },
     /// Record a hook/approval decision for one attempt (first-write-wins)
     /// or show the stored one. The first decision for a (ticket, attempt,
     /// key) triple sticks: repeats observe the stored answer instead of
@@ -6770,6 +6783,22 @@ struct DispatchLedger {
     /// the graph view filters to live rows and never writes.
     #[serde(default)]
     tasks: Vec<LiveTask>,
+    /// Foreground/background tasks owned by attempts (ticket #86 rework
+    /// of #69, spec #59 follow-up): work that outlives the turn.
+    /// Renamed from the accepted #69 slice's `tasks` to `owned_tasks`
+    /// so both features coexist with landed #70's live task graph
+    /// (`tasks: Vec<LiveTask>`). `#[serde(default)]` keeps pre-task
+    /// ledgers parsing (no migration: empty means the old rules apply
+    /// for one pass, then owned tasks record normally).
+    #[serde(default)]
+    owned_tasks: Vec<DispatchTask>,
+    /// Persisted bottom-up unwind order (ticket #86 rework of #69):
+    /// effect names in the order their owning tasks undid them. Appended
+    /// before each save so a kill mid-abort resumes from the persisted
+    /// prefix — nothing undone twice, none skipped. `#[serde(default)]`
+    /// keeps old ledgers parsing.
+    #[serde(default)]
+    abort_log: Vec<String>,
     /// Experiment forks (ticket #80, spec #65): named lines branched at a
     /// parent attempt entry. `#[serde(default)]` keeps pre-fork ledgers
     /// parsing (no migration: unforked tickets behave exactly as before).
@@ -6941,6 +6970,143 @@ fn task_kind_text(t: &LiveTask) -> &str {
     } else {
         t.kind.as_str()
     }
+}
+
+// --- foreground/background owned tasks + bottom-up abort (ticket #86
+// rework of #69, spec #59 follow-up) ------------------------------------
+//
+// Work that outlives the turn, and abort that cleans up in order.
+// A background task belongs to the attempt but not to its current work:
+// the attempt reads idle while only background tasks run, and an ordinary
+// abort of the current work leaves background tasks alone. Aborting with
+// background scope stops background tasks and everything they own.
+//
+// Aborts unwind bottom-up: owned work aborts before its owner and each
+// task's own cleanup runs only once its owned work is done, so every task
+// undoes its own effects. Effects undo newest-first within a task; tasks
+// unwind deepest-first (ties break by task id, ascending) so the order is
+// deterministic across a kill and its resume. Each undone effect is
+// appended to the ledger `abort_log` and the task's `undone` list BEFORE
+// the atomic save, so a kill mid-abort resumes from the persisted prefix:
+// no effect undone twice, none skipped. The FACTORY_KILL_ABORT_AT seam
+// (an effect name) exits(1) right after persisting that effect, exactly
+// like a kill -9 at that instant. No migration: ledgers without
+// `owned_tasks` read as empty and every command below is a no-op over them.
+/// One unit of work owned by an attempt (ticket #86 rework of #69).
+///
+/// Lives in `DispatchLedger::owned_tasks` (renamed from the accepted #69
+/// slice's `tasks` so it coexists with #70's live task graph).
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct DispatchTask {
+    id: u64,
+    ticket: u64,
+    attempt: u64,
+    name: String,
+    /// `foreground` (the attempt's current work) or `background` (work
+    /// that outlives the turn). Missing reads as foreground.
+    #[serde(default = "task_default_scope")]
+    scope: String,
+    /// `running`, `done`, or `aborted`. Missing reads as running.
+    #[serde(default = "task_default_status")]
+    status: String,
+    /// Owning task id, `None` for roots.
+    #[serde(default)]
+    parent: Option<u64>,
+    /// Owned effects, created oldest-first; undone newest-first.
+    #[serde(default)]
+    effects: Vec<String>,
+    /// Already-undone effects (persisted prefix of the unwind).
+    #[serde(default)]
+    undone: Vec<String>,
+}
+
+fn task_default_scope() -> String {
+    "foreground".to_string()
+}
+
+fn task_default_status() -> String {
+    "running".to_string()
+}
+
+/// Depth of a task in the ownership tree (roots are 0). Missing parents
+/// read as roots so a torn fixture can never loop the unwind.
+fn task_depth(tasks: &[DispatchTask], id: u64) -> usize {
+    let mut depth = 0;
+    let mut current = id;
+    let mut guard = tasks.len().saturating_add(1);
+    while guard > 0 {
+        guard -= 1;
+        let Some(t) = tasks.iter().find(|t| t.id == current) else {
+            break;
+        };
+        match t.parent {
+            Some(p) if p != current && tasks.iter().any(|o| o.id == p) => {
+                depth += 1;
+                current = p;
+            }
+            _ => break,
+        }
+    }
+    depth
+}
+
+/// Scope filter for an abort: ordinary aborts stop foreground tasks only;
+/// background scope additionally stops background tasks (and everything
+/// they own, which inherits the owner's scope through the tree).
+fn task_in_abort_scope(t: &DispatchTask, background: bool) -> bool {
+    if background {
+        return true;
+    }
+    t.scope != "background"
+}
+
+/// Bottom-up unwind plan: indexes into `ledger.owned_tasks` for this
+/// ticket, deepest-owned work first, ties by task id ascending.
+/// Deterministic so a resume replays the same order from persisted
+/// progress.
+fn abort_plan(ledger: &DispatchLedger, ticket: u64, background: bool) -> Vec<usize> {
+    let mut plan: Vec<usize> = ledger
+        .owned_tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.ticket == ticket && t.status == "running" && task_in_abort_scope(t, background)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    plan.sort_by_key(|&i| {
+        (
+            std::cmp::Reverse(task_depth(&ledger.owned_tasks, ledger.owned_tasks[i].id)),
+            ledger.owned_tasks[i].id,
+        )
+    });
+    plan
+}
+
+/// `true` while the attempt has no running foreground work but still owns
+/// running background work: the attempt reads idle, the work outlives it.
+fn attempt_idle_background(ledger: &DispatchLedger, ticket: u64, attempt: u64) -> bool {
+    let owned: Vec<&DispatchTask> = ledger
+        .owned_tasks
+        .iter()
+        .filter(|t| t.ticket == ticket && t.attempt == attempt && t.status == "running")
+        .collect();
+    !owned.is_empty() && owned.iter().all(|t| t.scope == "background")
+}
+
+/// Running background tasks owned by this attempt (shared by human and
+/// machine surfaces so both carry identical facts).
+fn attempt_background_running(ledger: &DispatchLedger, ticket: u64, attempt: u64) -> u64 {
+    ledger
+        .owned_tasks
+        .iter()
+        .filter(|t| {
+            t.ticket == ticket
+                && t.attempt == attempt
+                && t.status == "running"
+                && t.scope == "background"
+        })
+        .count() as u64
 }
 
 /// Implementer/reviewer seam: shell out only, never an API client.
@@ -8939,6 +9105,8 @@ pub fn cmd_status(json: bool) -> i32 {
                 "phase": attempt_phase(a),
                 "resumable": is_resumable(a),
                 "resumed": a.resumed,
+                "idle_background": attempt_idle_background(&ledger, a.ticket, a.attempt_no),
+                "background_running": attempt_background_running(&ledger, a.ticket, a.attempt_no),
                 "base": a.base_commit,
                 "head": a.head_commit,
                 "started": a.started_at,
@@ -9069,6 +9237,18 @@ pub fn cmd_status(json: bool) -> i32 {
                         );
                     }
                 }
+            }
+            // Idle-with-background reads beside the attempt line so Bea
+            // never mistakes a background-only attempt for breakage
+            // (ticket #86 rework of #69). Silent when the attempt owns
+            // no owned tasks.
+            if attempt_idle_background(&ledger, a.ticket, a.attempt_no) {
+                println!(
+                    "Ticket {} attempt {} is idle — background tasks still running ({} running).",
+                    a.ticket,
+                    a.attempt_no,
+                    attempt_background_running(&ledger, a.ticket, a.attempt_no)
+                );
             }
         }
     }
@@ -10038,6 +10218,8 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
             "phase": attempt_phase(a),
             "resumable": is_resumable(a),
             "resumed": a.resumed,
+            "idle_background": attempt_idle_background(&ledger, a.ticket, a.attempt_no),
+            "background_running": attempt_background_running(&ledger, a.ticket, a.attempt_no),
             "memos": memos,
             "base": a.base_commit,
             "head": a.head_commit,
@@ -10090,6 +10272,21 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
         };
         println!("Attempt {attempt}: {summary}");
         println!("Base {base} -> {head_words}, {span}.");
+        // Idle-with-background reads beside the attempt story so the log
+        // names where the attempt halted the same way status does (#86).
+        if row
+            .get("idle_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let running = row
+                .get("background_running")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            println!(
+                "Attempt {attempt} is idle — background tasks still running ({running} running)."
+            );
+        }
         if let Some(memos) = row.get("memos").and_then(|v| v.as_array()) {
             if !memos.is_empty() {
                 let pairs: Vec<String> = memos
@@ -11368,9 +11565,37 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
     if json {
         let wt_lines: Vec<&str> = worktrees.lines().collect();
         let memos: Vec<serde_json::Value> = ledger.decision_memos.iter().map(memo_json).collect();
+        // Per-attempt idle facts ride beside the raw rows so scripts
+        // decide resume-versus-alert on identical facts (ticket #86).
+        let attempts: Vec<serde_json::Value> = ledger
+            .attempts
+            .iter()
+            .map(|a| {
+                let mut row = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert(
+                        "idle_background".to_string(),
+                        serde_json::Value::Bool(attempt_idle_background(
+                            &ledger,
+                            a.ticket,
+                            a.attempt_no,
+                        )),
+                    );
+                    obj.insert(
+                        "background_running".to_string(),
+                        serde_json::json!(attempt_background_running(
+                            &ledger,
+                            a.ticket,
+                            a.attempt_no
+                        )),
+                    );
+                }
+                row
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::json!({"attempts": ledger.attempts, "decision_memos": memos, "worktrees": wt_lines, "stopped": stopped})
+            serde_json::json!({"attempts": attempts, "decision_memos": memos, "owned_tasks": ledger.owned_tasks, "abort_log": ledger.abort_log, "worktrees": wt_lines, "stopped": stopped})
         );
     } else {
         println!("== dispatch attempts ==");
@@ -11398,8 +11623,18 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
                     .collect();
                 format!(" memos={} ({})", memos.len(), pairs.join(", "))
             };
+            // Background tasks belong to the attempt but not its current
+            // work: the attempt reads idle while they run (ticket #86).
+            let idle = if attempt_idle_background(&ledger, a.ticket, a.attempt_no) {
+                format!(
+                    " idle (background running: {})",
+                    attempt_background_running(&ledger, a.ticket, a.attempt_no)
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "#{} T{} a{} {} phase={}{}{}{} base={} head={} {}",
+                "#{} T{} a{} {} phase={}{}{}{}{} base={} head={} {}",
                 a.id,
                 a.ticket,
                 a.attempt_no,
@@ -11408,10 +11643,38 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
                 resumable,
                 resumed,
                 memo_words,
+                idle,
                 base8,
                 head8,
                 a.started_at
             );
+        }
+        // Owned tasks read beside their attempts so an abort's scope is
+        // visible where Engineer Eli already looks (ticket #86). Empty
+        // ledgers print nothing new: old output stays byte-identical.
+        if !ledger.owned_tasks.is_empty() {
+            println!();
+            println!("== owned tasks ==");
+            for t in &ledger.owned_tasks {
+                let owner = match t.parent {
+                    Some(p) => format!(" owned-by={p}"),
+                    None => String::new(),
+                };
+                println!(
+                    "T{}-a{} {} {} {}{} effects={} undone={}",
+                    t.ticket,
+                    t.attempt,
+                    t.name,
+                    t.scope,
+                    t.status,
+                    owner,
+                    t.effects.len(),
+                    t.undone.len()
+                );
+            }
+            if !ledger.abort_log.is_empty() {
+                println!("abort order: {}", ledger.abort_log.join(", "));
+            }
         }
         print_paused_copy(ledger.attempts.iter().any(is_resumable));
         println!();
@@ -11462,6 +11725,109 @@ pub fn cmd_dispatch_resume(json: bool) -> i32 {
     println!("resumed");
     if json {
         println!("{{\"stopped\":false}}");
+    }
+    0
+}
+
+/// Abort an attempt's current work bottom-up over fixture state. Prints the
+/// unwind order as it goes; every undone effect persists before the next
+/// begins so a kill resumes the same order.
+pub fn cmd_dispatch_abort(ticket_raw: &str, background: bool, json: bool) -> i32 {
+    let ticket = match parse_issue_number(ticket_raw) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("abort: {e}");
+            return 1;
+        }
+    };
+    let state = dispatch_state_dir();
+    let mut ledger = match load_ledger_strict_for("abort", &state) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let plan = abort_plan(&ledger, ticket, background);
+    if plan.is_empty() {
+        println!("Ticket {ticket}: nothing to abort.");
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"ticket": ticket, "aborted": [], "order": [], "background": background})
+            );
+        }
+        return 0;
+    }
+    let order_names: Vec<String> = plan
+        .iter()
+        .map(|&i| ledger.owned_tasks[i].name.clone())
+        .collect();
+    if background {
+        println!(
+            "Ticket {ticket}: aborting with background scope ({} task(s), bottom-up): {}.",
+            plan.len(),
+            order_names.join(", ")
+        );
+    } else {
+        println!(
+            "Ticket {ticket}: aborting current work ({} task(s), bottom-up): {}. Background tasks keep running.",
+            plan.len(),
+            order_names.join(", ")
+        );
+    }
+    let mut undone_now: Vec<String> = Vec::new();
+    for &idx in &plan {
+        let effects: Vec<String> = ledger.owned_tasks[idx]
+            .effects
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        let task_name = ledger.owned_tasks[idx].name.clone();
+        for effect in effects {
+            if ledger.owned_tasks[idx].undone.iter().any(|u| u == &effect) {
+                continue;
+            }
+            ledger.owned_tasks[idx].undone.push(effect.clone());
+            ledger.abort_log.push(effect.clone());
+            undone_now.push(effect.clone());
+            println!("  undid {effect} ({task_name})");
+            if let Err(e) = save_ledger(&state, &ledger) {
+                eprintln!("abort: {e}");
+                return 1;
+            }
+            if std::env::var("FACTORY_KILL_ABORT_AT").as_deref() == Ok(effect.as_str()) {
+                eprintln!("abort: simulated kill after {effect} — resume replays the same order");
+                std::process::exit(1);
+            }
+        }
+        ledger.owned_tasks[idx].status = "aborted".to_string();
+        if let Err(e) = save_ledger(&state, &ledger) {
+            eprintln!("abort: {e}");
+            return 1;
+        }
+        println!("  aborted {task_name}");
+    }
+    let aborted_names: Vec<String> = plan
+        .iter()
+        .map(|&i| ledger.owned_tasks[i].name.clone())
+        .collect();
+    println!(
+        "Ticket {ticket}: aborted {} task(s) bottom-up.",
+        aborted_names.len()
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ticket": ticket,
+                "aborted": aborted_names,
+                "order": ledger.abort_log,
+                "undone_now": undone_now,
+                "background": background,
+            })
+        );
     }
     0
 }
@@ -13071,6 +13437,9 @@ pub fn run() -> i32 {
             } => cmd_dispatch_wait(cli.json, ticket.as_deref(), &parent, &policy),
             DispatchAction::Stop => cmd_dispatch_stop(cli.json),
             DispatchAction::Resume => cmd_dispatch_resume(cli.json),
+            DispatchAction::Abort { ticket, background } => {
+                cmd_dispatch_abort(&ticket, background, cli.json)
+            }
             DispatchAction::Memo {
                 ticket,
                 attempt,
