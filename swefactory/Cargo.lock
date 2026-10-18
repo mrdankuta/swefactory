@@ -323,6 +323,7 @@ dependencies = [
  "assert_cmd",
  "axum",
  "clap",
+ "futures-core",
  "predicates",
  "serde",
  "serde_json",
