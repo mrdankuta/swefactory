@@ -371,6 +371,91 @@ fn dispatch_once_skips_tickets_with_open_dependencies() {
     );
 }
 
+// Ticket #76: the freeze gate must engage for every spec-link phrasing
+// the ticket template can emit — `Part of #N` (sub-issue link) as well as
+// `Spec: #N` / `Spec issue: #N`. Each linked spec view carries no
+// SPEC-APPROVED comment, so an engaged gate must refuse the ticket and
+// name the linked spec; a missed link would sail through to review.
+#[test]
+fn dispatch_freeze_gate_resolves_all_spec_link_phrasings() {
+    for (body, spec) in [
+        ("Part of #20\nBuild the widget.", 20),
+        ("Spec: #21\nBuild the widget.", 21),
+        ("Spec issue: #22\nBuild the widget.", 22),
+    ] {
+        let h = setup(&format!("spec-link-{spec}"));
+        write_view(&h, 11, "Demo widget", body, &["ticket", "ready"], "OPEN");
+        write_view(
+            &h,
+            spec,
+            "Linked spec",
+            "Some spec text.",
+            &["spec"],
+            "OPEN",
+        );
+        let mut cmd = dispatch_cmd(&h, &["dispatch", "once"]);
+        cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+        cmd.assert()
+            .success()
+            .stdout(predicates::str::contains("freeze mismatch"));
+
+        let ledger: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(h.state.join("dispatch.json")).unwrap())
+                .unwrap();
+        let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "gate refusal is a logged attempt:\n{ledger}"
+        );
+        assert_eq!(
+            attempts[0].get("status").and_then(|v| v.as_str()),
+            Some("impl_failed"),
+            "body {body:?} must engage the freeze gate:\n{ledger}"
+        );
+        let gh = gh_log(&h);
+        assert!(
+            gh.contains(&format!("linked spec #{spec}")),
+            "refusal must name the linked spec #{spec} for body {body:?}:\n{gh}"
+        );
+        assert_never_touches_dev_or_lands(&git_log(&h), &gh);
+    }
+}
+
+// Ticket #76: a ticket body naming no spec keeps the current behaviour —
+// the gate is skipped openly (never a false match) and the ticket flows
+// through to review.
+#[test]
+fn dispatch_without_spec_link_skips_freeze_gate_openly() {
+    let h = setup("spec-link-none");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget. No parent link here.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(&h, &["dispatch", "once"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.assert().success();
+
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(h.state.join("dispatch.json")).unwrap()).unwrap();
+    let a = &ledger.get("attempts").and_then(|v| v.as_array()).unwrap()[0];
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "spec-less ticket must flow through to review:\n{ledger}"
+    );
+    let gh = gh_log(&h);
+    assert!(
+        !gh.contains("linked spec"),
+        "spec-less ticket must not trip the freeze gate:\n{gh}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh);
+}
+
 #[test]
 fn dispatch_once_marks_budget_exhausted_ticket_blocked() {
     let h = setup("once-budget");
