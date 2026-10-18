@@ -64,6 +64,8 @@ fn dispatch_self_test_proves_release_mechanics_hermetically() {
         "PASS: dispatch kill-mid-phase interrupts (resumable)",
         "PASS: dispatch resume completes the same attempt",
         "PASS: dispatch resume spends nothing (no network, fake implementer only)",
+        "PASS: facts conflict rejects stale",
+        "PASS: facts retry succeeds",
         "PASS: no gh invoked",
         "SELF-TEST ALL PASS",
     ] {
