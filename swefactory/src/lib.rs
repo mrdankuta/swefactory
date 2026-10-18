@@ -57,6 +57,17 @@ pub enum Commands {
         #[arg(long, default_value_t = LOG_DEFAULT_TAIL)]
         tail: usize,
     },
+    /// Cross-attempt facts (spec #64): the revision-guarded document
+    /// beside the dispatch ledger. Reads only in this slice (ticket
+    /// #77): the whole document or one facts path, human-readable by
+    /// default, machine-readable with the global --json flag carrying
+    /// the same value-plus-revision facts. Read-only: observing changes
+    /// nothing; an absent document reads as empty at revision zero with
+    /// no migration. Guarded writes arrive in later tickets.
+    Facts {
+        #[command(subcommand)]
+        action: FactsAction,
+    },
     /// Seed the factory into the current project (idempotent, never clobbers).
     Init {
         /// Check-adapter stack to install (default: auto-detect from the project).
@@ -307,6 +318,25 @@ pub enum DispatchAction {
         #[arg(long)]
         ticket: Option<String>,
     },
+    /// Wait on a parent task's children with a stated policy (ticket #68,
+    /// spec #59): `all-settled` resumes only after every child is terminal;
+    /// `fail-fast` aborts still-running siblings on the first child failure
+    /// before the parent decides. Waiting runs no code; the resume point is
+    /// checkpointed atomically like any phase. A simulated kill mid-wait
+    /// (`FACTORY_KILL_WAIT=1`) resumes into the same wait; children never
+    /// run twice unless declared replay-safe. Outcomes and abort order are
+    /// appended to the attempt transcript so `factory log` shows them.
+    Wait {
+        /// Ticket owning the parent task (e.g. 68 or #68).
+        #[arg(long)]
+        ticket: Option<String>,
+        /// Parent task id (e.g. `plan`).
+        #[arg(long)]
+        parent: String,
+        /// Waiting policy: `all-settled` or `fail-fast`.
+        #[arg(long)]
+        policy: String,
+    },
     /// Halt the loop: later `once` runs exit 0 without work.
     Stop,
     /// Restart the loop after a stop.
@@ -315,6 +345,25 @@ pub enum DispatchAction {
     /// no network, no tokens, no spend). Every failure names the mechanics
     /// that broke and exits non-zero.
     SelfTest,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FactsAction {
+    /// Read the facts document: the whole document by default, or one
+    /// slash-separated facts path (e.g. `costs/total`) on request.
+    /// Read-only: observing changes nothing. Exit 0 whenever the
+    /// document was read successfully — an absent document reads as
+    /// empty at revision zero, and a missing path reads as a plain
+    /// sentence (never zero-filled, never error-shaped). Nonzero only
+    /// on unreadable state (unreadable/corrupt facts document) with the
+    /// cause named. The global --json flag selects machine output
+    /// carrying the same value-plus-revision facts.
+    Show {
+        /// Slash-separated facts path (e.g. costs/total). Omit for the
+        /// whole document.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -6411,6 +6460,16 @@ struct LiveTask {
     /// Task ids (or resources) this task is waiting on; empty means none.
     #[serde(default)]
     waits_on: Vec<String>,
+    /// Waiting policy for a parent task (ticket #68, spec #59): ""
+    /// (no policy) | "all-settled" | "fail-fast". `#[serde(default)]`
+    /// keeps pre-wait ledgers parsing (absent reads as no policy).
+    #[serde(default)]
+    wait_policy: String,
+    /// Replay-safe children may run again after a kill mid-wait (ticket
+    /// #68, spec #59); anything else never runs twice. `#[serde(default)]`
+    /// keeps pre-wait ledgers parsing (absent reads as not replay-safe).
+    #[serde(default)]
+    replay_safe: bool,
 }
 
 /// `true` once a task has reached a terminal state and must leave the
@@ -8771,6 +8830,179 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// REVISION-GUARDED FACTS, slice 1: the document + reads (ticket #77,
+// spec #64)
+//
+// One JSON facts document lives in the existing state directory beside
+// the dispatch ledger (`facts.json` next to `dispatch.json`):
+// `{"revision": N, "facts": {...}}`. The ledger still owns attempt
+// lifecycle, logs still own transcripts; facts own cross-attempt figures
+// and nothing else moves stores. No migration: an absent document reads
+// as empty at revision zero, and reading never creates files, so
+// adoption touches no ledger, log, or worktree behavior.
+//
+// Reads address the whole document (`factory facts show`) or one
+// slash-separated path (`factory facts show costs/total`), human-readable
+// by default and machine-readable with the global --json flag carrying
+// the same value-plus-revision facts. A missing path is a plain sentence
+// with exit 0 — never zero-filled, never error-shaped. Path-syntax
+// validation, guarded writes, counters, and size bounds arrive in later
+// tickets and reuse these same load/traverse seams.
+// ---------------------------------------------------------------------------
+
+/// Facts document filename inside the state directory (beside the
+/// dispatch ledger, the logs dir, and the train file).
+const FACTS_FILENAME: &str = "facts.json";
+
+/// Human footer on every facts read: the per-machine blind spot from
+/// spec #64 stays in user-facing copy wherever facts are shown, so Bea
+/// never mistakes local figures for shared ones. Machine output keeps
+/// exactly the value-plus-revision facts (no tone, same shape).
+const FACTS_LOCALITY_LINE: &str =
+    "Per-machine local state: a ticket built on two machines sees two documents.";
+
+fn facts_doc_path(state: &std::path::Path) -> PathBuf {
+    state.join(FACTS_FILENAME)
+}
+
+/// One loaded facts document: the monotonic revision plus the whole
+/// value tree. Reads-only shape; writers advance the revision.
+struct FactsDocument {
+    revision: u64,
+    facts: serde_json::Value,
+}
+
+/// Read-only facts load. Absent file (or absent state dir) reads as
+/// empty at revision zero with nothing created; unreadable or corrupt
+/// files error naming the facts document, mirroring the ledger seam.
+fn load_facts_document(state: &std::path::Path) -> Result<FactsDocument, String> {
+    let path = facts_doc_path(state);
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FactsDocument {
+                revision: 0,
+                facts: serde_json::json!({}),
+            });
+        }
+        Err(e) => {
+            return Err(format!("facts: cannot read {}: {e}", path.display()));
+        }
+        Ok(t) => t,
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("facts: cannot parse {}: {e}", path.display()))?;
+    let obj = parsed.as_object().ok_or_else(|| {
+        format!(
+            "facts: cannot parse {}: expected an object with revision + facts",
+            path.display()
+        )
+    })?;
+    Ok(FactsDocument {
+        revision: obj.get("revision").and_then(|r| r.as_u64()).unwrap_or(0),
+        facts: obj
+            .get("facts")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
+/// Normalize a user-supplied facts path: ignore leading, trailing, and
+/// doubled slashes (`/costs/total/` reads as `costs/total`). Empty (or
+/// all-slash) input reads as the whole document. Strict path-syntax
+/// validation (accepted shape on rejection) belongs to a later ticket.
+fn normalize_facts_path(raw: &str) -> String {
+    raw.split('/')
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Traverse the facts tree along a normalized path. `None` is a missing
+/// fact (plain sentence, exit 0) — never synthesized, never zero-filled.
+fn facts_lookup<'a>(facts: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = facts;
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        current = current.get(seg)?;
+    }
+    Some(current)
+}
+
+/// Pretty value for human output (mirrors the JSON mode value exactly).
+fn facts_pretty(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Read the facts document: whole or one path, human or machine.
+/// Read-only like `status`/`log`: observing changes nothing.
+pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
+    let state = dispatch_state_dir();
+    let doc = match load_facts_document(&state) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let path = path_raw.map(normalize_facts_path).filter(|p| !p.is_empty());
+
+    match path {
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"revision": doc.revision, "facts": doc.facts})
+                );
+                return 0;
+            }
+            if doc.facts == serde_json::json!({}) {
+                println!("facts at revision {}: empty (no values set).", doc.revision);
+            } else {
+                println!("facts at revision {}:", doc.revision);
+                println!("{}", facts_pretty(&doc.facts));
+            }
+            println!("{FACTS_LOCALITY_LINE}");
+            0
+        }
+        Some(p) => match facts_lookup(&doc.facts, &p) {
+            Some(value) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "revision": doc.revision,
+                            "path": p,
+                            "value": value,
+                        })
+                    );
+                    return 0;
+                }
+                println!("facts {p} at revision {}:", doc.revision);
+                println!("{}", facts_pretty(value));
+                println!("{FACTS_LOCALITY_LINE}");
+                0
+            }
+            None => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "revision": doc.revision,
+                            "path": p,
+                            "value": serde_json::Value::Null,
+                            "missing": true,
+                        })
+                    );
+                    return 0;
+                }
+                println!("facts {p} at revision {}: no value set.", doc.revision);
+                println!("{FACTS_LOCALITY_LINE}");
+                0
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LIVE TASK GRAPH (ticket #70, spec #59 follow-up)
 //
 // One observable graph of everything live for the dispatcher screen and
@@ -8850,6 +9082,354 @@ pub fn cmd_dispatch_graph(json: bool, ticket_raw: Option<&str>) -> i32 {
             task_owner(t),
             waits
         );
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// CHILD-TASK WAITING POLICIES (ticket #68, spec #59 follow-up)
+//
+// A parent task owns child tasks (e.g. a verify split across suites) and
+// waits with a stated policy: all-settled resumes only after every child
+// is terminal; fail-fast aborts still-running siblings on the first child
+// failure before the parent decides. Waiting runs no code — children
+// finish outside the wait — and the resume point is checkpointed atomically
+// (tmp + rename) like any phase. Outcomes and abort order are appended to
+// the attempt transcript so `factory log` shows them.
+// ---------------------------------------------------------------------------
+
+/// `true` for a failed child outcome (triggers fail-fast aborts).
+fn is_task_failed(status: &str) -> bool {
+    status == "failed" || status.ends_with("_failed")
+}
+
+/// Transcript file for one attempt: the ledger `log_path` when set, else
+/// the conventional `<state>/logs/T<ticket>-a<attempt>.log`.
+fn wait_log_path(
+    state: &std::path::Path,
+    ledger: &DispatchLedger,
+    ticket: u64,
+    attempt: u64,
+) -> PathBuf {
+    if let Some(a) = ledger
+        .attempts
+        .iter()
+        .find(|a| a.ticket == ticket && a.attempt_no == attempt)
+    {
+        if !a.log_path.is_empty() {
+            return PathBuf::from(&a.log_path);
+        }
+    }
+    state.join(format!("logs/T{ticket}-a{attempt}.log"))
+}
+
+fn wait_append(
+    state: &std::path::Path,
+    ledger: &DispatchLedger,
+    ticket: u64,
+    attempt: u64,
+    line: &str,
+) {
+    let path = wait_log_path(state, ledger, ticket, attempt);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    append_log(&path, &format!("{line}\n"));
+}
+
+/// Wait on a parent task's children with the stated policy over fixture
+/// ledger state. `ticket_raw` optionally narrows the parent lookup.
+/// Exit 0 on waiting/resumed; nonzero with the cause named on bad input
+/// or unreadable state. The global `--json` flag selects machine output
+/// carrying the same facts structurally.
+pub fn cmd_dispatch_wait(
+    json: bool,
+    ticket_raw: Option<&str>,
+    parent_id: &str,
+    policy_raw: &str,
+) -> i32 {
+    let policy = policy_raw.trim().to_ascii_lowercase().replace('_', "-");
+    if policy != "all-settled" && policy != "fail-fast" {
+        eprintln!("wait: invalid policy {policy_raw:?}: want all-settled or fail-fast");
+        return 1;
+    }
+    let filter: Option<u64> = match ticket_raw {
+        Some(raw) => match parse_issue_number(raw) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("wait: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    if parent_id.trim().is_empty() {
+        eprintln!("wait: missing --parent task id");
+        return 1;
+    }
+    let state = dispatch_state_dir();
+    let mut ledger = match load_ledger_strict_for("wait", &state) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let candidates: Vec<usize> = ledger
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.id == parent_id)
+        .filter(|(_, t)| filter.map(|f| t.ticket == f).unwrap_or(true))
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        eprintln!("wait: unknown parent task {parent_id:?}");
+        return 1;
+    }
+    if candidates.len() > 1 {
+        eprintln!("wait: ambiguous parent task {parent_id:?}: pass --ticket to select one");
+        return 1;
+    }
+    let pidx = candidates[0];
+    let (pticket, pattempt) = (ledger.tasks[pidx].ticket, ledger.tasks[pidx].attempt);
+    let child_idx: Vec<usize> = ledger
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.parent.as_deref() == Some(parent_id))
+        .filter(|(_, t)| t.ticket == pticket && t.attempt == pattempt)
+        .map(|(i, _)| i)
+        .collect();
+    if child_idx.is_empty() {
+        eprintln!("wait: parent task {parent_id:?} owns no child tasks");
+        return 1;
+    }
+    // Already terminal: idempotent re-read, no writes.
+    if is_task_terminal(&ledger.tasks[pidx].status) {
+        let outcome = ledger.tasks[pidx].status.clone();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "parent": parent_id, "ticket": pticket, "attempt": pattempt,
+                    "policy": policy, "state": "resumed", "outcome": outcome,
+                    "children": [], "abort_order": [],
+                })
+            );
+        } else {
+            println!("resumed: parent {parent_id} already {outcome} (policy {policy})");
+        }
+        return 0;
+    }
+    let mut children: Vec<(String, String, bool)> = child_idx
+        .iter()
+        .map(|&i| {
+            let t = &ledger.tasks[i];
+            (t.id.clone(), t.status.clone(), t.replay_safe)
+        })
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    let failed: Vec<(String, String, bool)> = children
+        .iter()
+        .filter(|(_, s, _)| is_task_failed(s))
+        .cloned()
+        .collect();
+    let pending: Vec<(String, String, bool)> = children
+        .iter()
+        .filter(|(_, s, _)| !is_task_terminal(s))
+        .cloned()
+        .collect();
+    let pending_ids: Vec<String> = pending.iter().map(|(id, _, _)| id.clone()).collect();
+
+    // Simulated kill mid-wait: checkpoint the wait, then exit nonzero
+    // before any resume/abort mutation. Children are untouched, so the
+    // next pass resumes the same wait; only replay-safe children may run
+    // again, and the wait itself never runs them.
+    if std::env::var("FACTORY_KILL_WAIT").as_deref() == Ok("1")
+        || std::env::var("FACTORY_KILL_WAIT").as_deref() == Ok(parent_id)
+    {
+        ledger.tasks[pidx].status = "waiting".to_string();
+        ledger.tasks[pidx].waits_on = pending_ids.clone();
+        ledger.tasks[pidx].wait_policy = policy.clone();
+        if let Err(e) = save_ledger(&state, &ledger) {
+            eprintln!("wait: {e}");
+            return 1;
+        }
+        wait_append(
+            &state,
+            &ledger,
+            pticket,
+            pattempt,
+            &format!(
+                "WAIT: parent {parent_id} checkpointed waiting on {} (policy {policy})",
+                pending_ids.join(",")
+            ),
+        );
+        eprintln!(
+            "wait: killed mid-wait on parent {parent_id} (resumable) — rerun resumes the same wait"
+        );
+        return 1;
+    }
+
+    // Fail-fast trigger: first failed child aborts still-running siblings
+    // in sorted id order before the parent decides (parent records failed).
+    if policy == "fail-fast" && !failed.is_empty() {
+        let first_failed = failed[0].0.clone();
+        let mut abort_order: Vec<String> = Vec::new();
+        for (id, _, _) in &pending {
+            if let Some(t) = ledger.tasks.iter_mut().find(|t| t.id == *id) {
+                t.status = "aborted".to_string();
+                t.waits_on.clear();
+            }
+            abort_order.push(id.clone());
+        }
+        ledger.tasks[pidx].status = "failed".to_string();
+        ledger.tasks[pidx].waits_on.clear();
+        ledger.tasks[pidx].wait_policy = policy.clone();
+        if let Err(e) = save_ledger(&state, &ledger) {
+            eprintln!("wait: {e}");
+            return 1;
+        }
+        wait_append(
+            &state,
+            &ledger,
+            pticket,
+            pattempt,
+            &format!("WAIT: child {first_failed} failed (policy fail-fast)"),
+        );
+        for id in &abort_order {
+            wait_append(
+                &state,
+                &ledger,
+                pticket,
+                pattempt,
+                &format!("WAIT: abort {id} after {first_failed} (fail-fast)"),
+            );
+        }
+        wait_append(
+            &state,
+            &ledger,
+            pticket,
+            pattempt,
+            &format!("WAIT: parent {parent_id} decides failed after abort (policy fail-fast)"),
+        );
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "parent": parent_id, "ticket": pticket, "attempt": pattempt,
+                    "policy": policy, "state": "resumed", "outcome": "failed",
+                    "failed_child": first_failed,
+                    "children": children.iter().map(|(id, status, replay_safe)| {
+                        serde_json::json!({"id": id, "status": status, "replay_safe": replay_safe})
+                    }).collect::<Vec<_>>(),
+                    "abort_order": abort_order,
+                })
+            );
+        } else {
+            println!("resumed: parent {parent_id} decides failed (policy fail-fast) after child {first_failed} failed");
+            for (id, status, _) in &children {
+                println!("child {id} {status}");
+            }
+            for id in &abort_order {
+                println!("abort {id} after {first_failed} (fail-fast)");
+            }
+        }
+        return 0;
+    }
+
+    // Still waiting: checkpoint the wait and report what remains.
+    if !pending.is_empty() {
+        ledger.tasks[pidx].status = "waiting".to_string();
+        ledger.tasks[pidx].waits_on = pending_ids.clone();
+        ledger.tasks[pidx].wait_policy = policy.clone();
+        if let Err(e) = save_ledger(&state, &ledger) {
+            eprintln!("wait: {e}");
+            return 1;
+        }
+        wait_append(
+            &state,
+            &ledger,
+            pticket,
+            pattempt,
+            &format!(
+                "WAIT: parent {parent_id} waiting on {} (policy {policy})",
+                pending_ids.join(",")
+            ),
+        );
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "parent": parent_id, "ticket": pticket, "attempt": pattempt,
+                    "policy": policy, "state": "waiting",
+                    "pending": pending_ids,
+                    "children": children.iter().map(|(id, status, replay_safe)| {
+                        serde_json::json!({"id": id, "status": status, "replay_safe": replay_safe})
+                    }).collect::<Vec<_>>(),
+                })
+            );
+        } else {
+            println!(
+                "waiting: parent {parent_id} waits on {} (policy {policy})",
+                pending_ids.join(", ")
+            );
+            for (id, status, _) in &children {
+                println!("child {id} {status}");
+            }
+        }
+        return 0;
+    }
+
+    // All children terminal: resume the parent with every outcome logged.
+    let parent_outcome = if children.iter().any(|(_, s, _)| is_task_failed(s)) {
+        "failed"
+    } else {
+        "done"
+    };
+    ledger.tasks[pidx].status = parent_outcome.to_string();
+    ledger.tasks[pidx].waits_on.clear();
+    ledger.tasks[pidx].wait_policy = policy.clone();
+    if let Err(e) = save_ledger(&state, &ledger) {
+        eprintln!("wait: {e}");
+        return 1;
+    }
+    for (id, status, _) in &children {
+        wait_append(
+            &state,
+            &ledger,
+            pticket,
+            pattempt,
+            &format!("WAIT: child {id} {status}"),
+        );
+    }
+    wait_append(
+        &state,
+        &ledger,
+        pticket,
+        pattempt,
+        &format!("WAIT: parent {parent_id} resumed {parent_outcome} (policy {policy}); replay-safe children may rerun, others ran once"),
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "parent": parent_id, "ticket": pticket, "attempt": pattempt,
+                "policy": policy, "state": "resumed", "outcome": parent_outcome,
+                "children": children.iter().map(|(id, status, replay_safe)| {
+                    serde_json::json!({"id": id, "status": status, "replay_safe": replay_safe})
+                }).collect::<Vec<_>>(),
+                "abort_order": [],
+            })
+        );
+    } else {
+        println!("resumed: parent {parent_id} {parent_outcome} (policy {policy})");
+        for (id, status, _) in &children {
+            println!("child {id} {status}");
+        }
     }
     0
 }
@@ -10257,6 +10837,9 @@ pub fn run() -> i32 {
         }
         Commands::Status => cmd_status(cli.json),
         Commands::Log { ticket, tail } => cmd_log(&ticket, tail, cli.json),
+        Commands::Facts { action } => match action {
+            FactsAction::Show { path } => cmd_facts_show(cli.json, path.as_deref()),
+        },
         Commands::Init {
             stack,
             global_skills,
@@ -10324,6 +10907,11 @@ pub fn run() -> i32 {
             DispatchAction::Daemon { interval } => cmd_dispatch_daemon(cli.json, interval),
             DispatchAction::Status => cmd_dispatch_status(cli.json),
             DispatchAction::Graph { ticket } => cmd_dispatch_graph(cli.json, ticket.as_deref()),
+            DispatchAction::Wait {
+                ticket,
+                parent,
+                policy,
+            } => cmd_dispatch_wait(cli.json, ticket.as_deref(), &parent, &policy),
             DispatchAction::Stop => cmd_dispatch_stop(cli.json),
             DispatchAction::Resume => cmd_dispatch_resume(cli.json),
             DispatchAction::SelfTest => cmd_dispatch_selftest(cli.json),

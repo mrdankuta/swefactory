@@ -5,6 +5,16 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+### Shared cross-attempt state, slice 1: facts document + reads (spec #64, ticket #77)
+
+- `factory facts show [PATH]`: read the revision-guarded facts document
+  (`facts.json` beside the dispatch ledger) whole or at one
+  slash-separated path, human-readable by default and identical
+  value-plus-revision facts with `--json`. An absent document reads as
+  empty at revision zero with no migration; missing paths read as plain
+  sentences (never zero-filled, never error-shaped). Read-only:
+  observing changes nothing.
+
 ### 0.1.0-rc.6 — styled board + outcome metrics (spec #56, tickets #57–#58)
 
 - Board and all nine page shells restyled in the kanban design language
