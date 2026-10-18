@@ -7261,16 +7261,19 @@ fn depends_on(body: &str) -> Vec<u64> {
     deps
 }
 
-/// `Spec issue: #N` / `Spec: #N` reference in a ticket body (#none → None).
+/// `Spec issue: #N` / `Spec: #N` / `Part of #N` reference in a ticket body (#none → None).
 fn linked_spec(body: &str) -> Option<u64> {
     let low = body.to_lowercase();
     let mut idx = 0;
     while idx < low.len() {
         let rest = &low[idx..];
-        let found = rest
-            .find("spec issue:")
-            .map(|i| (i, "spec issue:".len()))
-            .or_else(|| rest.find("spec:").map(|i| (i, "spec:".len())));
+        // Earliest marker in the body wins (mirrors the bash dispatcher's
+        // first-match scan), so a `Part of` link ahead of a `Spec:` mention
+        // resolves to the former.
+        let found = ["spec issue:", "spec:", "part of"]
+            .iter()
+            .filter_map(|m| rest.find(m).map(|i| (i, m.len())))
+            .min();
         let Some((i, len)) = found else {
             break;
         };
