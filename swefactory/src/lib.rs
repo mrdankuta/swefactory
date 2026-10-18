@@ -61,17 +61,29 @@ pub enum Commands {
         fork: Option<String>,
     },
     /// Fork a ticket attempt at a chosen log entry into a named experiment
-    /// line (ticket #80, spec #65 slice: fork creation + isolation). The
-    /// fork inherits the conversation prefix up to and including the entry
-    /// and reads the shared facts document; the originating line is
-    /// byte-identical before and after. Each fork is isolated in its own
-    /// worktree, branch, and slot, addressable by name or number.
+    /// line (spec #65: fork creation + isolation in ticket #80, lineage +
+    /// nesting + caps here in ticket #81). The fork inherits the
+    /// conversation prefix up to and including the entry and reads the
+    /// shared facts document; the originating line is byte-identical
+    /// before and after. Each fork is isolated in its own worktree,
+    /// branch, and slot, addressable by name or number. Forks nest:
+    /// `--fork NAME|NUMBER` roots the child at a parent fork's entry and
+    /// records the full chain oldest-first. At most
+    /// MAX_FORKS_PER_TICKET forks per ticket; past the cap the fork is
+    /// refused with the cap stated. Per-line figures render from the
+    /// shared facts document at forks.<ticket>.<name> (or forks.<name>)
+    /// fields `cost` and `changed`.
     Fork {
         /// Ticket issue number (e.g. 80 or #80).
         ticket: String,
         /// Parent attempt number (default: the newest attempt).
+        /// Cannot be combined with --fork.
         #[arg(long)]
         attempt: Option<u64>,
+        /// Parent fork name or 1-based number for a nested fork.
+        /// Cannot be combined with --attempt.
+        #[arg(long, value_name = "NAME|NUMBER")]
+        fork: Option<String>,
         /// Transcript entry (1-indexed line) the fork inherits through.
         #[arg(long)]
         at: u64,
@@ -6732,10 +6744,31 @@ struct DispatchLedger {
     forks: Vec<ForkRecord>,
 }
 
+/// One link in a fork's lineage chain, oldest-first (ticket #81,
+/// spec #65): `kind` is `"attempt"` (a fork rooted at an attempt line)
+/// or `"fork"` (a nested fork rooted at a parent fork line); `no` is
+/// the attempt number or parent fork number; `name` is empty for
+/// attempts and the parent fork name for nested links.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct ForkLineageLink {
+    ticket: u64,
+    kind: String,
+    no: u64,
+    entry: u64,
+    #[serde(default)]
+    name: String,
+}
+
 /// One experiment line (ticket #80, spec #65): the fork inherits the
 /// parent attempt's transcript prefix up to and including `parent_entry`
 /// and continues independently in its own worktree, branch, slot, and log.
 /// The parent transcript is never written by a fork.
+///
+/// Lineage (ticket #81): `lineage` is the full chain oldest-first;
+/// `parent_fork` names the immediate parent fork (empty when the parent
+/// is an attempt). `#[serde(default)]` keeps pre-lineage ledgers parsing
+/// (no migration: older forks render their chain from the parent
+/// attempt + entry they already carry).
 #[derive(Serialize, serde::Deserialize, Clone, Debug)]
 struct ForkRecord {
     id: u64,
@@ -6744,6 +6777,10 @@ struct ForkRecord {
     name: String,
     parent_attempt: u64,
     parent_entry: u64,
+    #[serde(default)]
+    parent_fork: String,
+    #[serde(default)]
+    lineage: Vec<ForkLineageLink>,
     slot: String,
     branch: String,
     worktree: String,
@@ -8873,24 +8910,12 @@ pub fn cmd_status(json: bool) -> i32 {
 
     // Fork facts ride alongside attempt rows with identical lineage in
     // both modes. Empty stays present-but-empty: machines see one shape.
+    // Per-line figures come from the shared facts document (read-only).
+    let (fork_facts, fork_facts_rev) = fork_facts_or_empty(&state);
     let fork_rows: Vec<serde_json::Value> = ledger
         .forks
         .iter()
-        .map(|f| {
-            serde_json::json!({
-                "ticket": f.ticket,
-                "fork": f.name,
-                "fork_no": f.fork_no,
-                "name": f.name,
-                "parent_attempt": f.parent_attempt,
-                "parent_entry": f.parent_entry,
-                "slot": f.slot,
-                "branch": f.branch,
-                "worktree": f.worktree,
-                "status": "forked",
-                "summary": fork_summary(f),
-            })
-        })
+        .map(|f| fork_json(f, &fork_facts, fork_facts_rev))
         .collect();
     if json {
         let mut files_map = serde_json::Map::new();
@@ -8995,10 +9020,7 @@ pub fn cmd_status(json: bool) -> i32 {
     }
     if !ledger.forks.is_empty() {
         for f in &ledger.forks {
-            println!(
-                "Fork {} (ticket #{}, #{}) from attempt {} entry {} (slot {}).",
-                f.name, f.ticket, f.fork_no, f.parent_attempt, f.parent_entry, f.slot
-            );
+            println!("{}", fork_summary(f, &fork_facts, fork_facts_rev));
         }
     }
     print_paused_copy(ledger.attempts.iter().any(is_resumable));
@@ -9183,16 +9205,151 @@ fn fork_prefix_slice(full: &str, entry: u64) -> String {
     lines[..n].join("\n") + "\n"
 }
 
-fn fork_summary(f: &ForkRecord) -> String {
+/// Documented per-ticket fork cap (ticket #81, spec #65): storage growth
+/// is a visible decision, so the bound lives in user-facing copy (the
+/// `Fork` help above) and in the refusal message, never silently.
+/// A wide experiment tree is visibly more expensive than a single line.
+pub const MAX_FORKS_PER_TICKET: u64 = 8;
+
+/// The fork's full lineage chain oldest-first (ticket #81, spec #65).
+/// Pre-lineage rows (ticket #80) carry no `lineage`, so the chain is
+/// derived from the parent attempt + entry they already record.
+fn fork_chain(f: &ForkRecord) -> Vec<ForkLineageLink> {
+    if !f.lineage.is_empty() {
+        return f.lineage.clone();
+    }
+    vec![ForkLineageLink {
+        ticket: f.ticket,
+        kind: "attempt".to_string(),
+        no: f.parent_attempt,
+        entry: f.parent_entry,
+        name: String::new(),
+    }]
+}
+
+/// Plain-English lineage, oldest-first, shared by human output and the
+/// JSON `summary` so both modes carry identical facts.
+fn fork_lineage_words(chain: &[ForkLineageLink]) -> String {
+    let ticket = chain.first().map(|l| l.ticket).unwrap_or(0);
+    let links: Vec<String> = chain
+        .iter()
+        .map(|l| {
+            if l.kind == "fork" && !l.name.is_empty() {
+                format!("fork '{}' entry {}", l.name, l.entry)
+            } else {
+                format!("attempt {} entry {}", l.no, l.entry)
+            }
+        })
+        .collect();
+    format!("from ticket #{ticket} {}", links.join(" -> "))
+}
+
+/// One compact figure word: strings read as-is, numbers/bools render
+/// plainly, anything else falls back to compact JSON (never pretty).
+fn fork_figure_word(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "?".to_string()),
+    }
+}
+
+/// One per-line figure from the shared facts document (ticket #81,
+/// spec #65 + spec #64): ticket-scoped `forks.<ticket>.<name>.<field>`
+/// first, then unscoped `forks.<name>.<field>`. `None` is a missing
+/// figure (plain not-recorded words, exit 0) - never synthesized,
+/// never zero-filled.
+fn fork_figure(facts: &serde_json::Value, ticket: u64, name: &str, field: &str) -> Option<String> {
+    for path in [
+        format!("forks/{ticket}/{name}/{field}"),
+        format!("forks/{name}/{field}"),
+    ] {
+        if let Some(v) = facts_lookup(facts, &path) {
+            return Some(fork_figure_word(v));
+        }
+    }
+    None
+}
+
+/// Calm one-line experiment summary (ticket #81, spec #65): what line
+/// this is, where it descends from (oldest-first), and its per-line
+/// figures from the shared document. Missing figures read as
+/// not-recorded, never zero-filled. The identical string ships in human
+/// output and in the JSON `summary` so scripts reason about the same
+/// tree a reader sees.
+fn fork_summary(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> String {
+    let chain = fork_chain(f);
+    let cost = fork_figure(facts, f.ticket, &f.name, "cost");
+    let changed = fork_figure(facts, f.ticket, &f.name, "changed");
+    let figures = match (cost, changed) {
+        (Some(c), Some(ch)) => format!("cost {c}, changed {ch}"),
+        (Some(c), None) => format!("cost {c}, changed not yet recorded"),
+        (None, Some(ch)) => format!("cost not yet recorded, changed {ch}"),
+        (None, None) => "cost not yet recorded, changed not yet recorded".to_string(),
+    };
     format!(
-        "Ticket {} fork {} (#{} from attempt {} entry {}) is an experiment line (slot {}).",
-        f.ticket, f.name, f.fork_no, f.parent_attempt, f.parent_entry, f.slot
+        "Fork '{}' (#{}, {}): {}; {} (shared facts rev {}).",
+        f.name,
+        f.fork_no,
+        f.slot,
+        fork_lineage_words(&chain),
+        figures,
+        revision
     )
+}
+
+/// One fork's machine-readable row (ticket #81, spec #65): the same
+/// lineage chain oldest-first plus the same summary string and figures
+/// the human line carries, so both modes hold identical facts.
+fn fork_json(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> serde_json::Value {
+    let chain = fork_chain(f);
+    let lineage: Vec<serde_json::Value> = chain
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "ticket": l.ticket,
+                "kind": l.kind,
+                "no": l.no,
+                "entry": l.entry,
+                "name": l.name,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "ticket": f.ticket,
+        "fork": f.name,
+        "fork_no": f.fork_no,
+        "name": f.name,
+        "parent_attempt": f.parent_attempt,
+        "parent_entry": f.parent_entry,
+        "parent_fork": f.parent_fork,
+        "lineage": lineage,
+        "slot": f.slot,
+        "branch": f.branch,
+        "worktree": f.worktree,
+        "status": "forked",
+        "summary": fork_summary(f, facts, revision),
+        "cost": fork_figure(facts, f.ticket, &f.name, "cost"),
+        "changed": fork_figure(facts, f.ticket, &f.name, "changed"),
+        "facts_revision": revision,
+    })
+}
+
+/// Read-only shared-facts load for fork rendering (ticket #81): status
+/// and log must never fail on facts trouble, so an unreadable document
+/// degrades to empty at revision zero (figures not-recorded) instead
+/// of erroring the read.
+fn fork_facts_or_empty(state: &std::path::Path) -> (serde_json::Value, u64) {
+    match load_facts_document(state) {
+        Ok(doc) => (doc.facts, doc.revision),
+        Err(_) => (serde_json::json!({}), 0),
+    }
 }
 
 pub fn cmd_fork(
     ticket_raw: &str,
     attempt_opt: Option<u64>,
+    fork_sel: Option<&str>,
     entry: u64,
     name_raw: &str,
     json: bool,
@@ -9229,43 +9386,106 @@ pub fn cmd_fork(
         );
         return 1;
     }
-    // Parent attempt: explicit --attempt, else the newest record.
-    let parent: DispatchAttempt = match attempt_opt {
-        Some(no) => match ledger
-            .attempts
-            .iter()
-            .filter(|a| a.ticket == ticket && a.attempt_no == no)
-            .max_by_key(|a| a.id)
-            .cloned()
-        {
-            Some(a) => a,
+    // One parent line only: --attempt and --fork together name no line.
+    if attempt_opt.is_some() && fork_sel.is_some() {
+        eprintln!(
+            "fork: use either --attempt N or --fork NAME|NUMBER, not both (ticket #{ticket})"
+        );
+        return 1;
+    }
+    // Documented per-ticket cap (ticket #81, spec #65): past the cap the
+    // fork is refused before anything is written - no ledger row, no
+    // worktree, no branch, no log file. A wide experiment tree stays a
+    // visible storage decision.
+    let have_forks = ledger.forks.iter().filter(|f| f.ticket == ticket).count() as u64;
+    if have_forks >= MAX_FORKS_PER_TICKET {
+        eprintln!(
+            "fork: ticket #{ticket} already has {have_forks} forks (cap {MAX_FORKS_PER_TICKET} per ticket); abandon or land one line before branching again"
+        );
+        return 1;
+    }
+    // Parent line: an attempt (explicit --attempt, else the newest
+    // record) or a parent fork (--fork NAME|NUMBER for nested forks).
+    // Either way the parent file is only READ here; the fork seeds its
+    // own log file and the parent stays byte-identical.
+    enum ForkParent {
+        Attempt(DispatchAttempt),
+        Fork(ForkRecord),
+    }
+    let parent: ForkParent = match fork_sel {
+        Some(sel) => match resolve_fork(&ledger, ticket, sel) {
+            Some(f) => ForkParent::Fork(f.clone()),
             None => {
-                eprintln!("fork: no attempt {no} for ticket #{ticket} to fork from");
+                let taken = fork_taken_names(&ledger, ticket);
+                if taken.is_empty() {
+                    eprintln!("fork: ticket #{ticket} has no forks to fork from");
+                } else {
+                    eprintln!(
+                        "fork: no fork '{}' for ticket #{ticket} (taken: {})",
+                        sel.trim(),
+                        taken.join(", ")
+                    );
+                }
                 return 1;
             }
         },
-        None => match ledger
-            .attempts
-            .iter()
-            .filter(|a| a.ticket == ticket)
-            .max_by_key(|a| (a.attempt_no, a.id))
-            .cloned()
-        {
-            Some(a) => a,
-            None => {
-                eprintln!("fork: ticket #{ticket} has no attempts to fork from");
-                return 1;
-            }
+        None => match attempt_opt {
+            Some(no) => match ledger
+                .attempts
+                .iter()
+                .filter(|a| a.ticket == ticket && a.attempt_no == no)
+                .max_by_key(|a| a.id)
+                .cloned()
+            {
+                Some(a) => ForkParent::Attempt(a),
+                None => {
+                    eprintln!("fork: no attempt {no} for ticket #{ticket} to fork from");
+                    return 1;
+                }
+            },
+            None => match ledger
+                .attempts
+                .iter()
+                .filter(|a| a.ticket == ticket)
+                .max_by_key(|a| (a.attempt_no, a.id))
+                .cloned()
+            {
+                Some(a) => ForkParent::Attempt(a),
+                None => {
+                    eprintln!("fork: ticket #{ticket} has no attempts to fork from");
+                    return 1;
+                }
+            },
         },
     };
-    // Entry bound: 1-indexed into the parent's combined transcript.
-    // The parent file is only READ here; the fork seeds its own log file.
-    let full = log_read_transcript(&state, &parent);
+    // Parent transcript, base candidates, and the lineage prefix the
+    // child extends. A nested fork inherits its parent fork's prefix
+    // (lines 1..=entry of the parent fork log) and records the parent
+    // fork's full chain plus its own link, oldest-first.
+    let (full, base_candidates, lineage_prefix, parent_fork_name, root_attempt, parent_desc) =
+        match &parent {
+            ForkParent::Attempt(a) => (
+                log_read_transcript(&state, a),
+                vec![a.head_commit.clone(), a.base_commit.clone()],
+                Vec::new(),
+                String::new(),
+                a.attempt_no,
+                format!("attempt {}", a.attempt_no),
+            ),
+            ForkParent::Fork(f) => (
+                std::fs::read_to_string(Path::new(&f.log_path)).unwrap_or_default(),
+                vec![f.base_commit.clone()],
+                fork_chain(f),
+                f.name.clone(),
+                f.parent_attempt,
+                format!("fork '{}'", f.name),
+            ),
+        };
+    // Entry bound: 1-indexed into the parent line's transcript.
     let line_count = full.lines().count() as u64;
     if entry < 1 || entry > line_count {
         eprintln!(
-            "fork: entry {entry} out of range for ticket #{ticket} attempt {} (transcript has {line_count} line(s); use --at 1..={line_count})",
-            parent.attempt_no
+            "fork: entry {entry} out of range for ticket #{ticket} {parent_desc} (transcript has {line_count} line(s); use --at 1..={line_count})"
         );
         return 1;
     }
@@ -9296,7 +9516,7 @@ pub fn cmd_fork(
     // and fall back to the local HEAD so the fork always roots somewhere.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut base = String::new();
-    for candidate in [&parent.head_commit, &parent.base_commit] {
+    for candidate in &base_candidates {
         if candidate.is_empty() {
             continue;
         }
@@ -9355,13 +9575,48 @@ pub fn cmd_fork(
         remove_worktree(&wt);
         return 1;
     }
+    // The child's chain is the parent line's full chain plus its own
+    // link, oldest-first: a direct fork links the attempt, a nested fork
+    // links the parent fork. `parent_attempt` stays the root attempt so
+    // pre-lineage readers keep their meaning.
+    let mut lineage = lineage_prefix;
+    match &parent {
+        ForkParent::Attempt(a) => lineage.push(ForkLineageLink {
+            ticket,
+            kind: "attempt".to_string(),
+            no: a.attempt_no,
+            entry,
+            name: String::new(),
+        }),
+        ForkParent::Fork(f) => lineage.push(ForkLineageLink {
+            ticket,
+            kind: "fork".to_string(),
+            no: f.fork_no,
+            entry,
+            name: f.name.clone(),
+        }),
+    }
+    let lineage_rows: Vec<serde_json::Value> = lineage
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "ticket": l.ticket,
+                "kind": l.kind,
+                "no": l.no,
+                "entry": l.entry,
+                "name": l.name,
+            })
+        })
+        .collect();
     let record = ForkRecord {
         id,
         ticket,
         fork_no,
         name: name.clone(),
-        parent_attempt: parent.attempt_no,
+        parent_attempt: root_attempt,
         parent_entry: entry,
+        parent_fork: parent_fork_name.clone(),
+        lineage,
         slot: slot.clone(),
         branch: branch.clone(),
         worktree: wt_s.clone(),
@@ -9384,8 +9639,10 @@ pub fn cmd_fork(
                 "fork": name,
                 "fork_no": fork_no,
                 "name": name,
-                "parent_attempt": parent.attempt_no,
+                "parent_attempt": root_attempt,
                 "parent_entry": entry,
+                "parent_fork": parent_fork_name,
+                "lineage": lineage_rows,
                 "slot": slot,
                 "branch": branch,
                 "worktree": wt_s,
@@ -9394,8 +9651,7 @@ pub fn cmd_fork(
         return 0;
     }
     println!(
-        "Forked ticket #{ticket} attempt {} entry {entry} into fork '{name}' (#{fork_no}, slot {slot}).",
-        parent.attempt_no
+        "Forked ticket #{ticket} {parent_desc} entry {entry} into fork '{name}' (#{fork_no}, slot {slot}).",
     );
     println!("Branch {branch} at {wt_s}.");
     0
@@ -9434,32 +9690,15 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
         };
         let full = std::fs::read_to_string(Path::new(&f.log_path)).unwrap_or_default();
         let (shown, truncated) = log_tail(&full, tail);
+        let (fork_facts, fork_facts_rev) = fork_facts_or_empty(&state);
         if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ticket": f.ticket,
-                    "fork": f.name,
-                    "fork_no": f.fork_no,
-                    "name": f.name,
-                    "parent_attempt": f.parent_attempt,
-                    "parent_entry": f.parent_entry,
-                    "slot": f.slot,
-                    "branch": f.branch,
-                    "worktree": f.worktree,
-                    "status": "forked",
-                    "summary": fork_summary(f),
-                    "transcript": shown,
-                    "truncated": truncated,
-                })
-            );
+            let mut row = fork_json(f, &fork_facts, fork_facts_rev);
+            row["transcript"] = serde_json::Value::String(shown);
+            row["truncated"] = serde_json::Value::Bool(truncated);
+            println!("{row}");
             return 0;
         }
-        println!(
-            "Ticket #{ticket} fork {} (#{}) from attempt {} entry {} (slot {}).",
-            f.name, f.fork_no, f.parent_attempt, f.parent_entry, f.slot
-        );
-        println!("{}", fork_summary(f));
+        println!("{}", fork_summary(f, &fork_facts, fork_facts_rev));
         if shown.is_empty() {
             println!("(no transcript yet)");
         } else if tail == 0 {
@@ -9529,23 +9768,11 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
 
     // Fork facts ride alongside attempt rows so machines and prose read
     // one story. Empty stays absent: unforked tickets keep the old shape.
+    // Per-line figures come from the shared facts document (read-only).
+    let (fork_facts, fork_facts_rev) = fork_facts_or_empty(&state);
     let fork_rows: Vec<serde_json::Value> = ticket_forks
         .iter()
-        .map(|f| {
-            serde_json::json!({
-                "ticket": f.ticket,
-                "fork": f.name,
-                "fork_no": f.fork_no,
-                "name": f.name,
-                "parent_attempt": f.parent_attempt,
-                "parent_entry": f.parent_entry,
-                "slot": f.slot,
-                "branch": f.branch,
-                "worktree": f.worktree,
-                "status": "forked",
-                "summary": fork_summary(f),
-            })
-        })
+        .map(|f| fork_json(f, &fork_facts, fork_facts_rev))
         .collect();
     if json {
         let mut out = serde_json::json!({"ticket": ticket, "attempts": rows});
@@ -9619,10 +9846,7 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
         }
     }
     for f in &ticket_forks {
-        println!(
-            "Fork {} (#{}) from attempt {} entry {} (slot {}).",
-            f.name, f.fork_no, f.parent_attempt, f.parent_entry, f.slot
-        );
+        println!("{}", fork_summary(f, &fork_facts, fork_facts_rev));
     }
     print_paused_copy(entries.iter().any(|a| is_resumable(a)));
     0
@@ -12105,9 +12329,10 @@ pub fn run() -> i32 {
         Commands::Fork {
             ticket,
             attempt,
+            fork,
             at,
             name,
-        } => cmd_fork(&ticket, attempt, at, &name, cli.json),
+        } => cmd_fork(&ticket, attempt, fork.as_deref(), at, &name, cli.json),
         Commands::Init {
             stack,
             global_skills,
