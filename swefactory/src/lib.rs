@@ -62,34 +62,48 @@ pub enum Commands {
     },
     /// Fork a ticket attempt at a chosen log entry into a named experiment
     /// line (spec #65: fork creation + isolation in ticket #80, lineage +
-    /// nesting + caps here in ticket #81). The fork inherits the
-    /// conversation prefix up to and including the entry and reads the
-    /// shared facts document; the originating line is byte-identical
-    /// before and after. Each fork is isolated in its own worktree,
-    /// branch, and slot, addressable by name or number. Forks nest:
-    /// `--fork NAME|NUMBER` roots the child at a parent fork's entry and
-    /// records the full chain oldest-first. At most
+    /// nesting + caps in ticket #81, lifecycle composition in ticket #82).
+    /// The fork inherits the conversation prefix up to and including the
+    /// entry and reads the shared facts document; the originating line is
+    /// byte-identical before and after. Each fork is isolated in its own
+    /// worktree, branch, and slot, addressable by name or number. Forks
+    /// nest: `--fork NAME|NUMBER` roots the child at a parent fork's
+    /// entry and records the full chain oldest-first. At most
     /// MAX_FORKS_PER_TICKET forks per ticket; past the cap the fork is
     /// refused with the cap stated. Per-line figures render from the
     /// shared facts document at forks.<ticket>.<name> (or forks.<name>)
-    /// fields `cost` and `changed`.
+    /// fields `cost` and `changed`. A forked line replays like a main
+    /// line: `--interrupt NAME|NUMBER` marks it interrupted (resumable)
+    /// and releases its worktree, `--resume NAME|NUMBER` continues the
+    /// same line with its transcript preserved.
     Fork {
         /// Ticket issue number (e.g. 80 or #80).
         ticket: String,
         /// Parent attempt number (default: the newest attempt).
-        /// Cannot be combined with --fork.
+        /// Cannot be combined with --fork. Creation only.
         #[arg(long)]
         attempt: Option<u64>,
         /// Parent fork name or 1-based number for a nested fork.
-        /// Cannot be combined with --attempt.
+        /// Cannot be combined with --attempt. Creation only.
         #[arg(long, value_name = "NAME|NUMBER")]
         fork: Option<String>,
         /// Transcript entry (1-indexed line) the fork inherits through.
+        /// Creation only (required to root a new line).
         #[arg(long)]
-        at: u64,
+        at: Option<u64>,
         /// Fork name (unique per ticket; collisions list the taken names).
+        /// Creation only (required to root a new line).
         #[arg(long)]
-        name: String,
+        name: Option<String>,
+        /// Resume an interrupted fork line by name or 1-based number.
+        /// Cannot be combined with creation flags or --interrupt.
+        #[arg(long, value_name = "NAME|NUMBER")]
+        resume: Option<String>,
+        /// Mark a live fork line interrupted (resumable), releasing its
+        /// worktree for resume to re-attach. Cannot be combined with
+        /// creation flags or --resume.
+        #[arg(long, value_name = "NAME|NUMBER")]
+        interrupt: Option<String>,
     },
     /// Cross-attempt facts (spec #64): the revision-guarded document
     /// beside the dispatch ledger. Reads only in this slice (ticket
@@ -6778,6 +6792,13 @@ struct ForkLineageLink {
     name: String,
 }
 
+/// Default lifecycle state for a fork row written before this ticket
+/// (ticket #82): a live line, never interrupted — older rows render
+/// exactly as before with no migration.
+fn default_fork_status() -> String {
+    "forked".to_string()
+}
+
 /// One experiment line (ticket #80, spec #65): the fork inherits the
 /// parent attempt's transcript prefix up to and including `parent_entry`
 /// and continues independently in its own worktree, branch, slot, and log.
@@ -6788,6 +6809,13 @@ struct ForkLineageLink {
 /// is an attempt). `#[serde(default)]` keeps pre-lineage ledgers parsing
 /// (no migration: older forks render their chain from the parent
 /// attempt + entry they already carry).
+///
+/// Lifecycle (ticket #82): `status` is the per-line replay state —
+/// `"forked"` (live), `"implement_interrupted"` (interrupted,
+/// resumable) — and `resumed` counts resumes of this same line.
+/// `#[serde(default)]` keeps pre-lifecycle rows parsing as live lines
+/// with no resume history (no migration: unforked tickets and old rows
+/// behave exactly as before).
 #[derive(Serialize, serde::Deserialize, Clone, Debug)]
 struct ForkRecord {
     id: u64,
@@ -6807,6 +6835,10 @@ struct ForkRecord {
     #[serde(default)]
     base_commit: String,
     started_at: String,
+    #[serde(default = "default_fork_status")]
+    status: String,
+    #[serde(default)]
+    resumed: u64,
 }
 
 /// One stored hook/approval decision (ticket #67, spec #59 follow-up):
@@ -9290,12 +9322,24 @@ fn fork_figure(facts: &serde_json::Value, ticket: u64, name: &str, field: &str) 
     None
 }
 
+/// Words shared by every human surface when a fork carries resume
+/// history (ticket #82, spec #65); empty for never-resumed rows so old
+/// output is byte-identical.
+fn fork_resumed_suffix(f: &ForkRecord) -> String {
+    if f.resumed == 0 {
+        String::new()
+    } else {
+        format!(" Resumed from checkpoint {} time(s).", f.resumed)
+    }
+}
+
 /// Calm one-line experiment summary (ticket #81, spec #65): what line
 /// this is, where it descends from (oldest-first), and its per-line
 /// figures from the shared document. Missing figures read as
 /// not-recorded, never zero-filled. The identical string ships in human
 /// output and in the JSON `summary` so scripts reason about the same
-/// tree a reader sees.
+/// tree a reader sees. Resume history (ticket #82) appends only for
+/// resumed rows, so never-resumed lines render exactly as before.
 fn fork_summary(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> String {
     let chain = fork_chain(f);
     let cost = fork_figure(facts, f.ticket, &f.name, "cost");
@@ -9307,13 +9351,14 @@ fn fork_summary(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> Str
         (None, None) => "cost not yet recorded, changed not yet recorded".to_string(),
     };
     format!(
-        "Fork '{}' (#{}, {}): {}; {} (shared facts rev {}).",
+        "Fork '{}' (#{}, {}): {}; {} (shared facts rev {}).{}",
         f.name,
         f.fork_no,
         f.slot,
         fork_lineage_words(&chain),
         figures,
-        revision
+        revision,
+        fork_resumed_suffix(f)
     )
 }
 
@@ -9346,7 +9391,8 @@ fn fork_json(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> serde_
         "slot": f.slot,
         "branch": f.branch,
         "worktree": f.worktree,
-        "status": "forked",
+        "status": f.status,
+        "resumed": f.resumed,
         "summary": fork_summary(f, facts, revision),
         "cost": fork_figure(facts, f.ticket, &f.name, "cost"),
         "changed": fork_figure(facts, f.ticket, &f.name, "changed"),
@@ -9365,12 +9411,178 @@ fn fork_facts_or_empty(state: &std::path::Path) -> (serde_json::Value, u64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FORK LIFECYCLE (ticket #82, spec #65 slice: replayability per line)
+//
+// A forked line replays exactly like a main line: `--interrupt` marks
+// the line interrupted (resumable) and releases its worktree so resume
+// recreates it; `--resume` continues the SAME line (never a new one)
+// with its transcript preserved. Both are ledger + file operations on
+// the recorded line — no issue-tracker calls, no subprocesses, no
+// spend — so they stay hermetic. Landing is untouched: `release merge`
+// only ever reads attempt branches, so no path lands a fork without
+// the normal accept-and-land decision.
+// ---------------------------------------------------------------------------
+
+/// Mark one fork line interrupted (resumable), releasing its worktree so
+/// the next `--resume` re-attaches it. Mirrors the dispatcher's attempt
+/// interruption: the checkpoint line is already on disk, the ledger
+/// reads interrupted, never failed. Refuses live-again lines (already
+/// interrupted) instead of stacking markers.
+fn interrupt_fork_line(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    ticket: u64,
+    idx: usize,
+) -> i32 {
+    let status = ledger.forks[idx].status.clone();
+    let name = ledger.forks[idx].name.clone();
+    if is_interrupted_status(&status) {
+        eprintln!(
+            "fork: '{name}' for ticket #{ticket} is already interrupted — resume it with `fork {ticket} --resume {name}`"
+        );
+        return 1;
+    }
+    if status != "forked" {
+        eprintln!(
+            "fork: '{name}' for ticket #{ticket} is not live (status {status}) — nothing to interrupt"
+        );
+        return 1;
+    }
+    let slot = ledger.forks[idx].slot.clone();
+    let log_path = ledger.forks[idx].log_path.clone();
+    let worktree = PathBuf::from(ledger.forks[idx].worktree.clone());
+    append_log(
+        Path::new(&log_path),
+        &format!("interrupted during implement (slot {slot}) — resumable\n"),
+    );
+    ledger.forks[idx].status = "implement_interrupted".to_string();
+    // The worktree is released here and recreated on resume — the same
+    // release/re-attach discipline attempts follow, so abandoned lines
+    // never pin storage beyond the per-ticket cap.
+    remove_worktree(&worktree);
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("fork: {e}");
+        return 1;
+    }
+    println!("fork '{name}' for ticket #{ticket} interrupted (slot {slot}) — resumable next pass");
+    0
+}
+
+/// Resume one interrupted fork line: the same line continues its phase
+/// with its transcript preserved, instead of branching a new line. The
+/// slot gate holds (no resume is admitted past capacity), the released
+/// worktree is re-attached on the recorded branch, and the checkpoint
+/// line names the resume for the audit — mirroring `resume_ticket_attempt`
+/// without its issue-tracker side effects (forks are local lines).
+fn resume_fork_line(
+    state: &std::path::Path,
+    ledger: &mut DispatchLedger,
+    ticket: u64,
+    idx: usize,
+    json: bool,
+) -> i32 {
+    let status = ledger.forks[idx].status.clone();
+    let name = ledger.forks[idx].name.clone();
+    if !is_interrupted_status(&status) {
+        eprintln!(
+            "fork: '{name}' for ticket #{ticket} is not interrupted (status {status}) — nothing to resume"
+        );
+        return 1;
+    }
+    // Slot gate: a resume is admitted exactly like fresh work — never
+    // past capacity. Shared with attempts: the gate applies across all
+    // lines of a ticket.
+    if dispatch_active(ledger) >= dispatch_max_concurrent() {
+        eprintln!("fork: '{name}' resume deferred — slot gate at capacity");
+        return 1;
+    }
+    let record_branch = ledger.forks[idx].branch.clone();
+    let record_base = ledger.forks[idx].base_commit.clone();
+    let record_log = ledger.forks[idx].log_path.clone();
+    let slot = ledger.forks[idx].slot.clone();
+    let wt = state.join("worktrees").join(&slot);
+    // Re-attach the worktree the interruption released. The branch
+    // survives every interruption, so resume re-attaches; a missing
+    // branch (abandoned out-of-band, never observed, but cheap to
+    // survive) is cut fresh from the recorded base.
+    remove_worktree(&wt);
+    let branch_exists = run_git(&["rev-parse", "--verify", "--quiet", &record_branch], None)
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let wt_s = wt.to_string_lossy().to_string();
+    let base = if record_base.is_empty() {
+        "HEAD".to_string()
+    } else {
+        record_base.clone()
+    };
+    let added = if branch_exists {
+        run_git(&["worktree", "add", &wt_s, &record_branch], None)
+    } else {
+        run_git(
+            &["worktree", "add", &wt_s, "-b", &record_branch, &base],
+            None,
+        )
+    };
+    match added {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            eprintln!(
+                "fork: '{name}' resume worktree add failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("fork: '{name}' resume worktree add failed: {e}");
+            return 1;
+        }
+    }
+    let n = ledger.forks[idx].resumed + 1;
+    ledger.forks[idx].resumed = n;
+    ledger.forks[idx].status = "forked".to_string();
+    append_log(
+        Path::new(&record_log),
+        &format!(
+            "resumed from implement checkpoint (slot {slot}, resume #{n}) — transcript preserved\n"
+        ),
+    );
+    if let Err(e) = save_ledger(state, ledger) {
+        eprintln!("fork: {e}");
+        remove_worktree(&wt);
+        return 1;
+    }
+    if json {
+        let f = &ledger.forks[idx];
+        println!(
+            "{}",
+            serde_json::json!({
+                "ticket": ticket,
+                "fork": f.name,
+                "fork_no": f.fork_no,
+                "name": f.name,
+                "status": f.status,
+                "resumed": f.resumed,
+                "slot": f.slot,
+                "branch": f.branch,
+                "worktree": f.worktree,
+            })
+        );
+        return 0;
+    }
+    println!("fork '{name}' for ticket #{ticket} resumed from implement checkpoint (resume #{n}) — continuing the same line, transcript preserved");
+    0
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_fork(
     ticket_raw: &str,
     attempt_opt: Option<u64>,
     fork_sel: Option<&str>,
-    entry: u64,
-    name_raw: &str,
+    entry_opt: Option<u64>,
+    name_opt: Option<&str>,
+    resume_sel: Option<&str>,
+    interrupt_sel: Option<&str>,
     json: bool,
 ) -> i32 {
     let ticket = match parse_issue_number(ticket_raw) {
@@ -9380,16 +9592,63 @@ pub fn cmd_fork(
             return 1;
         }
     };
-    let name = match validate_fork_name(name_raw) {
-        Ok(n) => n,
+    let state = dispatch_state_dir();
+    let mut ledger = match load_ledger_strict_for("fork", &state) {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("{e}");
             return 1;
         }
     };
-    let state = dispatch_state_dir();
-    let mut ledger = match load_ledger_strict_for("fork", &state) {
-        Ok(l) => l,
+    // Lifecycle modes (ticket #82) name exactly one line and combine
+    // with nothing else: creation flags root a new line, lifecycle
+    // flags continue one.
+    if resume_sel.is_some() || interrupt_sel.is_some() {
+        if attempt_opt.is_some() || fork_sel.is_some() || entry_opt.is_some() || name_opt.is_some()
+        {
+            eprintln!(
+                "fork: --resume/--interrupt name one line; creation flags (--attempt/--fork/--at/--name) root a new one, never both (ticket #{ticket})"
+            );
+            return 1;
+        }
+        if resume_sel.is_some() && interrupt_sel.is_some() {
+            eprintln!(
+                "fork: use either --resume NAME|NUMBER or --interrupt NAME|NUMBER, not both (ticket #{ticket})"
+            );
+            return 1;
+        }
+        let sel = resume_sel.or(interrupt_sel).unwrap_or("");
+        let Some(idx) = ledger.forks.iter().position(|f| {
+            f.ticket == ticket
+                && (f.name == sel.trim() || sel.trim().parse::<u64>().ok() == Some(f.fork_no))
+        }) else {
+            let taken = fork_taken_names(&ledger, ticket);
+            if taken.is_empty() {
+                eprintln!("fork: ticket #{ticket} has no forks");
+            } else {
+                eprintln!(
+                    "fork: no fork '{}' for ticket #{ticket} (taken: {})",
+                    sel.trim(),
+                    taken.join(", ")
+                );
+            }
+            return 1;
+        };
+        if resume_sel.is_some() {
+            return resume_fork_line(&state, &mut ledger, ticket, idx, json);
+        }
+        return interrupt_fork_line(&state, &mut ledger, ticket, idx);
+    }
+    let Some(entry) = entry_opt else {
+        eprintln!("fork: --at ENTRY is required to root a new line (ticket #{ticket})");
+        return 1;
+    };
+    let Some(name_raw) = name_opt else {
+        eprintln!("fork: --name NAME is required to root a new line (ticket #{ticket})");
+        return 1;
+    };
+    let name = match validate_fork_name(name_raw) {
+        Ok(n) => n,
         Err(e) => {
             eprintln!("{e}");
             return 1;
@@ -9642,6 +9901,8 @@ pub fn cmd_fork(
         log_path: log_path.to_string_lossy().into_owned(),
         base_commit: base.clone(),
         started_at: now_stamp(),
+        status: "forked".to_string(),
+        resumed: 0,
     };
     ledger.forks.push(record);
     if let Err(e) = save_ledger(&state, &ledger) {
@@ -11921,6 +12182,101 @@ pub fn cmd_dispatch_selftest(json: bool) -> i32 {
         },
     );
 
+    // --- fork-at-entry + resume-on-a-fork (ticket #82, spec #65): the
+    // --- experiment line inherits the attempt prefix, survives an
+    // --- interruption with its transcript preserved, and resumes as the
+    // --- same line — through the same child-`factory` seam, with no gh,
+    // --- no network, and no spend (fork lines run no implementer).
+    let out = st.factory(&["fork", "71", "--at", "1", "--name", "selftest-exp"]);
+    let (stdout, stderr) = selftest_text(&out);
+    let attempt_log =
+        std::fs::read_to_string(state.join("logs").join("T71-a1-impl.log")).unwrap_or_default();
+    let fork_log_path = state.join("logs").join("T71-fork-selftest-exp.log");
+    let fork_body = std::fs::read_to_string(&fork_log_path).unwrap_or_default();
+    let prefix_ok =
+        !attempt_log.is_empty() && !fork_body.is_empty() && attempt_log.starts_with(&fork_body);
+    st.check(
+        "fork-at-entry inherits the prefix",
+        out.status.success() && stdout.contains("Forked ticket #71") && prefix_ok,
+        "Forked ticket #71 with the attempt prefix",
+        selftest_got(&out, &stderr),
+    );
+    // The experiment line does work: one transcript line from the worker.
+    let _ = std::fs::write(&fork_log_path, format!("{fork_body}experiment work line\n"));
+    // Interruption marks the line resumable and releases its worktree.
+    let out = st.factory(&["fork", "71", "--interrupt", "selftest-exp"]);
+    let (_stdout, stderr) = selftest_text(&out);
+    let ledger_text = std::fs::read_to_string(state.join("dispatch.json")).unwrap_or_default();
+    let interrupted = serde_json::from_str::<serde_json::Value>(&ledger_text)
+        .ok()
+        .and_then(|v| {
+            v.get("forks")?
+                .as_array()?
+                .first()?
+                .get("status")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let wt_list = st.git(&proj, &["worktree", "list"]);
+    let (wt_out, _) = selftest_text(&wt_list);
+    st.check(
+        "fork interrupt releases the worktree (resumable)",
+        out.status.success()
+            && interrupted == "implement_interrupted"
+            && !wt_out.contains("T71-fork-selftest-exp"),
+        "implement_interrupted, worktree released",
+        format!("status={interrupted} out={}", selftest_got(&out, &stderr)),
+    );
+    // Resume continues the same line: no new fork, transcript kept.
+    let out = st.factory(&["fork", "71", "--resume", "selftest-exp"]);
+    let (stdout, stderr) = selftest_text(&out);
+    let ledger_text = std::fs::read_to_string(state.join("dispatch.json")).unwrap_or_default();
+    let (fork_count, resumed, status) = serde_json::from_str::<serde_json::Value>(&ledger_text)
+        .ok()
+        .and_then(|v| {
+            let forks = v.get("forks")?.as_array()?;
+            let first = forks.first()?;
+            Some((
+                forks.len(),
+                first.get("resumed")?.as_u64()?,
+                first.get("status")?.as_str()?.to_string(),
+            ))
+        })
+        .unwrap_or((0, 0, String::new()));
+    let wt_list = st.git(&proj, &["worktree", "list"]);
+    let (wt_out, _) = selftest_text(&wt_list);
+    st.check(
+        "fork resume continues the same line",
+        out.status.success()
+            && stdout.contains("resumed")
+            && fork_count == 1
+            && resumed == 1
+            && status == "forked"
+            && wt_out.contains("T71-fork-selftest-exp"),
+        "one fork, resumed=1, forked, worktree re-attached",
+        format!(
+            "count={fork_count} resumed={resumed} status={status} out={}",
+            selftest_got(&out, &stderr)
+        ),
+    );
+    // The resumed transcript holds prefix + work + both markers, and
+    // the existing tail bound still applies on the fork line.
+    let resumed_body = std::fs::read_to_string(&fork_log_path).unwrap_or_default();
+    let out = st.factory(&["log", "71", "--fork", "selftest-exp", "--tail", "2"]);
+    let (tail_out, _) = selftest_text(&out);
+    st.check(
+        "fork resume preserves the transcript under tail bounds",
+        out.status.success()
+            && resumed_body.contains("experiment work line")
+            && resumed_body.contains("interrupted during implement")
+            && resumed_body.contains("resume #1")
+            && tail_out.contains("resume #1")
+            && !tail_out.contains("experiment work line"),
+        "prefix + work + markers kept, tail 2 shows the newest lines",
+        selftest_got(&out, &tail_out),
+    );
+
     // --- the gh bomb never fired: the mechanics needed no gh ---
     let bomb = std::fs::read_to_string(&gh_log).unwrap_or_default();
     st.check(
@@ -12626,7 +12982,18 @@ pub fn run() -> i32 {
             fork,
             at,
             name,
-        } => cmd_fork(&ticket, attempt, fork.as_deref(), at, &name, cli.json),
+            resume,
+            interrupt,
+        } => cmd_fork(
+            &ticket,
+            attempt,
+            fork.as_deref(),
+            at,
+            name.as_deref(),
+            resume.as_deref(),
+            interrupt.as_deref(),
+            cli.json,
+        ),
         Commands::Init {
             stack,
             global_skills,
