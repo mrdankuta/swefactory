@@ -110,6 +110,21 @@ fn seed_state(root: &Path, status: &str) -> PathBuf {
     state
 }
 
+/// Grow the attempt log to roughly `lines` x `line_len` bytes: the
+/// dispatcher fragment embeds a bounded tail of UNBOUNDED lines, so long
+/// lines make large snapshots cheaply (no extra subprocesses per tick).
+fn grow_log(state: &Path, lines: usize, line_len: usize) {
+    let path = state.join("logs").join("T9-a1.log");
+    let mut out = String::new();
+    for i in 0..lines {
+        out.push_str(&format!("bulk line {i:04} "));
+        while out.len() < (i + 1) * (line_len + 20) {
+            out.push('x');
+        }
+        out.push('\n');
+    }
+    fs::write(path, out).unwrap();
+}
 /// Rewrite the single attempt's status in place (a seeded transition).
 fn set_attempt_status(state: &Path, status: &str) {
     let path = state.join("dispatch.json");
@@ -166,17 +181,29 @@ fn body_of(raw: &str) -> &str {
 /// each block over a channel. The async test pulls blocks with timeouts,
 /// so a seeded ledger rewrite lands mid-connection and the delta is
 /// observed on the same connection that saw the snapshot.
+///
+/// The thread also honors a pause flag (stalled-viewer tests stop the
+/// socket reads so TCP backpressure is real, not simulated) and keeps a
+/// killer handle so a test can kill the connection mid-stream.
 struct LiveTap {
     blocks: tokio::sync::mpsc::UnboundedReceiver<String>,
+    killer: std::net::TcpStream,
+    paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LiveTap {
     async fn attach(port: u16, path: &str) -> Self {
         let path = path.to_string();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_paused = paused.clone();
+        // Killer handle: shutting it down kills the connection mid-stream
+        // (the reconnect tests' external kill switch).
+        let probe = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let killer = probe.try_clone().unwrap();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
-            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut s = probe;
             s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
                 .unwrap();
             s.write_all(
@@ -186,6 +213,13 @@ impl LiveTap {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
             loop {
+                // Stalled-viewer tests pause the socket reads: unread
+                // bytes pile up in kernel buffers until the server feels
+                // real TCP backpressure.
+                if thread_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
                 match s.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -207,7 +241,25 @@ impl LiveTap {
                 }
             }
         });
-        Self { blocks: rx }
+        Self {
+            blocks: rx,
+            killer,
+            paused,
+        }
+    }
+
+    /// Kill the connection mid-stream from the outside (the server sees
+    /// the socket die, exactly like a dropped viewer).
+    fn kill(&self) {
+        let _ = self.killer.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Pause (true) or resume (false) the socket reads. Paused, the test
+    /// stops draining TCP, so the server's next deltas meet real
+    /// backpressure past the kernel buffers.
+    fn set_paused(&self, paused: bool) {
+        self.paused
+            .store(paused, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Next `\n\n`-terminated block within `timeout`, or `None`.
@@ -270,17 +322,31 @@ fn set_stream_env(state: &Path, gh: &Path, git: &Path) {
     }
 }
 
+/// Documented live rules for one test: silence bound (ms) plus buffer
+/// bound (events). The hello on every new connection advertises the
+/// effective values, so viewers and tests read the rule from the wire.
+fn set_stream_rule_env(silence_after_ms: &str, buffer_bound: &str) {
+    unsafe {
+        std::env::set_var("FACTORY_STREAM_SILENCE_AFTER_MS", silence_after_ms);
+        std::env::set_var("FACTORY_STREAM_BUFFER_BOUND", buffer_bound);
+    }
+}
+
 fn clear_stream_env() {
     unsafe {
         std::env::remove_var("FACTORY_STATE_DIR");
         std::env::remove_var("FACTORY_GH_BIN");
         std::env::remove_var("FACTORY_GIT_BIN");
         std::env::remove_var("FACTORY_STREAM_KEEPALIVE_MS");
+        std::env::remove_var("FACTORY_STREAM_SILENCE_AFTER_MS");
+        std::env::remove_var("FACTORY_STREAM_BUFFER_BOUND");
     }
 }
 
-#[test]
-fn stream_contract_defaults_are_documented() {
+#[tokio::test]
+async fn stream_contract_defaults_are_documented() {
+    let _guard = ENV_LOCK.lock().await;
+    clear_stream_env();
     assert_eq!(STREAM_CONTRACT_VERSION, 1, "contract starts at v1");
     assert_eq!(
         STREAM_KEEPALIVE_MS, 15_000,
@@ -581,6 +647,401 @@ async fn polling_views_render_byte_identically_with_streams_on_and_off() {
     }
 
     drop(taps);
+    server.abort();
+    clear_stream_env();
+}
+
+// --- ticket #84 (spec #66): reconnects + slow viewers ---------------------
+//
+// Fresh-snapshot-always: a new connection gets hello, then the whole
+// current state, then deltas. Streams never replay, so duplicates are
+// impossible by construction and a viewer that was offline simply missed
+// the middle. A documented silence rule declares half-open sockets dead;
+// viewers past the documented buffer bound are disconnected with a
+// re-attach instruction instead of buffering forever.
+
+#[tokio::test]
+async fn stream_silence_and_buffer_bounds_are_documented() {
+    let _guard = ENV_LOCK.lock().await;
+    clear_stream_env();
+    assert_eq!(
+        factory_lib::STREAM_SILENCE_AFTER_MS,
+        3 * factory_lib::STREAM_KEEPALIVE_MS,
+        "silence bound is documented as three quiet keepalives"
+    );
+    assert!(
+        factory_lib::stream_buffer_bound() >= 2,
+        "the effective bound always fits hello, snapshot, and a delta"
+    );
+    // The hello advertises the live rules so viewers (and tests) read
+    // them from the wire instead of the source.
+    let hello = factory_lib::stream_hello_json("board", None);
+    for field in ["keepalive_ms", "silence_after_ms", "buffer_bound"] {
+        assert!(
+            hello
+                .get(field)
+                .and_then(|v| v.as_u64())
+                .is_some_and(|v| v > 0),
+            "hello advertises the {field} rule, got: {hello}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn board_stream_hello_advertises_the_effective_live_rules() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("hello-rules");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("777", "9");
+    let (port, server) = serve_port().await;
+
+    let mut tap = LiveTap::attach(port, "/streams/board").await;
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let hello = hello_payload(&data);
+    assert_eq!(
+        hello["keepalive_ms"], 200,
+        "effective keepalive, got: {hello}"
+    );
+    assert_eq!(
+        hello["silence_after_ms"], 777,
+        "effective silence bound, got: {hello}"
+    );
+    assert_eq!(
+        hello["buffer_bound"], 9,
+        "effective buffer bound, got: {hello}"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn kill_midstream_then_reconnect_lands_on_current_with_no_duplicates() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("kill-reconnect");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("2000", "64");
+    let (port, server) = serve_port().await;
+
+    // First connection sees the old state, then dies mid-stream.
+    let mut first = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"].as_str().unwrap().contains("impl_running"),
+        "first snapshot shows the old state"
+    );
+    first.kill();
+    drop(first);
+
+    // The loop moves while nobody watches.
+    set_attempt_status(&state, "impl_done");
+
+    // Reconnect: hello, then ONE fresh snapshot of now — never a replay.
+    let mut second = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello", "reconnect opens with hello, not a replay");
+    let (event, data) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot", "reconnect lands on a fresh snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-status=\"impl_done\""),
+        "fresh snapshot shows current state, got: {}",
+        snapshot["html"]
+    );
+
+    // Nothing moves after the reconnect, so no delta may repeat anything:
+    // the middle was missed, not queued.
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(600);
+    while std::time::Instant::now() < quiet_until {
+        let remaining = quiet_until.saturating_duration_since(std::time::Instant::now());
+        if let Some(block) = second.next_block(remaining).await {
+            let (event, _) = parse_block(&block);
+            assert!(
+                event.as_deref() != Some("delta") && event.as_deref() != Some("snapshot"),
+                "no replayed events after a fresh snapshot, got: {event:?}"
+            );
+        }
+    }
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn quiet_connection_past_silence_bound_counts_as_dead() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("silence");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "");
+    set_stream_env(&state, &gh, &git);
+    unsafe {
+        // No keepalive beats during the test: the connection is quiet.
+        std::env::set_var("FACTORY_STREAM_KEEPALIVE_MS", "3600000");
+    }
+    set_stream_rule_env("300", "64");
+    let (port, server) = serve_port().await;
+
+    let mut tap = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let hello = hello_payload(&data);
+    assert_eq!(
+        hello["silence_after_ms"], 300,
+        "hello names the silence bound, got: {hello}"
+    );
+    let (event, _) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+
+    // Past the documented bound with no bytes at all, the viewer counts
+    // the connection dead (the server never fakes liveness) and
+    // re-attaches to current state.
+    assert!(
+        tap.next_block(std::time::Duration::from_millis(900))
+            .await
+            .is_none(),
+        "a quiet connection stays quiet past the silence bound"
+    );
+    drop(tap);
+    let mut reattached = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello", "re-attach opens with hello");
+    let (event, data) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot", "re-attach lands on current state");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"].as_str().unwrap().contains("data-dispatch"),
+        "re-attached snapshot is live state, got: {}",
+        snapshot["html"]
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn stalled_consumer_past_buffer_bound_gets_reattach_then_disconnects() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("stall");
+    let state = seed_state(&root, "impl_running");
+    // Long transcript lines make ~1.5MB snapshots cheaply: the fragment
+    // embeds a bounded tail of unbounded lines, with no per-line fan-out.
+    grow_log(&state, 50, 30_000);
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("30000", "4");
+    let (port, server) = serve_port().await;
+
+    let mut tap = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut tap, std::time::Duration::from_secs(15)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(15)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"].as_str().unwrap().len() > 1_000_000,
+        "snapshots are large enough to fill kernel buffers"
+    );
+
+    // Stall: stop draining TCP while the loop keeps moving. Each toggle
+    // is a ~1.5MB delta, so the kernel buffers fill and the server must
+    // disconnect instead of buffering forever.
+    tap.set_paused(true);
+    let state_clone = state.clone();
+    // Blocking sleeps must NOT run on the test runtime thread:
+    // `#[tokio::test]` is single-threaded, so sleeping inline would
+    // starve the server task (and its producer ticks) for the whole
+    // toggle run. A blocking thread keeps the loop moving while the
+    // server stays schedulable.
+    tokio::task::spawn_blocking(move || {
+        for i in 0..40 {
+            set_attempt_status(
+                &state_clone,
+                if i % 2 == 0 {
+                    "impl_done"
+                } else {
+                    "impl_running"
+                },
+            );
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    })
+    .await
+    .unwrap();
+    tap.set_paused(false);
+
+    // Drain: stale deltas, then the terminal re-attach instruction,
+    // then the server ends the stream.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut saw_reattach = false;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stalled consumer was never disconnected past the buffer bound"
+        );
+        match tap.next_block(std::time::Duration::from_secs(3)).await {
+            None => break,
+            Some(block) => {
+                let (event, data) = parse_block(&block);
+                if event.as_deref() == Some("reattach") {
+                    assert_eq!(data.len(), 1, "reattach carries one JSON line");
+                    let payload: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+                    assert!(
+                        payload["message"].as_str().unwrap().contains("fell behind"),
+                        "calm copy names what happened, got: {payload}"
+                    );
+                    assert_eq!(
+                        payload["action"], "Re-attach",
+                        "one re-attach action, got: {payload}"
+                    );
+                    assert_eq!(
+                        payload["stream"], "/streams/dispatch",
+                        "instruction names the way back, got: {payload}"
+                    );
+                    saw_reattach = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_reattach,
+        "the stalled viewer is disconnected WITH a re-attach instruction"
+    );
+
+    // The instruction works: re-attaching lands on current state.
+    set_attempt_status(&state, "impl_done");
+    let mut reattached = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-status=\"impl_done\""),
+        "re-attach after disconnect shows current state"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn dropped_and_reopened_viewer_returns_to_current_with_place_kept() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("reopen");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("2000", "64");
+    let (port, server) = serve_port().await;
+
+    // Bea watches ticket 9, then drops the browser.
+    let mut first = LiveTap::attach(port, "/streams/ticket/9").await;
+    let (event, data) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    assert_eq!(hello_payload(&data)["ticket"], 9);
+    let (event, data) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("data-ticket=\"9\""),
+        "first view holds its place on ticket 9"
+    );
+    first.kill();
+    drop(first);
+
+    // The loop moves while she is gone; the middle is missed, not queued.
+    set_attempt_status(&state, "impl_done");
+
+    // Reopening the same place lands on current state, place kept.
+    let mut second = LiveTap::attach(port, "/streams/ticket/9").await;
+    let (event, data) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    assert_eq!(
+        hello_payload(&data)["ticket"],
+        9,
+        "reopened viewer keeps its place on ticket 9"
+    );
+    let (event, data) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot", "reopen lands on a fresh snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    let html = snapshot["html"].as_str().unwrap();
+    assert!(
+        html.contains("data-ticket=\"9\""),
+        "place kept on ticket 9, got: {html:.200}"
+    );
+    assert!(
+        html.contains("finished implement, awaiting review"),
+        "reopened view shows current state, got: {html:.200}"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn live_pages_carry_the_stream_hook_and_calm_reattach_copy() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("page-hook");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("2000", "64");
+    let (port, server) = serve_port().await;
+
+    for (page, scope, stream) in [
+        ("/", "board", "/streams/board"),
+        ("/tickets/9", "ticket", "/streams/ticket/9"),
+        ("/dispatch", "dispatcher-live", "/streams/dispatch"),
+    ] {
+        let raw = get(port, page).await;
+        assert!(raw.contains("200"), "page {page} serves, got:\n{raw}");
+        let body = body_of(&raw).to_string();
+        assert!(
+            body.contains(&format!("data-stream-scope=\"{scope}\"")),
+            "page {page} names its stream scope, got:\n{body:.500}"
+        );
+        assert!(
+            body.contains(&format!("data-stream-url=\"{stream}\"")),
+            "page {page} names its stream URL, got:\n{body:.500}"
+        );
+        assert!(
+            body.contains("data-stream-silence-after-ms="),
+            "page {page} documents the silence bound, got:\n{body:.500}"
+        );
+        assert!(
+            body.contains("data-stream-banner"),
+            "page {page} carries the disconnected banner, got:\n{body:.500}"
+        );
+        assert!(
+            body.contains("disconnected") && body.contains("Re-attach"),
+            "page {page} reads as calm copy with one action, got:\n{body:.500}"
+        );
+    }
+
     server.abort();
     clear_stream_env();
 }

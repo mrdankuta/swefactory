@@ -364,6 +364,52 @@ pub enum FactsAction {
         #[arg(value_name = "PATH")]
         path: Option<String>,
     },
+    /// Create one facts path with the revision the reader observed.
+    /// Refuses when the path already exists (nothing changed). One
+    /// atomic path operation per invocation; the accepted write advances
+    /// the revision by exactly one. The global --json flag selects
+    /// machine output carrying the same value-plus-revision facts.
+    Create {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+        /// JSON value to store (e.g. 42, "done", {"a": 1}).
+        #[arg(long, value_name = "JSON")]
+        value: String,
+    },
+    /// Set (upsert) one facts path with the revision the reader observed.
+    /// Creates the path or any missing intermediate objects, overwrites
+    /// when it exists. One atomic path operation per invocation; the
+    /// accepted write advances the revision by exactly one. The global
+    /// --json flag selects machine output carrying the same
+    /// value-plus-revision facts.
+    Set {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+        /// JSON value to store (e.g. 42, "done", {"a": 1}).
+        #[arg(long, value_name = "JSON")]
+        value: String,
+    },
+    /// Delete one facts path with the revision the reader observed.
+    /// Refuses when the path has no value (nothing changed). One atomic
+    /// path operation per invocation; the accepted write advances the
+    /// revision by exactly one. The global --json flag selects machine
+    /// output carrying the same path-plus-revision facts.
+    Delete {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Revision the reader observed (reread on conflict and retry).
+        #[arg(long, value_name = "N")]
+        revision: u64,
+    },
 }
 
 #[derive(Serialize)]
@@ -814,6 +860,41 @@ li[data-attempt] [data-summary]{font-weight:600;margin:0 0 8px}\n\
 [data-done-feed]{margin-top:16px}\n\
 [data-done-feed] summary{cursor:pointer;color:#6b655a;font-size:14px}\n\
 \n";
+/// Live-stream upgrade for one fragment container (ticket #84, spec
+/// #66): the container names its scope stream plus the documented
+/// silence bound, and the hidden banner carries calm copy with one
+/// re-attach action. The script is progressive enhancement only — each
+/// page keeps its polling hook exactly as it is, so with streams
+/// unreachable the views render and refresh identically.
+fn stream_viewer_html(container_id: &str) -> String {
+    format!(
+        "<p data-stream-banner hidden>You're seeing the last update \u{2014} the live view disconnected. \
+        <button type=\"button\" data-stream-reattach>Re-attach</button></p>\
+        <script>(function(){{\
+        var el=document.getElementById('{id}');\
+        if(!el||!window.EventSource)return;\
+        var url=el.getAttribute('data-stream-url');\
+        var silence=parseInt(el.getAttribute('data-stream-silence-after-ms')||'{dflt}',10);\
+        var banner=document.querySelector('[data-stream-banner]');\
+        var btn=document.querySelector('[data-stream-reattach]');\
+        var es=null,timer=null;\
+        function show(){{if(banner)banner.hidden=false;}}\
+        function hide(){{if(banner)banner.hidden=true;}}\
+        function stop(){{if(es){{try{{es.close();}}catch(_e){{}}es=null;}}if(timer){{clearTimeout(timer);timer=null;}}}}\
+        function arm(){{if(timer)clearTimeout(timer);timer=setTimeout(function(){{stop();show();}},silence);}}\
+        function apply(data){{try{{var p=JSON.parse(data);if(p&&p.html!==undefined)el.innerHTML=p.html;}}catch(_e){{}}arm();}}\
+        function attach(){{stop();hide();try{{es=new EventSource(url);}}catch(_e){{return;}}\
+        es.addEventListener('hello',function(e){{try{{var h=JSON.parse(e.data);if(h&&h.silence_after_ms)silence=parseInt(h.silence_after_ms,10);}}catch(_e){{}}arm();}});\
+        es.addEventListener('snapshot',function(e){{apply(e.data);}});\
+        es.addEventListener('delta',function(e){{apply(e.data);}});\
+        es.addEventListener('reattach',function(e){{stop();show();}});}}\
+        if(btn)btn.addEventListener('click',function(){{attach();}});\
+        attach();}})();</script>",
+        id = container_id,
+        dflt = STREAM_SILENCE_AFTER_MS,
+    )
+}
+
 /// Full board page: columns plus the polling hook that refreshes only
 /// the fragment (no full reloads). Pure over columns for testing.
 pub fn board_page_html(columns: &[BoardColumn]) -> String {
@@ -827,13 +908,15 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
     <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
     <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
     <p data-version>factory {version}</p></header>\
-    <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\">\
-    {fragment}</div></main>\
+    <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\" data-stream-scope=\"board\" data-stream-url=\"/streams/board\" data-stream-silence-after-ms=\"{}\">\
+    {fragment}</div>{}</main>\
     <script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
     setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
     </body></html>",
         SITE_CSS,
         BOARD_POLL_MS,
+        STREAM_SILENCE_AFTER_MS,
+        stream_viewer_html("board"),
     )
 }
 
@@ -1288,13 +1371,15 @@ pub fn ticket_detail_page_html(detail: &TicketDetail) -> String {
 <body><header class=\"site\"><h1>Ticket #{}</h1>\
 <p>Body, attempts, and transcript tails. Matches <code>factory log {}</code>.</p>\
 <p data-version>factory {version}</p></header>\
-<main><div id=\"ticket\" data-ticket-fragment=\"/fragments/ticket/{}\" data-poll-ms=\"{}\">\
-{fragment}</div></main>\
+<main><div id=\"ticket\" data-ticket-fragment=\"/fragments/ticket/{}\" data-poll-ms=\"{}\" data-stream-scope=\"ticket\" data-stream-url=\"/streams/ticket/{}\" data-stream-silence-after-ms=\"{}\">\
+{fragment}</div>{}</main>\
 <script>(function(){{var el=document.getElementById('ticket');if(!el)return;var url=el.getAttribute('data-ticket-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
         detail.number, SITE_CSS,
         detail.number, detail.number, detail.number, BOARD_POLL_MS,
+        detail.number, STREAM_SILENCE_AFTER_MS,
+        stream_viewer_html("ticket"),
     )
 }
 
@@ -1380,13 +1465,15 @@ pub fn dispatcher_page_html(data: &DispatcherData) -> String {
 <p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
-<main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\">\
-{fragment}</div></main>\
+<main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\" data-stream-scope=\"dispatcher-live\" data-stream-url=\"/streams/dispatch\" data-stream-silence-after-ms=\"{}\">\
+{fragment}</div>{}</main>\
 <script>(function(){{var el=document.getElementById('dispatch');if(!el)return;var url=el.getAttribute('data-dispatch-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'3000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
         SITE_CSS,
         DISPATCHER_POLL_MS,
+        STREAM_SILENCE_AFTER_MS,
+        stream_viewer_html("dispatch"),
     )
 }
 
@@ -2790,11 +2877,16 @@ pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
 // no bind change (loopback by default, `--allow-remote` as before).
 //
 // Wire order per connection: `hello` (contract version, scope, server
-// time) then one `snapshot` (current fragment bytes) then `delta` events
+// time, plus the live rules: keepalive, silence bound, buffer bound)
+// then one `snapshot` (current fragment bytes) then `delta` events
 // only when the fragment bytes move, plus SSE keepalive comments at the
 // documented interval. Reconnects start from a fresh snapshot and are
 // never a replay (the middle is simply missed; `status`/`log` stay the
-// record). A client that sends `?version=` older or newer than
+// record). A connection that delivers no bytes for `silence_after_ms`
+// counts as dead: the viewer says so and offers one re-attach action.
+// A viewer with `buffer_bound` deltas still queued is disconnected with
+// a terminal `reattach` instruction instead of buffering forever. A
+// client that sends `?version=` older or newer than
 // `STREAM_CONTRACT_VERSION` gets a loud 400 instead of a stream, so
 // mismatched viewers fail at hello instead of rendering garbage.
 //
@@ -2825,6 +2917,42 @@ pub fn stream_keepalive_ms() -> u64 {
         .unwrap_or(STREAM_KEEPALIVE_MS)
 }
 
+/// Documented silence bound (ms): a connection that delivers no bytes
+/// (not even a keepalive comment) for this long counts as dead; the
+/// viewer says so and offers one re-attach action. Three quiet
+/// keepalives: long enough that one missed beat never reads as death,
+/// short enough that a half-open socket never pretends to be live.
+/// The suite shortens it via `FACTORY_STREAM_SILENCE_AFTER_MS`.
+pub const STREAM_SILENCE_AFTER_MS: u64 = 3 * STREAM_KEEPALIVE_MS;
+
+/// Effective silence bound (ms): the env override when it parses,
+/// the documented default otherwise. Read-only.
+pub fn stream_silence_after_ms() -> u64 {
+    std::env::var("FACTORY_STREAM_SILENCE_AFTER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(STREAM_SILENCE_AFTER_MS)
+}
+
+/// Documented per-connection buffer bound (events): the most deltas the
+/// server will hold for one slow viewer. Past it the viewer is
+/// disconnected with a re-attach instruction instead of buffering
+/// forever — the backlog is dropped because every delta already carries
+/// whole-fragment state, so the next attach lands current anyway. The
+/// suite tightens it via `FACTORY_STREAM_BUFFER_BOUND`.
+pub const STREAM_BUFFER_BOUND: usize = 16;
+
+/// Effective buffer bound (events): the env override when it parses,
+/// the documented default otherwise. Read-only. Clamped so hello,
+/// snapshot, and at least one delta always fit before backpressure.
+pub fn stream_buffer_bound() -> usize {
+    std::env::var("FACTORY_STREAM_BUFFER_BOUND")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(2, 1024))
+        .unwrap_or(STREAM_BUFFER_BOUND)
+}
 /// Change-detection tick (ms): a fifth of the keepalive, clamped so
 /// slow defaults stay cheap and short test beats stay responsive.
 fn stream_tick_ms(keepalive_ms: u64) -> u64 {
@@ -2839,22 +2967,24 @@ fn stream_server_time_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Hello payload: contract version, scope, and server time. The ticket
-/// scope also names its ticket number. Pure over inputs for testing.
+/// Hello payload: contract version, scope, server time, and the live
+/// rules (effective keepalive, silence bound, buffer bound) so the
+/// viewer reads the-documented behavior from the wire. The ticket scope
+/// also names its ticket number. Pure over inputs except the effective
+/// rule values, which read the process env like the handlers do.
 pub fn stream_hello_json(scope: &str, ticket: Option<u64>) -> serde_json::Value {
-    match ticket {
-        Some(n) => serde_json::json!({
-            "version": STREAM_CONTRACT_VERSION,
-            "scope": scope,
-            "server_time": stream_server_time_secs(),
-            "ticket": n,
-        }),
-        None => serde_json::json!({
-            "version": STREAM_CONTRACT_VERSION,
-            "scope": scope,
-            "server_time": stream_server_time_secs(),
-        }),
+    let mut hello = serde_json::json!({
+        "version": STREAM_CONTRACT_VERSION,
+        "scope": scope,
+        "server_time": stream_server_time_secs(),
+        "keepalive_ms": stream_keepalive_ms(),
+        "silence_after_ms": stream_silence_after_ms(),
+        "buffer_bound": stream_buffer_bound(),
+    });
+    if let Some(n) = ticket {
+        hello["ticket"] = serde_json::Value::from(n);
     }
+    hello
 }
 
 /// One per-scope stream source: the exact bytes the matching polling
@@ -2875,6 +3005,16 @@ impl StreamScope {
             StreamScope::Board => "board",
             StreamScope::Ticket { .. } => "ticket",
             StreamScope::DispatcherLive => "dispatcher-live",
+        }
+    }
+
+    /// Stream URL serving one scope (v1: one connection serves one scope).
+    /// The re-attach instruction names this path as the way back.
+    fn stream_path(&self) -> String {
+        match self {
+            StreamScope::Board => "/streams/board".to_string(),
+            StreamScope::Ticket { number, .. } => format!("/streams/ticket/{number}"),
+            StreamScope::DispatcherLive => "/streams/dispatch".to_string(),
         }
     }
 
@@ -2911,25 +3051,126 @@ fn stream_version_error(requested: Option<u64>) -> Option<String> {
     }
 }
 
-/// Bridge between the per-connection producer task and Axum's `Sse`
-/// body: the producer sends hello, snapshot, then deltas; Axum's
-/// keep-alive layer adds the comment beat. Ends when the client goes
-/// away (send fails) — the server never buffers without bound past the
-/// channel, and closing every client changes nothing about the loop.
+/// Bounded per-connection queue between the producer task and Axum's
+/// `Sse` body. Deltas that arrive while the viewer has `buffer_bound`
+/// events still queued are dropped as a batch — every delta already
+/// carries whole-fragment state, so the middle is simply missed and the
+/// next attach lands current anyway. The batch collapse ends in one
+/// terminal `reattach` event (calm copy plus one action) and the stream
+/// closes: the server never buffers without bound, and closing every
+/// client still changes nothing about the loop.
+struct StreamShared {
+    inner: std::sync::Mutex<StreamInner>,
+}
+
+struct StreamInner {
+    queue: std::collections::VecDeque<Result<axum::response::sse::Event, std::convert::Infallible>>,
+    closed: bool,
+    waker: Option<std::task::Waker>,
+}
+
+impl StreamShared {
+    /// Queue one event unless the stream already ended.
+    fn push(self: &std::sync::Arc<Self>, event: axum::response::sse::Event) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.closed {
+            return false;
+        }
+        guard.queue.push_back(Ok(event));
+        if let Some(waker) = guard.waker.take() {
+            waker.wake();
+        }
+        true
+    }
+
+    /// Queue one delta, or disconnect a stalled viewer: when `buffer_bound`
+    /// events are still queued, the backlog collapses into the terminal
+    /// `reattach` instruction and the stream ends. Returns false when the
+    /// producer must exit (stalled or closed).
+    fn push_delta(
+        self: &std::sync::Arc<Self>,
+        event: axum::response::sse::Event,
+        scope: &StreamScope,
+        buffer_bound: usize,
+    ) -> bool {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.closed {
+            return false;
+        }
+        if guard.queue.len() >= buffer_bound {
+            guard.queue.clear();
+            guard.queue.push_back(Ok(stream_reattach_event(scope)));
+            guard.closed = true;
+            if let Some(waker) = guard.waker.take() {
+                waker.wake();
+            }
+            return false;
+        }
+        guard.queue.push_back(Ok(event));
+        if let Some(waker) = guard.waker.take() {
+            waker.wake();
+        }
+        true
+    }
+
+    /// Mark the stream ended (client gone, or slow-viewer disconnect).
+    /// The producer checks this every tick and exits, so dead connections
+    /// hold no tasks and no buffers.
+    fn mark_closed(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.closed = true;
+    }
+
+    /// True once the stream ended for any reason.
+    fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+}
+
+/// Axum's handle on one connection: pops queued events until the queue
+/// is empty and closed. Dropping it (client gone) marks the shared
+/// state closed so the producer task exits on its next tick.
 struct StreamChannel {
-    rx: tokio::sync::mpsc::UnboundedReceiver<
-        Result<axum::response::sse::Event, std::convert::Infallible>,
-    >,
+    shared: std::sync::Arc<StreamShared>,
+}
+
+impl Drop for StreamChannel {
+    fn drop(&mut self) {
+        self.shared.mark_closed();
+    }
 }
 
 impl futures_core::Stream for StreamChannel {
     type Item = Result<axum::response::sse::Event, std::convert::Infallible>;
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(event) = guard.queue.pop_front() {
+            return std::task::Poll::Ready(Some(event));
+        }
+        if guard.closed {
+            return std::task::Poll::Ready(None);
+        }
+        guard.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
     }
+}
+
+/// Terminal instruction for a viewer disconnected past the buffer bound:
+/// calm copy (nothing stopped, the middle was missed) plus one action
+/// (re-open the same stream URL). Pure over the scope for testing.
+fn stream_reattach_event(scope: &StreamScope) -> axum::response::sse::Event {
+    let payload = serde_json::to_string(&serde_json::json!({
+        "message": "This live view fell behind and was disconnected \u{2014} nothing stopped. Re-attach to see current state.",
+        "action": "Re-attach",
+        "stream": scope.stream_path(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    axum::response::sse::Event::default()
+        .event("reattach")
+        .data(payload)
 }
 
 /// Single-line JSON envelope for snapshot/delta payloads: one `data:`
@@ -2942,26 +3183,37 @@ fn stream_html_envelope(html: &str) -> String {
 /// Spawn the per-connection producer and return its channel: hello,
 /// then a whole snapshot, then a delta whenever the scope's fragment
 /// bytes move. Read-only: the producer only re-reads the polling seams.
-fn spawn_stream_producer(scope: StreamScope, keepalive_ms: u64) -> StreamChannel {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+/// Past `buffer_bound` queued deltas the viewer is disconnected with a
+/// re-attach instruction (the shared queue collapses, the stream ends).
+fn spawn_stream_producer(
+    scope: StreamScope,
+    keepalive_ms: u64,
+    buffer_bound: usize,
+) -> StreamChannel {
+    let shared = std::sync::Arc::new(StreamShared {
+        inner: std::sync::Mutex::new(StreamInner {
+            queue: std::collections::VecDeque::new(),
+            closed: false,
+            waker: None,
+        }),
+    });
+    let producer = shared.clone();
     tokio::spawn(async move {
         let hello = serde_json::to_string(&stream_hello_json(scope.name(), scope.ticket()))
             .unwrap_or_else(|_| "{}".to_string());
-        if tx
-            .send(Ok(axum::response::sse::Event::default()
+        if !producer.push(
+            axum::response::sse::Event::default()
                 .event("hello")
-                .data(hello)))
-            .is_err()
-        {
+                .data(hello),
+        ) {
             return;
         }
         let mut last = scope.snapshot_html();
-        if tx
-            .send(Ok(axum::response::sse::Event::default()
+        if !producer.push(
+            axum::response::sse::Event::default()
                 .event("snapshot")
-                .data(stream_html_envelope(&last))))
-            .is_err()
-        {
+                .data(stream_html_envelope(&last)),
+        ) {
             return;
         }
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(stream_tick_ms(
@@ -2970,19 +3222,22 @@ fn spawn_stream_producer(scope: StreamScope, keepalive_ms: u64) -> StreamChannel
         ticks.tick().await;
         loop {
             ticks.tick().await;
+            if producer.is_closed() {
+                return;
+            }
             let now = scope.snapshot_html();
             if now != last {
                 last = now;
                 let event = axum::response::sse::Event::default()
                     .event("delta")
                     .data(stream_html_envelope(&last));
-                if tx.send(Ok(event)).is_err() {
+                if !producer.push_delta(event, &scope, buffer_bound) {
                     return;
                 }
             }
         }
     });
-    StreamChannel { rx }
+    StreamChannel { shared }
 }
 
 /// Shared stream opener: version gate, then hello/snapshot/deltas with
@@ -2993,7 +3248,12 @@ fn open_stream(
     scope: StreamScope,
     keepalive_ms: u64,
 ) -> axum::response::Sse<axum::response::sse::KeepAliveStream<StreamChannel>> {
-    axum::response::Sse::new(spawn_stream_producer(scope, keepalive_ms)).keep_alive(
+    axum::response::Sse::new(spawn_stream_producer(
+        scope,
+        keepalive_ms,
+        stream_buffer_bound(),
+    ))
+    .keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_millis(keepalive_ms)),
     )
@@ -8932,6 +9192,239 @@ fn facts_pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// Store `value` at `path` (normalized, non-empty), creating any
+/// missing intermediate objects. Errors (nothing changed) when an
+/// intermediate segment exists as a non-object or the document root is
+/// not an object.
+fn facts_set_value(
+    facts: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (last, parents) = segments.split_last().expect("non-empty facts path");
+    if !facts.is_object() {
+        return Err(format!(
+            "facts: cannot write {path}: the facts document root is not an object; nothing changed."
+        ));
+    }
+    let mut current = facts;
+    for seg in parents {
+        if current.get(seg).is_none() {
+            current
+                .as_object_mut()
+                .expect("facts cursor stays an object")
+                .insert((*seg).to_string(), serde_json::json!({}));
+        }
+        current = current
+            .get_mut(seg)
+            .expect("just-inserted facts segment present");
+        if !current.is_object() {
+            return Err(format!(
+                "facts: cannot write {path}: '{seg}' is not an object; nothing changed."
+            ));
+        }
+    }
+    current
+        .as_object_mut()
+        .expect("facts parent stays an object")
+        .insert((*last).to_string(), value);
+    Ok(())
+}
+
+/// Remove the value at `path` (normalized, non-empty). `Ok(true)` is a
+/// removal; `Ok(false)` is a missing path (nothing changed, refused by
+/// the caller). Errors when the document root is not an object.
+fn facts_delete_value(facts: &mut serde_json::Value, path: &str) -> Result<bool, String> {
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (last, parents) = segments.split_last().expect("non-empty facts path");
+    if !facts.is_object() {
+        return Err(format!(
+            "facts: cannot delete {path}: the facts document root is not an object; nothing changed."
+        ));
+    }
+    let mut current = facts;
+    for seg in parents {
+        match current.get_mut(seg) {
+            Some(next) if next.is_object() => current = next,
+            _ => return Ok(false),
+        }
+    }
+    Ok(current
+        .as_object_mut()
+        .expect("facts parent stays an object")
+        .remove(*last)
+        .is_some())
+}
+
+/// Atomic facts-document write (temp file + rename, the same durability
+/// guarantee as the ledger): a crash between the two leaves the previous
+/// document on disk, never a torn one. The FACTORY_FACTS_CRASH seam
+/// exists only to pin that guarantee in tests: with it set to `1`, this
+/// writes tmp and the process exits before the rename, exactly like a
+/// kill -9 at that instant (orphaned tmp, previous document intact).
+fn save_facts_document(state: &std::path::Path, doc: &FactsDocument) -> Result<(), String> {
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("facts: cannot create {}: {e}", state.display()))?;
+    let text = serde_json::to_string_pretty(&serde_json::json!({
+        "revision": doc.revision,
+        "facts": doc.facts,
+    }))
+    .map_err(|e| format!("facts: cannot serialize facts document: {e}"))?;
+    let tmp = facts_doc_path(state).with_extension("json.tmp");
+    std::fs::write(&tmp, &text)
+        .map_err(|e| format!("facts: cannot stage {}: {e}", tmp.display()))?;
+    // Test-only kill seam: behave exactly like a crash after the tmp
+    // write but before the rename.
+    if std::env::var("FACTORY_FACTS_CRASH").as_deref() == Ok("1") {
+        std::process::exit(1);
+    }
+    std::fs::rename(&tmp, facts_doc_path(state)).map_err(|e| {
+        format!(
+            "facts: cannot replace {}: {e}",
+            facts_doc_path(state).display()
+        )
+    })?;
+    Ok(())
+}
+
+/// One guarded facts write: the shared path for create (refuses when the
+/// path exists), set (upserts), and delete. `value_raw` is `Some` for
+/// create/set (parsed as JSON) and `None` for delete.
+fn cmd_facts_write(
+    json: bool,
+    op: &str,
+    path_raw: &str,
+    revision: u64,
+    value_raw: Option<&str>,
+) -> i32 {
+    let state = dispatch_state_dir();
+    let doc = match load_facts_document(&state) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let path = normalize_facts_path(path_raw);
+    if path.is_empty() {
+        eprintln!(
+            "facts: cannot {op}: path must name one slash-separated value (e.g. costs/total); nothing changed."
+        );
+        return 1;
+    }
+    if revision != doc.revision {
+        eprintln!(
+            "facts: write conflict at {path}: presented revision {revision}, current revision {}; nothing changed. Reread the path and retry with the current revision.",
+            doc.revision
+        );
+        return 1;
+    }
+    let mut facts = doc.facts;
+    let stored: Option<serde_json::Value> = match op {
+        "create" | "set" => {
+            let raw = value_raw.unwrap_or("null");
+            let value: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("facts: cannot {op} {path}: --value is not valid JSON: {e}");
+                    return 1;
+                }
+            };
+            if op == "create" && facts_lookup(&facts, &path).is_some() {
+                eprintln!(
+                    "facts: cannot create {path}: path already exists at revision {}; nothing changed.",
+                    doc.revision
+                );
+                return 1;
+            }
+            if let Err(e) = facts_set_value(&mut facts, &path, value.clone()) {
+                eprintln!("{e}");
+                return 1;
+            }
+            Some(value)
+        }
+        _ => match facts_delete_value(&mut facts, &path) {
+            Ok(true) => None,
+            Ok(false) => {
+                eprintln!(
+                    "facts: cannot delete {path}: no value set at revision {}; nothing changed.",
+                    doc.revision
+                );
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        },
+    };
+    let new_revision = doc.revision + 1;
+    let new_doc = FactsDocument {
+        revision: new_revision,
+        facts,
+    };
+    if let Err(e) = save_facts_document(&state, &new_doc) {
+        eprintln!("{e}");
+        return 1;
+    }
+    match stored {
+        Some(value) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revision": new_revision,
+                        "path": path,
+                        "value": value,
+                    })
+                );
+                return 0;
+            }
+            println!("facts {path} at revision {new_revision}:");
+            println!("{}", facts_pretty(&value));
+            println!("{FACTS_LOCALITY_LINE}");
+            0
+        }
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revision": new_revision,
+                        "path": path,
+                        "deleted": true,
+                    })
+                );
+                return 0;
+            }
+            println!("facts {path} at revision {new_revision}: deleted.");
+            println!("{FACTS_LOCALITY_LINE}");
+            0
+        }
+    }
+}
+
+/// Create one facts path with the revision the reader observed.
+/// Refuses when the path already exists or the revision is stale, with
+/// the cause named; refusals change nothing.
+pub fn cmd_facts_create(json: bool, path: &str, revision: u64, value: &str) -> i32 {
+    cmd_facts_write(json, "create", path, revision, Some(value))
+}
+
+/// Set (upsert) one facts path with the revision the reader observed.
+/// Refuses on a stale revision, with presented and current revisions
+/// named; refusals change nothing.
+pub fn cmd_facts_set(json: bool, path: &str, revision: u64, value: &str) -> i32 {
+    cmd_facts_write(json, "set", path, revision, Some(value))
+}
+
+/// Delete one facts path with the revision the reader observed.
+/// Refuses when the path has no value or the revision is stale, with
+/// the cause named; refusals change nothing.
+pub fn cmd_facts_delete(json: bool, path: &str, revision: u64) -> i32 {
+    cmd_facts_write(json, "delete", path, revision, None)
+}
 /// Read the facts document: whole or one path, human or machine.
 /// Read-only like `status`/`log`: observing changes nothing.
 pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
@@ -10839,6 +11332,17 @@ pub fn run() -> i32 {
         Commands::Log { ticket, tail } => cmd_log(&ticket, tail, cli.json),
         Commands::Facts { action } => match action {
             FactsAction::Show { path } => cmd_facts_show(cli.json, path.as_deref()),
+            FactsAction::Create {
+                path,
+                revision,
+                value,
+            } => cmd_facts_create(cli.json, &path, revision, &value),
+            FactsAction::Set {
+                path,
+                revision,
+                value,
+            } => cmd_facts_set(cli.json, &path, revision, &value),
+            FactsAction::Delete { path, revision } => cmd_facts_delete(cli.json, &path, revision),
         },
         Commands::Init {
             stack,
