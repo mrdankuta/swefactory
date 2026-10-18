@@ -295,6 +295,18 @@ pub enum DispatchAction {
     },
     /// Show attempts + worktrees + STOP state.
     Status,
+    /// Live task graph: every live task of every live attempt as a node
+    /// with its owner edge (owning task, or the attempt itself), status,
+    /// and what it is waiting on. Read-only: observing changes nothing.
+    /// Exit 0 whenever the ledger read succeeded (even when empty);
+    /// nonzero only on unreadable state or a bad --ticket, with the cause
+    /// named. The global --json flag selects machine output carrying the
+    /// same facts structurally.
+    Graph {
+        /// Only this ticket's live tasks (e.g. 70 or #70).
+        #[arg(long)]
+        ticket: Option<String>,
+    },
     /// Halt the loop: later `once` runs exit 0 without work.
     Stop,
     /// Restart the loop after a stop.
@@ -6052,6 +6064,14 @@ struct DispatchLedger {
     /// records older than the retention horizon read as absent.
     #[serde(default)]
     idempotency_keys: Vec<IdempotencyRecord>,
+    /// Live task nodes for the observable task graph (ticket #70, spec
+    /// #59): one record per task the attempt is currently running or
+    /// waiting on. `#[serde(default)]` keeps pre-task ledgers parsing
+    /// (absent reads as no live tasks, never an error). Terminal tasks
+    /// leave the graph on the ledger commit that marks them terminal;
+    /// the graph view filters to live rows and never writes.
+    #[serde(default)]
+    tasks: Vec<LiveTask>,
 }
 
 /// One stored exactly-once outcome (ticket #62, spec #59): the key, the
@@ -6065,6 +6085,71 @@ struct IdempotencyRecord {
     attempt_no: u64,
     status: String,
     stored_at: String,
+}
+
+// --- live task graph (ticket #70, spec #59 follow-up) ---------------------
+//
+// One observable graph of everything live: every live task of an attempt
+// is a node carrying its owner edge (the owning task, or the attempt
+// itself when parent is absent), its kind (parent | child | background |
+// foreground; empty reads as "task"), its status, and what it is waiting
+// on. Terminal tasks (done | failed | aborted | cancelled | completed, or
+// any status ending _done | _failed | _aborted | _cancelled | _completed)
+// leave the graph on the ledger commit that marks them terminal — the
+// view filters to live rows. Later tickets (#68 waiting policies, #69
+// background scope) own the write paths; this slice only records and
+// reads the nodes so the dispatcher screen and debugging share one view.
+/// One live task node in the observable task graph.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct LiveTask {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    ticket: u64,
+    /// Attempt number this task belongs to (matches DispatchAttempt.attempt_no).
+    #[serde(default)]
+    attempt: u64,
+    /// Owning task id; None means owned directly by the attempt itself.
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    status: String,
+    /// Task ids (or resources) this task is waiting on; empty means none.
+    #[serde(default)]
+    waits_on: Vec<String>,
+}
+
+/// `true` once a task has reached a terminal state and must leave the
+/// live graph. Centralized so human and JSON modes agree.
+fn is_task_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "done" | "failed" | "aborted" | "cancelled" | "completed"
+    ) || status.ends_with("_done")
+        || status.ends_with("_failed")
+        || status.ends_with("_aborted")
+        || status.ends_with("_cancelled")
+        || status.ends_with("_completed")
+}
+
+/// Owner edge for one node: `task:<parent>` when owned by another task,
+/// else `attempt:T<ticket>-a<attempt>` for the attempt itself.
+fn task_owner(t: &LiveTask) -> String {
+    match &t.parent {
+        Some(p) => format!("task:{p}"),
+        None => format!("attempt:T{}-a{}", t.ticket, t.attempt),
+    }
+}
+
+/// Display kind; empty records read as the generic "task".
+fn task_kind_text(t: &LiveTask) -> &str {
+    if t.kind.is_empty() {
+        "task"
+    } else {
+        t.kind.as_str()
+    }
 }
 
 /// Implementer/reviewer seam: shell out only, never an API client.
@@ -8393,6 +8478,90 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// LIVE TASK GRAPH (ticket #70, spec #59 follow-up)
+//
+// One observable graph of everything live for the dispatcher screen and
+// debugging: every live task of an attempt is a node with its owner edge
+// (owning task, or the attempt itself), kind, status, and what it is
+// waiting on. Read-only like all observers: fs::read only, no ledger,
+// log, or worktree writes on this path, so opening and closing viewers
+// changes nothing. Terminal tasks leave the graph on the ledger commit
+// that marks them terminal (filtered here, never deleted here).
+// ---------------------------------------------------------------------------
+
+/// Read-only live task graph over the dispatch ledger.
+/// `ticket_raw` optionally narrows to one ticket (e.g. "70" or "#70").
+pub fn cmd_dispatch_graph(json: bool, ticket_raw: Option<&str>) -> i32 {
+    let filter: Option<u64> = match ticket_raw {
+        Some(raw) => match parse_issue_number(raw) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("graph: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let state = dispatch_state_dir();
+    let ledger = match load_ledger_strict_for("graph", &state) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let mut live: Vec<&LiveTask> = ledger
+        .tasks
+        .iter()
+        .filter(|t| !is_task_terminal(&t.status))
+        .filter(|t| filter.map(|f| t.ticket == f).unwrap_or(true))
+        .collect();
+    live.sort_by(|a, b| (a.ticket, a.attempt, &a.id).cmp(&(b.ticket, b.attempt, &b.id)));
+    let rows: Vec<serde_json::Value> = live
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "ticket": t.ticket,
+                "attempt": t.attempt,
+                "kind": task_kind_text(t),
+                "status": t.status,
+                "owner": task_owner(t),
+                "waits_on": t.waits_on,
+            })
+        })
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"tasks": rows, "count": rows.len()})
+        );
+        return 0;
+    }
+    if rows.is_empty() {
+        println!("No live tasks \u{2014} the graph is empty.");
+        return 0;
+    }
+    println!("Live task graph \u{2014} {} live task(s).", rows.len());
+    for t in &live {
+        let waits = if t.waits_on.is_empty() {
+            "waits_on=none".to_string()
+        } else {
+            format!("waits_on={}", t.waits_on.join(","))
+        };
+        println!(
+            "{} {} {} owner={} {}",
+            t.id,
+            task_kind_text(t),
+            t.status,
+            task_owner(t),
+            waits
+        );
+    }
+    0
+}
+
 pub fn cmd_dispatch_status(json: bool) -> i32 {
     let state = dispatch_state_dir();
     let ledger = load_ledger(&state);
@@ -9862,6 +10031,7 @@ pub fn run() -> i32 {
             } => cmd_dispatch_once(cli.json, dry_run, idempotency_key.as_deref()),
             DispatchAction::Daemon { interval } => cmd_dispatch_daemon(cli.json, interval),
             DispatchAction::Status => cmd_dispatch_status(cli.json),
+            DispatchAction::Graph { ticket } => cmd_dispatch_graph(cli.json, ticket.as_deref()),
             DispatchAction::Stop => cmd_dispatch_stop(cli.json),
             DispatchAction::Resume => cmd_dispatch_resume(cli.json),
             DispatchAction::SelfTest => cmd_dispatch_selftest(cli.json),
