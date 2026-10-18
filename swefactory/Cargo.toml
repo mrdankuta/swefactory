@@ -23,6 +23,10 @@ path = "src/lib.rs"
 askama = "0.16.1"
 axum = "0.8.9"
 clap = { version = "4", features = ["derive"] }
+# Ticket #83 (spec #66 streams): the SSE transport bridges the producer
+# task and Axum's `Sse` body through a hand-rolled `Stream`; futures-core
+# is the only new piece (already vendored transitively via Axum).
+futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

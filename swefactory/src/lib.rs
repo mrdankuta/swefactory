@@ -2627,6 +2627,15 @@ pub fn web_router() -> axum::Router {
             "/fragments/train",
             axum::routing::get(train_review_fragment_handler),
         )
+        .route("/streams/board", axum::routing::get(stream_board_handler))
+        .route(
+            "/streams/ticket/{number}",
+            axum::routing::get(stream_ticket_handler),
+        )
+        .route(
+            "/streams/dispatch",
+            axum::routing::get(stream_dispatch_handler),
+        )
         .route("/train/land", axum::routing::post(train_land_handler))
         .route("/onboard", axum::routing::get(onboard_page_handler))
         .route(
@@ -2707,6 +2716,289 @@ pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
             1
         }
     }
+}
+
+// --- live event streams (ticket #83, spec #66) ---------------------------------
+//
+// Read-only Server-Sent Events on the existing serve surface; polling is
+// untouched (every polling fragment keeps serving byte-identical
+// bytes with streams on or off). One connection serves one scope in v1:
+// `board`, `ticket`, or `dispatcher-live` — each pushing exactly the facts
+// the matching polling view already shows, as whole-fragment snapshots
+// and whole-fragment deltas. No new facts, no mutations, no auth change,
+// no bind change (loopback by default, `--allow-remote` as before).
+//
+// Wire order per connection: `hello` (contract version, scope, server
+// time) then one `snapshot` (current fragment bytes) then `delta` events
+// only when the fragment bytes move, plus SSE keepalive comments at the
+// documented interval. Reconnects start from a fresh snapshot and are
+// never a replay (the middle is simply missed; `status`/`log` stay the
+// record). A client that sends `?version=` older or newer than
+// `STREAM_CONTRACT_VERSION` gets a loud 400 instead of a stream, so
+// mismatched viewers fail at hello instead of rendering garbage.
+//
+// Consumers converge within `STREAM_KEEPALIVE_MS`: the change-detection
+// tick runs at a fifth of the keepalive (clamped to 25ms..=1s), so two
+// viewers attached to one scope read identical bytes no later than the
+// keepalive beat after a move. `FACTORY_STREAM_KEEPALIVE_MS` overrides
+// the interval (the hermetic suite shortens it; unset reads as default).
+
+/// Stream contract version named in every hello. Additive changes ride
+/// the same version; anything breaking advances this and old viewers
+/// fail loudly at hello (spec #66 testing decision).
+pub const STREAM_CONTRACT_VERSION: u64 = 1;
+
+/// Documented keepalive interval (ms): a quiet connection past this is
+/// the most staleness two viewers can disagree by, and the beat the
+/// suite shortens via `FACTORY_STREAM_KEEPALIVE_MS`. Matches the board
+/// poll beat (~15s) so streams feel like the views they mirror.
+pub const STREAM_KEEPALIVE_MS: u64 = 15_000;
+
+/// Effective keepalive interval (ms): the env override when it parses,
+/// the documented default otherwise. Read-only.
+pub fn stream_keepalive_ms() -> u64 {
+    std::env::var("FACTORY_STREAM_KEEPALIVE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(STREAM_KEEPALIVE_MS)
+}
+
+/// Change-detection tick (ms): a fifth of the keepalive, clamped so
+/// slow defaults stay cheap and short test beats stay responsive.
+fn stream_tick_ms(keepalive_ms: u64) -> u64 {
+    (keepalive_ms / 5).clamp(25, 1_000)
+}
+
+/// Server time for the hello payload: unix epoch seconds. Read-only.
+fn stream_server_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Hello payload: contract version, scope, and server time. The ticket
+/// scope also names its ticket number. Pure over inputs for testing.
+pub fn stream_hello_json(scope: &str, ticket: Option<u64>) -> serde_json::Value {
+    match ticket {
+        Some(n) => serde_json::json!({
+            "version": STREAM_CONTRACT_VERSION,
+            "scope": scope,
+            "server_time": stream_server_time_secs(),
+            "ticket": n,
+        }),
+        None => serde_json::json!({
+            "version": STREAM_CONTRACT_VERSION,
+            "scope": scope,
+            "server_time": stream_server_time_secs(),
+        }),
+    }
+}
+
+/// One per-scope stream source: the exact bytes the matching polling
+/// fragment serves, re-read on every tick. Deltas compare these bytes,
+/// so a stream can only ever push what polling already shows.
+#[derive(Debug, Clone)]
+enum StreamScope {
+    Board,
+    Ticket { number: u64, raw: String },
+    DispatcherLive,
+}
+
+impl StreamScope {
+    /// Scope name as the hello carries it (spec: board, ticket,
+    /// dispatcher-live — one scope per connection in v1).
+    fn name(&self) -> &'static str {
+        match self {
+            StreamScope::Board => "board",
+            StreamScope::Ticket { .. } => "ticket",
+            StreamScope::DispatcherLive => "dispatcher-live",
+        }
+    }
+
+    /// Ticket number for the hello payload (`None` off the ticket scope).
+    fn ticket(&self) -> Option<u64> {
+        match self {
+            StreamScope::Ticket { number, .. } => Some(*number),
+            _ => None,
+        }
+    }
+
+    /// Current fragment bytes for this scope: the same render calls the
+    /// polling handlers serve. Read-only (same seams, no writes).
+    fn snapshot_html(&self) -> String {
+        match self {
+            StreamScope::Board => board_fragment_html(&board_data()),
+            StreamScope::Ticket { number, raw } => ticket_detail(*number, TICKET_DETAIL_TAIL)
+                .map(|d| ticket_detail_fragment_html(&d))
+                .unwrap_or_else(|| ticket_missing_fragment_html(raw)),
+            StreamScope::DispatcherLive => dispatcher_fragment_html(&dispatcher_data()),
+        }
+    }
+}
+
+/// `?version=` gate: present and mismatched means a loud 400 naming the
+/// expected contract (fail at hello, never render garbage). Pure over
+/// inputs for testing.
+fn stream_version_error(requested: Option<u64>) -> Option<String> {
+    match requested {
+        Some(v) if v != STREAM_CONTRACT_VERSION => Some(format!(
+            "stream contract mismatch: client asked for version {v}, server speaks version {STREAM_CONTRACT_VERSION} — refresh the viewer to match the server"
+        )),
+        _ => None,
+    }
+}
+
+/// Bridge between the per-connection producer task and Axum's `Sse`
+/// body: the producer sends hello, snapshot, then deltas; Axum's
+/// keep-alive layer adds the comment beat. Ends when the client goes
+/// away (send fails) — the server never buffers without bound past the
+/// channel, and closing every client changes nothing about the loop.
+struct StreamChannel {
+    rx: tokio::sync::mpsc::UnboundedReceiver<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+}
+
+impl futures_core::Stream for StreamChannel {
+    type Item = Result<axum::response::sse::Event, std::convert::Infallible>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Single-line JSON envelope for snapshot/delta payloads: one `data:`
+/// line per event however large the fragment grows.
+fn stream_html_envelope(html: &str) -> String {
+    serde_json::to_string(&serde_json::json!({ "html": html }))
+        .unwrap_or_else(|_| "{\"html\":\"\"}".to_string())
+}
+
+/// Spawn the per-connection producer and return its channel: hello,
+/// then a whole snapshot, then a delta whenever the scope's fragment
+/// bytes move. Read-only: the producer only re-reads the polling seams.
+fn spawn_stream_producer(scope: StreamScope, keepalive_ms: u64) -> StreamChannel {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let hello = serde_json::to_string(&stream_hello_json(scope.name(), scope.ticket()))
+            .unwrap_or_else(|_| "{}".to_string());
+        if tx
+            .send(Ok(axum::response::sse::Event::default()
+                .event("hello")
+                .data(hello)))
+            .is_err()
+        {
+            return;
+        }
+        let mut last = scope.snapshot_html();
+        if tx
+            .send(Ok(axum::response::sse::Event::default()
+                .event("snapshot")
+                .data(stream_html_envelope(&last))))
+            .is_err()
+        {
+            return;
+        }
+        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(stream_tick_ms(
+            keepalive_ms,
+        )));
+        ticks.tick().await;
+        loop {
+            ticks.tick().await;
+            let now = scope.snapshot_html();
+            if now != last {
+                last = now;
+                let event = axum::response::sse::Event::default()
+                    .event("delta")
+                    .data(stream_html_envelope(&last));
+                if tx.send(Ok(event)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    StreamChannel { rx }
+}
+
+/// Shared stream opener: version gate, then hello/snapshot/deltas with
+/// the keepalive beat. The `Sse` response carries
+/// `text/event-stream` + `no-cache`; unknown tickets never reach here
+/// (their handlers 404 first, like the polling fragments).
+fn open_stream(
+    scope: StreamScope,
+    keepalive_ms: u64,
+) -> axum::response::Sse<axum::response::sse::KeepAliveStream<StreamChannel>> {
+    axum::response::Sse::new(spawn_stream_producer(scope, keepalive_ms)).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_millis(keepalive_ms)),
+    )
+}
+
+/// Optional `?version=` query: absent means "speak current".
+#[derive(Debug, serde::Deserialize)]
+struct StreamQuery {
+    version: Option<u64>,
+}
+
+/// GET /streams/board: hello, snapshot, then board deltas. Read-only.
+async fn stream_board_handler(
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
+) -> Result<
+    axum::response::Sse<axum::response::sse::KeepAliveStream<StreamChannel>>,
+    (axum::http::StatusCode, String),
+> {
+    if let Some(err) = stream_version_error(query.version) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, err));
+    }
+    Ok(open_stream(StreamScope::Board, stream_keepalive_ms()))
+}
+
+/// GET /streams/ticket/{number}: hello, snapshot, then detail deltas.
+/// Unknown tickets 404 calmly (same shape as the polling fragment).
+async fn stream_ticket_handler(
+    axum::extract::Path(raw): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
+) -> Result<
+    axum::response::Sse<axum::response::sse::KeepAliveStream<StreamChannel>>,
+    (axum::http::StatusCode, String),
+> {
+    if let Some(err) = stream_version_error(query.version) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, err));
+    }
+    match parse_issue_number(&raw)
+        .ok()
+        .filter(|n| ticket_detail(*n, TICKET_DETAIL_TAIL).is_some())
+    {
+        Some(number) => Ok(open_stream(
+            StreamScope::Ticket { number, raw },
+            stream_keepalive_ms(),
+        )),
+        None => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            ticket_missing_page_html(&raw),
+        )),
+    }
+}
+
+/// GET /streams/dispatch: hello, snapshot, then dispatcher-live deltas.
+/// Read-only (the POST stop/resume controls stay the only writers).
+async fn stream_dispatch_handler(
+    axum::extract::Query(query): axum::extract::Query<StreamQuery>,
+) -> Result<
+    axum::response::Sse<axum::response::sse::KeepAliveStream<StreamChannel>>,
+    (axum::http::StatusCode, String),
+> {
+    if let Some(err) = stream_version_error(query.version) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, err));
+    }
+    Ok(open_stream(
+        StreamScope::DispatcherLive,
+        stream_keepalive_ms(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
