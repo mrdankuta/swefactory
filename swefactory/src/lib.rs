@@ -341,6 +341,29 @@ pub enum DispatchAction {
     Stop,
     /// Restart the loop after a stop.
     Resume,
+    /// Record a hook/approval decision for one attempt (first-write-wins)
+    /// or show the stored one. The first decision for a (ticket, attempt,
+    /// key) triple sticks: repeats observe the stored answer instead of
+    /// re-asking, so a restart finds the same outcome with or without a
+    /// crash in between. Scope is the attempt: a fresh attempt starts
+    /// with an empty cache. Exit 0 on record and on reuse; nonzero only
+    /// when the scope is missing or the key/decision is empty, with the
+    /// cause named. The global --json flag selects machine output
+    /// carrying the same facts structurally.
+    Memo {
+        /// Ticket issue number (e.g. 67 or #67).
+        #[arg(long)]
+        ticket: String,
+        /// Attempt number the decision belongs to.
+        #[arg(long)]
+        attempt: u64,
+        /// Decision key (e.g. approve-deploy, allow-flagged-tool).
+        #[arg(long)]
+        key: String,
+        /// Decision value to store on first write (e.g. allow, deny).
+        #[arg(long)]
+        decision: String,
+    },
     /// Hermetic proof of the release mechanics (temp bare origin, no gh,
     /// no network, no tokens, no spend). Every failure names the mechanics
     /// that broke and exits non-zero.
@@ -6665,6 +6688,13 @@ struct DispatchLedger {
     /// records older than the retention horizon read as absent.
     #[serde(default)]
     idempotency_keys: Vec<IdempotencyRecord>,
+    /// Decision memos for hooks/approvals (ticket #67, spec #59
+    /// follow-up): first-write-wins answers scoped to the attempt, so a
+    /// restart finds the stored answer instead of re-prompting.
+    /// `#[serde(default)]` keeps pre-memo ledgers parsing (absent reads
+    /// as an empty cache, never an error).
+    #[serde(default)]
+    decision_memos: Vec<DecisionMemo>,
     /// Live task nodes for the observable task graph (ticket #70, spec
     /// #59): one record per task the attempt is currently running or
     /// waiting on. `#[serde(default)]` keeps pre-task ledgers parsing
@@ -6673,6 +6703,20 @@ struct DispatchLedger {
     /// the graph view filters to live rows and never writes.
     #[serde(default)]
     tasks: Vec<LiveTask>,
+}
+
+/// One stored hook/approval decision (ticket #67, spec #59 follow-up):
+/// the attempt scope it belongs to, the decision key, and the winning
+/// value the first writer stored. Repeats observe this row instead of
+/// re-asking; a fresh attempt starts with no rows. `#[serde(default)]`
+/// keeps pre-memo ledgers parsing (absent reads as an empty cache).
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+struct DecisionMemo {
+    ticket: u64,
+    attempt: u64,
+    key: String,
+    decision: String,
+    stored_at: String,
 }
 
 /// One stored exactly-once outcome (ticket #62, spec #59): the key, the
@@ -9015,6 +9059,13 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
     for a in &entries {
         let full = log_read_transcript(&state, a);
         let (shown, truncated) = log_tail(&full, tail);
+        // Memo facts per attempt (ticket #67): the stored answers a hook
+        // reuses on resume instead of re-asking. Empty for memo-less
+        // attempts so old rows read exactly as before.
+        let memos: Vec<serde_json::Value> = attempt_memos(&ledger, a.ticket, a.attempt_no)
+            .iter()
+            .map(|m| memo_json(m))
+            .collect();
         rows.push(serde_json::json!({
             "ticket": a.ticket,
             "attempt": a.attempt_no,
@@ -9024,6 +9075,7 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
             "phase": attempt_phase(a),
             "resumable": is_resumable(a),
             "resumed": a.resumed,
+            "memos": memos,
             "base": a.base_commit,
             "head": a.head_commit,
             "started": a.started_at,
@@ -9066,6 +9118,25 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
         };
         println!("Attempt {attempt}: {summary}");
         println!("Base {base} -> {head_words}, {span}.");
+        if let Some(memos) = row.get("memos").and_then(|v| v.as_array()) {
+            if !memos.is_empty() {
+                let pairs: Vec<String> = memos
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{}={}",
+                            m.get("key").and_then(|v| v.as_str()).unwrap_or("?"),
+                            m.get("decision").and_then(|v| v.as_str()).unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                println!(
+                    "Decisions ({}, reused on resume instead of asking again): {}.",
+                    memos.len(),
+                    pairs.join(", ")
+                );
+            }
+        }
         if transcript.is_empty() {
             println!("(no transcript yet)");
         } else if tail == 0 {
@@ -9927,6 +9998,211 @@ pub fn cmd_dispatch_wait(
     0
 }
 
+// ---------------------------------------------------------------------------
+// DECISION MEMOS (ticket #67, spec #59 follow-up)
+//
+// Hooks and approvals that never ask twice. A first-write-wins memo cache
+// scoped to the attempt: the first decision (approve deploy, allow a
+// flagged tool call, answer a guard question) is stored, and after any
+// restart the hook finds the stored answer instead of re-prompting.
+// Identical outcome with or without a crash in between: the store rides
+// the same temp-file + rename as every ledger write, so a kill between
+// the two leaves the previous ledger (the FACTORY_MEMO_CRASH seam below
+// exists only to pin that guarantee in tests: it writes tmp and exits
+// before the rename, exactly like a kill -9 at that instant).
+//
+// Concurrency: memo writes take the same mkdir lock as `dispatch once`,
+// so concurrent first-writes serialize and resolve to exactly one winner;
+// losers observe the stored value. Scope is the attempt: the triple
+// (ticket, attempt, key) is the cache line, and a fresh attempt number
+// starts with an empty cache.
+// ---------------------------------------------------------------------------
+
+/// Memos stored for one attempt, in record order.
+fn attempt_memos(ledger: &DispatchLedger, ticket: u64, attempt_no: u64) -> Vec<&DecisionMemo> {
+    ledger
+        .decision_memos
+        .iter()
+        .filter(|m| m.ticket == ticket && m.attempt == attempt_no)
+        .collect()
+}
+
+/// One memo as machine-readable facts, shared by every JSON surface so no
+/// fact lives only in prose.
+fn memo_json(m: &DecisionMemo) -> serde_json::Value {
+    serde_json::json!({
+        "ticket": m.ticket,
+        "attempt": m.attempt,
+        "slot": format!("T{}-a{}", m.ticket, m.attempt),
+        "key": m.key,
+        "decision": m.decision,
+        "stored_at": m.stored_at,
+    })
+}
+
+/// Acquire the shared dispatch lock, retrying while a pass holds it. Memo
+/// writes must serialize against `dispatch once` ledger writes as well as
+/// each other, or a concurrent commit could lose one of the two updates.
+fn memo_lock(state: &std::path::Path) -> Option<DispatchLock> {
+    for _ in 0..200 {
+        if let Some(lock) = DispatchLock::acquire(state.join(".lock")) {
+            return Some(lock);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+/// Record a hook/approval decision or observe the stored one (ticket #67).
+/// First-write-wins on (ticket, attempt, key); repeats print the stored
+/// answer with a reuse marker and change nothing. Atomic (tmp + rename)
+/// under the shared dispatch lock.
+pub fn cmd_dispatch_memo(
+    json: bool,
+    ticket_raw: &str,
+    attempt_no: u64,
+    key_raw: &str,
+    decision_raw: &str,
+) -> i32 {
+    let ticket = match parse_issue_number(ticket_raw) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("memo: {e}");
+            return 1;
+        }
+    };
+    let key = key_raw.trim().to_string();
+    if key.is_empty() {
+        eprintln!("memo: key must not be empty");
+        return 1;
+    }
+    let decision = decision_raw.trim().to_string();
+    if decision.is_empty() {
+        eprintln!("memo: decision must not be empty");
+        return 1;
+    }
+    fn print_reuse(
+        json: bool,
+        ticket: u64,
+        attempt_no: u64,
+        slot: &str,
+        key: &str,
+        decision: &str,
+    ) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ticket": ticket,
+                    "attempt": attempt_no,
+                    "slot": slot,
+                    "key": key,
+                    "decision": decision,
+                    "recorded": false,
+                })
+            );
+        } else {
+            println!(
+                "Decision reused for ticket {ticket} attempt {attempt_no}: {key}={decision} (slot {slot}) — already decided, not asked again."
+            );
+        }
+    }
+    let state = dispatch_state_dir();
+    let slot = format!("T{ticket}-a{attempt_no}");
+    // Reuse is the resume path, so it stays lock-free like every other
+    // observer: after a kill (even one that orphans the dispatch lock,
+    // exactly as `dispatch once` under kill does) the hook still finds
+    // the stored answer. Tmp + rename makes the load see the old or the
+    // new ledger, never a torn one; a miss below falls through to the
+    // locked write, which re-checks before storing.
+    let ledger = load_ledger(&state);
+    if let Some(stored) = ledger
+        .decision_memos
+        .iter()
+        .find(|m| m.ticket == ticket && m.attempt == attempt_no && m.key == key)
+    {
+        print_reuse(json, ticket, attempt_no, &slot, &key, &stored.decision);
+        return 0;
+    }
+    if let Err(e) = std::fs::create_dir_all(&state) {
+        eprintln!("memo: cannot create {}: {e}", state.display());
+        return 1;
+    }
+    let Some(_lock) = memo_lock(&state) else {
+        eprintln!("memo: another dispatcher holds the lock — retry the hook");
+        return 1;
+    };
+    // Re-check under the lock: a concurrent first-write may have won
+    // while this hook waited, and losers must observe the stored value.
+    let mut ledger = load_ledger(&state);
+    if !ledger
+        .attempts
+        .iter()
+        .any(|a| a.ticket == ticket && a.attempt_no == attempt_no)
+    {
+        eprintln!("memo: no such attempt T{ticket}-a{attempt_no} — the scope must exist before a hook records a decision");
+        return 1;
+    }
+    if let Some(stored) = ledger
+        .decision_memos
+        .iter()
+        .find(|m| m.ticket == ticket && m.attempt == attempt_no && m.key == key)
+    {
+        print_reuse(json, ticket, attempt_no, &slot, &key, &stored.decision);
+        return 0;
+    }
+    ledger.decision_memos.push(DecisionMemo {
+        ticket,
+        attempt: attempt_no,
+        key: key.clone(),
+        decision: decision.clone(),
+        stored_at: now_secs().to_string(),
+    });
+    if let Err(e) = std::fs::create_dir_all(&state) {
+        eprintln!("memo: cannot create {}: {e}", state.display());
+        return 1;
+    }
+    let tmp = state.join("dispatch.json.tmp");
+    let text = match serde_json::to_string_pretty(&ledger) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("memo: cannot serialize ledger: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = std::fs::write(&tmp, &text) {
+        eprintln!("memo: cannot write ledger: {e}");
+        return 1;
+    }
+    // Test-only kill seam: behave exactly like a crash after the tmp
+    // write but before the rename (orphaned tmp, previous ledger intact).
+    if std::env::var("FACTORY_MEMO_CRASH").as_deref() == Ok("1") {
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::rename(&tmp, ledger_path(&state)) {
+        eprintln!("memo: cannot replace ledger: {e}");
+        return 1;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ticket": ticket,
+                "attempt": attempt_no,
+                "slot": slot,
+                "key": key,
+                "decision": decision,
+                "recorded": true,
+            })
+        );
+    } else {
+        println!(
+            "Decision recorded for ticket {ticket} attempt {attempt_no}: {key}={decision} (slot {slot}) — hooks reuse this answer instead of asking again."
+        );
+    }
+    0
+}
+
 pub fn cmd_dispatch_status(json: bool) -> i32 {
     let state = dispatch_state_dir();
     let ledger = load_ledger(&state);
@@ -9938,9 +10214,10 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
     let stopped = state.join("STOP").is_file();
     if json {
         let wt_lines: Vec<&str> = worktrees.lines().collect();
+        let memos: Vec<serde_json::Value> = ledger.decision_memos.iter().map(memo_json).collect();
         println!(
             "{}",
-            serde_json::json!({"attempts": ledger.attempts, "worktrees": wt_lines, "stopped": stopped})
+            serde_json::json!({"attempts": ledger.attempts, "decision_memos": memos, "worktrees": wt_lines, "stopped": stopped})
         );
     } else {
         println!("== dispatch attempts ==");
@@ -9956,8 +10233,20 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
             } else {
                 String::new()
             };
+            // Memo facts ride the attempt line (ticket #67): empty when
+            // the attempt has no memos, so memo-less output is byte-identical.
+            let memos = attempt_memos(&ledger, a.ticket, a.attempt_no);
+            let memo_words = if memos.is_empty() {
+                String::new()
+            } else {
+                let pairs: Vec<String> = memos
+                    .iter()
+                    .map(|m| format!("{}={}", m.key, m.decision))
+                    .collect();
+                format!(" memos={} ({})", memos.len(), pairs.join(", "))
+            };
             println!(
-                "#{} T{} a{} {} phase={}{}{} base={} head={} {}",
+                "#{} T{} a{} {} phase={}{}{}{} base={} head={} {}",
                 a.id,
                 a.ticket,
                 a.attempt_no,
@@ -9965,6 +10254,7 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
                 attempt_phase(a),
                 resumable,
                 resumed,
+                memo_words,
                 base8,
                 head8,
                 a.started_at
@@ -11418,6 +11708,12 @@ pub fn run() -> i32 {
             } => cmd_dispatch_wait(cli.json, ticket.as_deref(), &parent, &policy),
             DispatchAction::Stop => cmd_dispatch_stop(cli.json),
             DispatchAction::Resume => cmd_dispatch_resume(cli.json),
+            DispatchAction::Memo {
+                ticket,
+                attempt,
+                key,
+                decision,
+            } => cmd_dispatch_memo(cli.json, &ticket, attempt, &key, &decision),
             DispatchAction::SelfTest => cmd_dispatch_selftest(cli.json),
         },
         Commands::Release { action } => match action {
