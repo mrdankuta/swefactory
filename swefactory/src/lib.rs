@@ -57,6 +57,17 @@ pub enum Commands {
         #[arg(long, default_value_t = LOG_DEFAULT_TAIL)]
         tail: usize,
     },
+    /// Cross-attempt facts (spec #64): the revision-guarded document
+    /// beside the dispatch ledger. Reads only in this slice (ticket
+    /// #77): the whole document or one facts path, human-readable by
+    /// default, machine-readable with the global --json flag carrying
+    /// the same value-plus-revision facts. Read-only: observing changes
+    /// nothing; an absent document reads as empty at revision zero with
+    /// no migration. Guarded writes arrive in later tickets.
+    Facts {
+        #[command(subcommand)]
+        action: FactsAction,
+    },
     /// Seed the factory into the current project (idempotent, never clobbers).
     Init {
         /// Check-adapter stack to install (default: auto-detect from the project).
@@ -315,6 +326,25 @@ pub enum DispatchAction {
     /// no network, no tokens, no spend). Every failure names the mechanics
     /// that broke and exits non-zero.
     SelfTest,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FactsAction {
+    /// Read the facts document: the whole document by default, or one
+    /// slash-separated facts path (e.g. `costs/total`) on request.
+    /// Read-only: observing changes nothing. Exit 0 whenever the
+    /// document was read successfully — an absent document reads as
+    /// empty at revision zero, and a missing path reads as a plain
+    /// sentence (never zero-filled, never error-shaped). Nonzero only
+    /// on unreadable state (unreadable/corrupt facts document) with the
+    /// cause named. The global --json flag selects machine output
+    /// carrying the same value-plus-revision facts.
+    Show {
+        /// Slash-separated facts path (e.g. costs/total). Omit for the
+        /// whole document.
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -8479,6 +8509,179 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, json: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// REVISION-GUARDED FACTS, slice 1: the document + reads (ticket #77,
+// spec #64)
+//
+// One JSON facts document lives in the existing state directory beside
+// the dispatch ledger (`facts.json` next to `dispatch.json`):
+// `{"revision": N, "facts": {...}}`. The ledger still owns attempt
+// lifecycle, logs still own transcripts; facts own cross-attempt figures
+// and nothing else moves stores. No migration: an absent document reads
+// as empty at revision zero, and reading never creates files, so
+// adoption touches no ledger, log, or worktree behavior.
+//
+// Reads address the whole document (`factory facts show`) or one
+// slash-separated path (`factory facts show costs/total`), human-readable
+// by default and machine-readable with the global --json flag carrying
+// the same value-plus-revision facts. A missing path is a plain sentence
+// with exit 0 — never zero-filled, never error-shaped. Path-syntax
+// validation, guarded writes, counters, and size bounds arrive in later
+// tickets and reuse these same load/traverse seams.
+// ---------------------------------------------------------------------------
+
+/// Facts document filename inside the state directory (beside the
+/// dispatch ledger, the logs dir, and the train file).
+const FACTS_FILENAME: &str = "facts.json";
+
+/// Human footer on every facts read: the per-machine blind spot from
+/// spec #64 stays in user-facing copy wherever facts are shown, so Bea
+/// never mistakes local figures for shared ones. Machine output keeps
+/// exactly the value-plus-revision facts (no tone, same shape).
+const FACTS_LOCALITY_LINE: &str =
+    "Per-machine local state: a ticket built on two machines sees two documents.";
+
+fn facts_doc_path(state: &std::path::Path) -> PathBuf {
+    state.join(FACTS_FILENAME)
+}
+
+/// One loaded facts document: the monotonic revision plus the whole
+/// value tree. Reads-only shape; writers advance the revision.
+struct FactsDocument {
+    revision: u64,
+    facts: serde_json::Value,
+}
+
+/// Read-only facts load. Absent file (or absent state dir) reads as
+/// empty at revision zero with nothing created; unreadable or corrupt
+/// files error naming the facts document, mirroring the ledger seam.
+fn load_facts_document(state: &std::path::Path) -> Result<FactsDocument, String> {
+    let path = facts_doc_path(state);
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FactsDocument {
+                revision: 0,
+                facts: serde_json::json!({}),
+            });
+        }
+        Err(e) => {
+            return Err(format!("facts: cannot read {}: {e}", path.display()));
+        }
+        Ok(t) => t,
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("facts: cannot parse {}: {e}", path.display()))?;
+    let obj = parsed.as_object().ok_or_else(|| {
+        format!(
+            "facts: cannot parse {}: expected an object with revision + facts",
+            path.display()
+        )
+    })?;
+    Ok(FactsDocument {
+        revision: obj.get("revision").and_then(|r| r.as_u64()).unwrap_or(0),
+        facts: obj
+            .get("facts")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
+/// Normalize a user-supplied facts path: ignore leading, trailing, and
+/// doubled slashes (`/costs/total/` reads as `costs/total`). Empty (or
+/// all-slash) input reads as the whole document. Strict path-syntax
+/// validation (accepted shape on rejection) belongs to a later ticket.
+fn normalize_facts_path(raw: &str) -> String {
+    raw.split('/')
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Traverse the facts tree along a normalized path. `None` is a missing
+/// fact (plain sentence, exit 0) — never synthesized, never zero-filled.
+fn facts_lookup<'a>(facts: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = facts;
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        current = current.get(seg)?;
+    }
+    Some(current)
+}
+
+/// Pretty value for human output (mirrors the JSON mode value exactly).
+fn facts_pretty(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Read the facts document: whole or one path, human or machine.
+/// Read-only like `status`/`log`: observing changes nothing.
+pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
+    let state = dispatch_state_dir();
+    let doc = match load_facts_document(&state) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let path = path_raw.map(normalize_facts_path).filter(|p| !p.is_empty());
+
+    match path {
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"revision": doc.revision, "facts": doc.facts})
+                );
+                return 0;
+            }
+            if doc.facts == serde_json::json!({}) {
+                println!("facts at revision {}: empty (no values set).", doc.revision);
+            } else {
+                println!("facts at revision {}:", doc.revision);
+                println!("{}", facts_pretty(&doc.facts));
+            }
+            println!("{FACTS_LOCALITY_LINE}");
+            0
+        }
+        Some(p) => match facts_lookup(&doc.facts, &p) {
+            Some(value) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "revision": doc.revision,
+                            "path": p,
+                            "value": value,
+                        })
+                    );
+                    return 0;
+                }
+                println!("facts {p} at revision {}:", doc.revision);
+                println!("{}", facts_pretty(value));
+                println!("{FACTS_LOCALITY_LINE}");
+                0
+            }
+            None => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "revision": doc.revision,
+                            "path": p,
+                            "value": serde_json::Value::Null,
+                            "missing": true,
+                        })
+                    );
+                    return 0;
+                }
+                println!("facts {p} at revision {}: no value set.", doc.revision);
+                println!("{FACTS_LOCALITY_LINE}");
+                0
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LIVE TASK GRAPH (ticket #70, spec #59 follow-up)
 //
 // One observable graph of everything live for the dispatcher screen and
@@ -9965,6 +10168,9 @@ pub fn run() -> i32 {
         }
         Commands::Status => cmd_status(cli.json),
         Commands::Log { ticket, tail } => cmd_log(&ticket, tail, cli.json),
+        Commands::Facts { action } => match action {
+            FactsAction::Show { path } => cmd_facts_show(cli.json, path.as_deref()),
+        },
         Commands::Init {
             stack,
             global_skills,
