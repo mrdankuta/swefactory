@@ -8139,6 +8139,93 @@ fn remove_worktree(path: &std::path::Path) {
     let _ = run_git(&["worktree", "prune"], None);
 }
 
+/// Cut (or re-attach) the ticket worktree, repairing stale registrations
+/// (ticket #75): when the branch is registered at a directory that no
+/// longer exists — a dead retry's admin entry, the #60 incident shape —
+/// `git worktree add` fails with "already used by worktree at ..." and
+/// every later pass would skip the ticket forever. Prune the dead entry
+/// and retry so the attempt proceeds on a fresh worktree. An occupying
+/// directory that still exists is only reaped when it is our own dead slot
+/// under `state/worktrees/`; a foreign checkout is refused with the exact
+/// recovery command instead of being touched. Never touches dev/main.
+fn ensure_ticket_worktree(
+    state: &std::path::Path,
+    branch: &str,
+    wt: &std::path::Path,
+    base: &str,
+) -> Result<(), String> {
+    let wt_s = wt.to_string_lossy().to_string();
+    // One add attempt: reuse form when the branch exists, fresh cut otherwise.
+    let attempt_add = || {
+        let branch_exists = run_git(&["rev-parse", "--verify", "--quiet", branch], None)
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let out = if branch_exists {
+            run_git(&["worktree", "add", &wt_s, branch], None)
+        } else {
+            run_git(&["worktree", "add", &wt_s, "-b", branch, base], None)
+        };
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(format!("failed to run: {e}")),
+        }
+    };
+    // After one repair of the pinning registration, retry the add once.
+    let retry_after_repair = |note: &str| match attempt_add() {
+        Ok(()) => {
+            println!("dispatch: {note} — fresh worktree cut for {branch}");
+            Ok(())
+        }
+        Err(e) => Err(format!("worktree add failed after {note}: {e}")),
+    };
+    if let Err(first_err) = attempt_add() {
+        // Repair window: drop dead admin entries, then look for the
+        // registration that still pins the branch.
+        let _ = run_git(&["worktree", "prune"], None);
+        let listed = run_git(&["worktree", "list", "--porcelain"], None)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let holder = parse_git_worktree_porcelain(&listed)
+            .into_iter()
+            .find(|w| w.branch == branch)
+            .map(|w| w.path);
+        match holder {
+            Some(path) if !std::path::Path::new(&path).exists() => {
+                // Directory absent: dead registration, safe to drop.
+                let _ = run_git(&["worktree", "remove", "--force", &path], None);
+                let _ = run_git(&["worktree", "prune"], None);
+                retry_after_repair(&format!("stale worktree registration at {path} pruned"))
+            }
+            Some(path) => {
+                let ours = std::path::Path::new(&path).starts_with(state.join("worktrees"));
+                if ours {
+                    // Our own dead slot (killed pass leftover): reap it.
+                    remove_worktree(std::path::Path::new(&path));
+                    retry_after_repair(&format!("dead slot worktree at {path} reaped"))
+                } else {
+                    Err(format!(
+                            "worktree add failed ({first_err}); branch {branch} is checked out at {path} — refusing to touch a foreign checkout. Recover with: git worktree remove --force {path} (after confirming no live worker) or git worktree prune"
+                        ))
+                }
+            }
+            None => {
+                // No registration pins the branch anymore (the prune
+                // above already cleared it): retry once before giving up.
+                retry_after_repair("pruning dead worktree entries").map_err(|e| {
+                        format!(
+                            "{e} (first failure: {first_err}). Recover with: git worktree prune && git worktree list"
+                        )
+                    })
+            }
+        }
+    } else {
+        Ok(())
+    }
+}
+
 fn last_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -8532,10 +8619,13 @@ fn run_attempt_phases(
             &format!("dispatch attempt {slot} implement base={base} branch={branch}\n"),
         );
         // Implement checkpoint: committed before the implementer runs.
+        // On failure settle as interrupted at the last committed phase
+        // (ticket #75) — never leave the activated row running.
         if let Err(e) = checkpoint_phase(state, ledger, idx, "implement") {
             eprintln!("dispatch: {e}");
-            remove_worktree(wt);
-            return TicketOutcome::Skipped;
+            append_log(log_path, &format!("checkpoint implement failed: {e}\n"));
+            let phase = attempt_phase(&ledger.attempts[idx]).to_string();
+            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, &phase);
         }
         if simulated_kill_phase("implement") {
             return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "implement");
@@ -8576,10 +8666,12 @@ fn run_attempt_phases(
             return TicketOutcome::Done;
         };
         // Verify checkpoint: committed before the check adapter runs.
+        // On failure settle as interrupted (ticket #75), never running.
         if let Err(e) = checkpoint_phase(state, ledger, idx, "verify") {
             eprintln!("dispatch: {e}");
-            remove_worktree(wt);
-            return TicketOutcome::Skipped;
+            append_log(log_path, &format!("checkpoint verify failed: {e}\n"));
+            let phase = attempt_phase(&ledger.attempts[idx]).to_string();
+            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, &phase);
         }
         if simulated_kill_phase("verify") {
             return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "verify");
@@ -8709,11 +8801,13 @@ fn run_attempt_phases(
     }
     let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
     // Review checkpoint: committed before the reviewer runs.
+    // On failure settle as interrupted (ticket #75), never running.
     if let Err(e) = checkpoint_phase(state, ledger, idx, "review") {
         eprintln!("dispatch: {e}");
+        append_log(log_path, &format!("checkpoint review failed: {e}\n"));
+        let phase = attempt_phase(&ledger.attempts[idx]).to_string();
         remove_worktree(&rwt);
-        remove_worktree(wt);
-        return TicketOutcome::Skipped;
+        return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, &phase);
     }
     if simulated_kill_phase("review") {
         remove_worktree(&rwt);
@@ -8873,39 +8967,18 @@ fn resume_ticket_attempt(
     let tmpdir = state.join("tmp").join(&slot);
     let _ = std::fs::create_dir_all(&tmpdir);
     // Recreate the worktree the interruption released. The branch survives
-    // every interruption, so resume re-attaches; a missing branch (never
+    // every interruption, so resume re-attaches (ticket #75: stale
+    // registrations are repaired inside); a missing branch (never
     // observed, but cheap to survive) is cut fresh from the recorded base.
     remove_worktree(&wt);
-    let branch_exists = run_git(&["rev-parse", "--verify", "--quiet", &record_branch], None)
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let wt_s = wt.to_string_lossy().to_string();
     let base = if record_base.is_empty() {
         "HEAD".to_string()
     } else {
         record_base.clone()
     };
-    let added = if branch_exists {
-        run_git(&["worktree", "add", &wt_s, &record_branch], None)
-    } else {
-        run_git(
-            &["worktree", "add", &wt_s, "-b", &record_branch, &base],
-            None,
-        )
-    };
-    match added {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            println!(
-                "dispatch: #{ticket} resume worktree add failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return TicketOutcome::Skipped;
-        }
-        Err(e) => {
-            println!("dispatch: #{ticket} resume worktree add failed: {e}");
-            return TicketOutcome::Skipped;
-        }
+    if let Err(e) = ensure_ticket_worktree(state, &record_branch, &wt, &base) {
+        println!("dispatch: #{ticket} resume {e}");
+        return TicketOutcome::Skipped;
     }
     let n = ledger.attempts[idx].resumed + 1;
     ledger.attempts[idx].resumed = n;
@@ -8922,9 +8995,14 @@ fn resume_ticket_attempt(
         ),
     );
     if let Err(e) = save_ledger(state, ledger) {
+        // Re-activation never persisted (ticket #75): revert to the
+        // interrupted checkpoint in memory so no running row escapes,
+        // then Done so the loop retries the save loudly.
         eprintln!("dispatch: {e}");
+        ledger.attempts[idx].status = format!("{phase}_interrupted");
+        ledger.attempts[idx].finished_at = now_stamp();
         remove_worktree(&wt);
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Done;
     }
     println!("  resumed from {phase} checkpoint (resume #{n}) — continuing attempt {attempt_no}");
     gh_comment(
@@ -9190,33 +9268,18 @@ fn cmd_dispatch_ticket(
     let _ = std::fs::create_dir_all(&tmpdir);
     println!("dispatch: #{ticket} '{title}' (attempt {attempt_no})");
 
-    // Reuse an existing ticket branch for retries; never touch dev/main.
-    let branch_exists = run_git(&["rev-parse", "--verify", "--quiet", &branch], None)
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let wt_s = wt.to_string_lossy().to_string();
-    let added = if branch_exists {
-        run_git(&["worktree", "add", &wt_s, &branch], None)
-    } else {
-        run_git(&["worktree", "add", &wt_s, "-b", &branch, &base], None)
-    };
-    match added {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            let msg = format!(
-                "dispatch: #{ticket} worktree add failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            println!("{msg}");
-            append_log(&log_path, &format!("{msg}\n"));
-            log_event(&log_path, id, ticket, "worktree-add", 1);
-            return TicketOutcome::Skipped;
-        }
-        Err(e) => {
-            println!("dispatch: #{ticket} worktree add failed: {e}");
-            return TicketOutcome::Skipped;
-        }
+    // Reuse an existing ticket branch for retries (ticket #75: stale
+    // registrations are repaired inside); never touch dev/main. No lease
+    // is held on failure — the attempt row is pushed only after the
+    // directory exists, so every early exit here never activated.
+    if let Err(e) = ensure_ticket_worktree(state, &branch, &wt, &base) {
+        let msg = format!("dispatch: #{ticket} {e}");
+        println!("{msg}");
+        append_log(&log_path, &format!("{msg}\n"));
+        log_event(&log_path, id, ticket, "worktree-add", 1);
+        return TicketOutcome::Skipped;
     }
+    let wt_s = wt.to_string_lossy().to_string();
     ledger.attempts.push(DispatchAttempt {
         id,
         ticket,
@@ -9236,8 +9299,12 @@ fn cmd_dispatch_ticket(
     });
     let idx = ledger.attempts.len() - 1;
     // Plan checkpoint: committed before any side-effecting work begins.
+    // On failure the row was never activated on disk (this checkpoint is
+    // its first persist — ticket #75), so drop it in memory and release
+    // the ticket instead of leaving a running row behind.
     if let Err(e) = checkpoint_phase(state, ledger, idx, "plan") {
         eprintln!("dispatch: {e}");
+        ledger.attempts.pop();
         remove_worktree(&wt);
         return TicketOutcome::Skipped;
     }

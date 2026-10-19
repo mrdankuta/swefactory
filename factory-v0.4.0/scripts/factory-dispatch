@@ -38,6 +38,74 @@ LOG_DIR="$STATE_DIR/logs"
 STOP_FILE="$STATE_DIR/STOP"
 REPO_NAME="$(basename "$ROOT")"
 
+# --- stuck-lease hardening (ticket #75) ------------------------------------
+# A dispatcher pass must never die holding a lease on a missing worktree.
+# DISPATCH_ATTEMPT_ID names the currently activated attempt row (empty when
+# none); the EXIT trap below settles it if the pass dies unsettled. Bash has
+# deliberately NO auto-reaper: without a lock a running row might belong to
+# a live concurrent pass, so a kill -9 lease is released by the human with
+# the printed sqlite3 command instead of by the next pass.
+DISPATCH_ATTEMPT_ID=""
+
+lease_recovery_sql() { echo "UPDATE attempts SET status='impl_failed', finished_at=datetime('now') WHERE status LIKE '%_running';"; }
+
+dispatch_lease_trap() {
+  local rc=$?
+  [ -n "${DISPATCH_ATTEMPT_ID:-}" ] || return "$rc"
+  [ -n "${DB:-}" ] && [ -f "$DB" ] || return "$rc"
+  local st; st="$(sqlite3 "$DB" "SELECT status FROM attempts WHERE id=$DISPATCH_ATTEMPT_ID;" 2>/dev/null || true)"
+  case "$st" in
+    *_running)
+      sqlite3 "$DB" "UPDATE attempts SET status='impl_failed', finished_at=datetime('now') WHERE id=$DISPATCH_ATTEMPT_ID;" 2>/dev/null || true
+      echo "dispatch: pass exited ($rc) with attempt $DISPATCH_ATTEMPT_ID unsettled ($st) — marked impl_failed." >&2
+      echo "dispatch: if a lease ever survives a kill -9, release it with:" >&2
+      echo "  sqlite3 $DB \"$(lease_recovery_sql)\"" >&2
+      ;;
+  esac
+  return "$rc"
+}
+trap dispatch_lease_trap EXIT
+
+# ensure_worktree <wt> <branch> <base>: cut or re-attach the ticket
+# worktree. Reuses the branch when it already exists; when the branch is
+# registered at a directory that no longer exists (a dead retry's admin
+# entry — the #60 incident shape), prunes the dead registration and
+# re-cuts instead of failing. Reuses the directory in place when it is
+# already the branch's checkout. Returns nonzero WITHOUT exiting (callers
+# use it in `if !` so `set -e` stays quiet); on failure the ticket is
+# released for retry with NO attempt row activated.
+ensure_worktree() {
+  local wt="$1" branch="$2" base="$3" registered holder wt_abs
+  wt_abs="$(cd "$(dirname "$wt")" 2>/dev/null && pwd)/$(basename "$wt")"
+  registered="$(git worktree list --porcelain 2>/dev/null | awk -v want="$branch" '
+    /^worktree / { path=substr($0, 10) }
+    /^branch / { b=$0; sub(/^branch refs\/heads\//, "", b); if (b == want) print path }')"
+  if [ -n "${registered:-}" ] && [ "$registered" = "$wt_abs" ] && [ -d "$wt" ]; then
+    echo "dispatch: reusing worktree $wt ($branch)" >&2
+    return 0
+  fi
+  if git rev-parse --verify --quiet "$branch" >/dev/null; then
+    git worktree add "$wt" "$branch" 2>&1 | tail -n 1 && return 0
+  else
+    git worktree add "$wt" -b "$branch" "$base" 2>&1 | tail -n 1 && return 0
+  fi
+  echo "dispatch: worktree add failed for $branch — pruning dead registrations and retrying" >&2
+  git worktree prune 2>/dev/null || true
+  holder="$(git worktree list --porcelain 2>/dev/null | awk -v want="$branch" '
+    /^worktree / { path=substr($0, 10) }
+    /^branch / { b=$0; sub(/^branch refs\/heads\//, "", b); if (b == want) print path }')"
+  if [ -n "${holder:-}" ] && [ ! -e "$holder" ]; then
+    echo "dispatch: stale registration at $holder (directory absent) — removing and re-cutting" >&2
+    git worktree remove --force "$holder" 2>/dev/null || true
+    git worktree prune 2>/dev/null || true
+  fi
+  if git rev-parse --verify --quiet "$branch" >/dev/null; then
+    git worktree add "$wt" "$branch" 2>&1 | tail -n 1
+  else
+    git worktree add "$wt" -b "$branch" "$base" 2>&1 | tail -n 1
+  fi
+}
+
 usage() { sed -n '2,18p' "$0"; }
 
 db_init() {
@@ -217,13 +285,14 @@ cmd_once() {
   [ -z "$candidates" ] && { echo "dispatch: no open tickets"; exit 0; }
 
   for ticket in $candidates; do
+    DISPATCH_ATTEMPT_ID=""
     [ "$(active_count)" -ge "$MAX_CONCURRENT" ] && { echo "dispatch: capacity reached"; exit 0; }
     local info; info="$(issue_json "$ticket")"
     local labels title body
     labels="$(labels_of "$info")"
     has_label "$labels" "blocked" && { echo "dispatch: #$ticket blocked — skip"; continue; }
     has_label "$labels" "ready" || { echo "dispatch: #$ticket not ready — skip"; continue; }
-    [ "$(ticket_active "$ticket")" -gt 0 ] && { echo "dispatch: #$ticket already active — skip"; continue; }
+    [ "$(ticket_active "$ticket")" -gt 0 ] && { echo "dispatch: #$ticket already active — skip (if no dispatcher is running, release the stuck lease with: sqlite3 $DB \"$(lease_recovery_sql)\")"; continue; }
     local att; att="$(ticket_attempts "$ticket")"
     [ "$att" -ge "$MAX_ATTEMPTS" ] && {
       echo "dispatch: #$ticket exhausted ($att attempts) — labelling blocked"
@@ -253,8 +322,19 @@ cmd_once() {
     else
       base="$(git rev-parse origin/dev 2>/dev/null || git rev-parse HEAD)"
     fi
-    git worktree add "$wt" -b "$branch" "$base" 2>&1 | tail -n 1
+    # Worktree BEFORE lease (ticket #75): the attempt row is activated only
+    # after the directory is verified present, so every early exit below
+    # either records a terminal state or never activated.
+    if ! ensure_worktree "$wt" "$branch" "$base"; then
+      echo "  worktree unavailable for #$ticket (branch checked out elsewhere?) — releasing for retry; inspect with: git worktree prune && git worktree list" 
+      continue
+    fi
+    if [ ! -d "$wt" ]; then
+      echo "  worktree $wt still absent after add — releasing #$ticket for retry"
+      continue
+    fi
     id="$(new_attempt "$ticket" "$((att + 1))" "$base" "$branch" "$wt" "$log")"
+    DISPATCH_ATTEMPT_ID="$id"
     [ -n "$train" ] && set_train "$id" "$train"
 
     # --- freeze check on linked spec ---
@@ -263,21 +343,34 @@ cmd_once() {
         echo "  spec #$spec freeze mismatch — needs re-freeze, releasing ticket"
         set_status "$id" "impl_failed"
         gh issue comment "$ticket" --body "DISPATCH: linked spec #$spec body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs." >/dev/null
-        git worktree remove --force "$wt"
+        git worktree remove --force "$wt" || true
         continue
       fi
     fi
 
-    # --- implement ---
-    {
+    # --- implement (every write guarded: a failed redirection must settle
+    # the attempt, never kill the pass under set -e holding impl_running) ---
+    if ! {
       echo "Ticket issue: #$ticket"; echo "Spec issue: #${spec:-none}"
       echo "Branch: $branch (base $base)"; echo ""
       echo "$body"
-    } > "$wt/.factory-brief.md"
-    cat "$ROOT/.pi/prompts/build.md" "$wt/.factory-brief.md" > "$wt/.factory-prompt.md"
+    } > "$wt/.factory-brief.md"; then
+      echo "  brief write to $wt failed — settling attempt, releasing ticket"
+      set_status "$id" "impl_failed"
+      gh issue comment "$ticket" --body "DISPATCH: implementer setup failed (cannot write $wt/.factory-brief.md, attempt $((att + 1))/$MAX_ATTEMPTS)." >/dev/null
+      git worktree remove --force "$wt" || true
+      continue
+    fi
+    if ! cat "$ROOT/.pi/prompts/build.md" "$wt/.factory-brief.md" > "$wt/.factory-prompt.md"; then
+      echo "  prompt compose for $wt failed — settling attempt, releasing ticket"
+      set_status "$id" "impl_failed"
+      gh issue comment "$ticket" --body "DISPATCH: implementer setup failed (cannot compose prompt, attempt $((att + 1))/$MAX_ATTEMPTS)." >/dev/null
+      git worktree remove --force "$wt" || true
+      continue
+    fi
     echo "  implement: $PI_BIN -p (timeout ${TIMEOUT_IMPL}s)"
-    (cd "$wt" && timeout "$TIMEOUT_IMPL" $PI_BIN -p "$(cat .factory-prompt.md)" >>"$log" 2>&1)
-    local code=$?
+    local code=0
+    (cd "$wt" && timeout "$TIMEOUT_IMPL" $PI_BIN -p "$(cat .factory-prompt.md)" >>"$log" 2>&1) || code=$?
     if [ "$code" -ne 0 ]; then
       echo "  implement exited $code — will retry next pass"
       set_status "$id" "impl_failed"
@@ -338,7 +431,14 @@ cmd_once() {
 
     # --- review (separate detached worktree, reviewer writes file, dispatcher posts) ---
     local rwt="../${REPO_NAME}-review-${head:0:8}" report="/tmp/T${ticket}-review.md"
-    git worktree add --detach "$rwt" "$head" 2>&1 | tail -n 1
+    if ! git worktree add --detach "$rwt" "$head" 2>&1 | tail -n 1; then
+      echo "  review worktree failed — routing back to ready"
+      set_status "$id" "review_failed"
+      gh issue edit "$ticket" --remove-label review --add-label ready >/dev/null
+      gh issue comment "$ticket" --body "DISPATCH: review setup failed (cannot cut review worktree, attempt $((att + 1))/$MAX_ATTEMPTS)." >/dev/null
+      git worktree remove --force "$wt" || true
+      continue
+    fi
     sqlite3 "$DB" "UPDATE attempts SET status='review_running' WHERE id=$id;"
     {
       echo "Repo worktree: $rwt"; echo "BASE_COMMIT: $base"; echo "HEAD_COMMIT: $head"
@@ -361,7 +461,8 @@ cmd_once() {
     else
       gh issue comment "$ticket" --body "DISPATCH: reviewer produced no report file. Verdict line: ${verdict:-none}. Review log kept in dispatcher state." >/dev/null
     fi
-    git worktree remove --force "$rwt"
+    git worktree remove --force "$rwt" || true
+    git worktree prune 2>/dev/null || true
     if [ "$verdict" = "accept" ]; then
       if [ -n "$train" ]; then
         # Accept-path auto-merge into the train: clean merges only.

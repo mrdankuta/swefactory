@@ -1042,3 +1042,226 @@ fn dispatch_daemon_rejects_bad_interval() {
         .assert()
         .failure();
 }
+
+// ---------------------------------------------------------------------------
+// STUCK-LEASE HARDENING (ticket #75): a pass can never die holding a lease
+// on a missing worktree. When the branch-reuse path finds the branch
+// registered but its directory absent, the pass re-cuts the worktree (or
+// cleanly releases the ticket) instead of dying with the attempt parked
+// in a running state; a kill in the activation window stays retryable.
+// ---------------------------------------------------------------------------
+
+/// Real git (not the logging shim): fixture setup the dispatcher never sees.
+fn real_git(repo: &Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .status()
+        .unwrap();
+    assert!(st.success(), "fixture git {args:?} failed");
+}
+
+fn real_git_stdout(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "fixture git {args:?} failed");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Branch-exists-but-directory-missing reuse recovers: the ticket branch is
+/// registered at a worktree directory that no longer exists (the #60
+/// incident shape — a dead retry's admin entry), yet the pass cuts a fresh
+/// worktree and carries the attempt through instead of skipping forever.
+#[test]
+fn dispatch_once_recovers_branch_registered_but_directory_missing() {
+    let h = setup("stale-worktree");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    // Fixture: ticket branch checked out at a directory that then vanishes
+    // without `git worktree remove` — the stale admin entry survives.
+    let stale = h.repo.parent().unwrap().join("stale-dir");
+    real_git(
+        &h.repo,
+        &[
+            "worktree",
+            "add",
+            &stale.to_string_lossy(),
+            "-b",
+            "factory/T11-demo-widget",
+        ],
+    );
+    std::fs::remove_dir_all(&stale).unwrap();
+    let listed = real_git_stdout(&h.repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        listed.contains("factory/T11-demo-widget"),
+        "fixture must leave a stale registration:\n{listed}"
+    );
+
+    let mut cmd = dispatch_cmd(&h, &["dispatch", "once"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.assert().success();
+
+    // Recovered, not skipped: one attempt carried to review_done.
+    let ledger = fs::read_to_string(h.state.join("dispatch.json"))
+        .expect("recovered pass must record an attempt");
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "ledger:\n{ledger}");
+    let a = &attempts[0];
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{ledger}"
+    );
+    assert_eq!(
+        a.get("branch").and_then(|v| v.as_str()),
+        Some("factory/T11-demo-widget"),
+        "reuse must keep the ticket branch:\n{ledger}"
+    );
+    // The stale registration is gone; the merge rode the auto-cut train.
+    let listed_after = real_git_stdout(&h.repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !listed_after.contains("stale-dir"),
+        "stale admin entry must be repaired:\n{listed_after}"
+    );
+    let gh = gh_log(&h);
+    assert!(gh.contains("integrated"), "must integrate:\n{gh}");
+    let leftover: Vec<_> = fs::read_dir(h.state.join("worktrees"))
+        .map(|rd| rd.filter_map(|e| e.ok()).collect())
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "worktrees must be cleaned up: {leftover:?}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh);
+}
+
+/// A simulated kill between attempt activation and agent launch (plan
+/// checkpoint) leaves the ticket retryable with no human lease cleanup:
+/// the next pass resumes the SAME attempt and carries it to completion.
+#[test]
+fn dispatch_once_plan_kill_resumes_to_completion_without_cleanup() {
+    let h = setup("plan-kill-resume");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    dispatch_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .env("FACTORY_KILL_PHASE", "plan")
+        .assert()
+        .success();
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("plan_interrupted"),
+        "ledger:\n{ledger}"
+    );
+
+    // No ledger surgery, no sqlite cleanup: the next pass just runs.
+    dispatch_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success();
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "resume must continue the same attempt:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("attempt_no").and_then(|v| v.as_u64()),
+        Some(1),
+        "ledger:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "ledger:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{ledger}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh_log(&h));
+}
+
+/// An abandoned running lease (kill -9 shape: row reads impl_running with
+/// no live worker) is reaped and resumed to completion on the next pass —
+/// never skipped forever, never needing human lease cleanup.
+#[test]
+fn dispatch_once_reaps_abandoned_running_lease() {
+    let h = setup("reap-running");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    fs::create_dir_all(h.state.join("logs")).unwrap();
+    let log_path = h.state.join("logs").join("T11-a1-impl.log");
+    fs::write(&log_path, "abandoned mid-implement\n").unwrap();
+    fs::write(
+        h.state.join("dispatch.json"),
+        format!(
+            r#"{{"attempts":[{{"id":1,"ticket":11,"attempt_no":1,"base_commit":"","head_commit":"","branch":"factory/T11-demo-widget","worktree":"","status":"impl_running","exit_code":0,"log_path":"{}","started_at":"s","finished_at":"","train_branch":"","phase":"implement","resumed":0}}]}}"#,
+            log_path.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    dispatch_cmd(&h, &["dispatch", "once"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 1, "no fork, same attempt:\n{ledger}");
+    assert_eq!(
+        attempts[0].get("attempt_no").and_then(|v| v.as_u64()),
+        Some(1),
+        "ledger:\n{ledger}"
+    );
+    assert!(
+        attempts[0]
+            .get("resumed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            >= 1,
+        "reaped lease must resume:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{ledger}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh_log(&h));
+}
