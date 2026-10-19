@@ -707,6 +707,36 @@ fn dispatch_once_dry_run_touches_nothing() {
 }
 
 #[test]
+fn dispatch_once_works_oldest_ticket_first() {
+    let h = setup("oldest-first");
+    for number in [71u64, 86u64] {
+        write_view(
+            &h,
+            number,
+            "Demo widget",
+            "Build it.",
+            &["ticket", "ready"],
+            "OPEN",
+        );
+    }
+    // Tracker order is newest-first; the pass must still work oldest-first.
+    let mut cmd = dispatch_cmd(&h, &["dispatch", "once", "--dry-run"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":86},{"number":71}]"#);
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let pos71 = stdout
+        .find("factory/T71-")
+        .expect("dry-run surveys ticket 71");
+    let pos86 = stdout
+        .find("factory/T86-")
+        .expect("dry-run surveys ticket 86");
+    assert!(
+        pos71 < pos86,
+        "oldest ready ticket first even when listed newest-first:\n{stdout}"
+    );
+}
+
+#[test]
 fn dispatch_routes_changes_requested_back_to_ready() {
     let h = setup("changes-requested");
     write_view(
