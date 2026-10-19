@@ -222,18 +222,42 @@ fn imported(name: &str) -> (PathBuf, PathBuf) {
 fn status_reads_imported_facts_human_and_json() {
     let (_root, state) = imported("status");
 
-    // Human: one line per attempt with the same ids, tickets, statuses,
-    // and short commits `sqlite3` shows for the fixture rows.
-    factory(&state)
+    // Human: an aligned table carrying the same tickets, statuses,
+    // slots, and timestamps `sqlite3` shows for the fixture rows — no
+    // internal ledger ids (ticket #90 readable views) — plus a totals
+    // line with the loop state.
+    let out = factory(&state)
         .args(["dispatch", "status"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("#1 T101 a1 impl_done"))
-        .stdout(predicates::str::contains("#2 T101 a2 review_failed"))
-        .stdout(predicates::str::contains("#3 T102 a1 impl_running"))
-        .stdout(predicates::str::contains("base=aaaaaaaa"))
-        .stdout(predicates::str::contains("head=bbbbbbbb"))
-        .stdout(predicates::str::contains("2026-09-01 10:00:00"));
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(out).unwrap();
+    for want in [
+        "TICKET",
+        "T101-a1",
+        "impl_done",
+        "review_failed",
+        "T102-a1",
+        "impl_running",
+        "2026-09-01 10:00:00",
+        "total:",
+        "loop:",
+    ] {
+        assert!(
+            human.contains(want),
+            "status table carries {want}:\n{human}"
+        );
+    }
+    assert!(
+        !human.lines().any(|l| l.trim_start().starts_with('#')),
+        "no internal ledger ids in human output:\n{human}"
+    );
+    assert!(
+        !human.contains("base="),
+        "no unaligned ledger dump:\n{human}"
+    );
 
     // JSON: the same rows structurally — ids, tickets, attempt numbers,
     // statuses, full commits, timestamps.
