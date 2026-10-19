@@ -234,7 +234,13 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
         .env("CHILD_PID_FILE", &h.child_pid)
         .env("GH_VIEWS_DIR", &h.views)
         .env("GH_LIST_JSON", "[]")
-        .env_remove("FACTORY_SLOT");
+        // Hermetic budgets: scrub ambient service env; per-test
+        // TIMEOUT_IMPL/REVIEW overrides are applied after this builder.
+        .env_remove("FACTORY_SLOT")
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("MAX_CONCURRENT")
+        .env_remove("TIMEOUT_IMPL")
+        .env_remove("TIMEOUT_REVIEW");
     cmd
 }
 

@@ -191,7 +191,15 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
         .env("ADAPTER_LOG", &h.adapter_log)
         .env("GH_VIEWS_DIR", &h.views)
         .env("GH_LIST_JSON", "[]")
-        .env_remove("FACTORY_SLOT");
+        // Hermetic budgets: the dogfood service exports MAX_ATTEMPTS=3 /
+        // MAX_CONCURRENT=3, which must not leak into tests that pin the
+        // code defaults (budget 2, serial). Explicit per-test .env()
+        // overrides still win (applied after the builder returns).
+        .env_remove("FACTORY_SLOT")
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("MAX_CONCURRENT")
+        .env_remove("TIMEOUT_IMPL")
+        .env_remove("TIMEOUT_REVIEW");
     cmd
 }
 
