@@ -63,6 +63,14 @@ pub enum Commands {
         /// Show one fork by name or number instead of the attempt history.
         #[arg(long, value_name = "NAME|NUMBER")]
         fork: Option<String>,
+        /// Render the latest attempt's agent conversation (assistant turns,
+        /// thinking, tool calls, results) instead of the raw tool-output log.
+        /// Bounded to the newest 20 items (`--tail N` overrides, `0` means
+        /// full). Read-only: rendering reads session file bytes only and
+        /// never attaches to the live session — opening the live session
+        /// in another agent process stays forbidden.
+        #[arg(long)]
+        transcript: bool,
     },
     /// Fork a ticket attempt at a chosen log entry into a named experiment
     /// line (spec #65: fork creation + isolation in ticket #80, lineage +
@@ -1165,7 +1173,8 @@ pub struct TicketAttemptView {
     pub truncated: bool,
 }
 
-/// One ticket as the detail page sees it: body plus attempt history.
+/// One ticket as the detail page sees it: body plus attempt history plus
+/// the latest attempt's normalized agent conversation (ticket #93).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TicketDetail {
     pub number: u64,
@@ -1174,6 +1183,10 @@ pub struct TicketDetail {
     pub labels: Vec<String>,
     pub state: String,
     pub attempts: Vec<TicketAttemptView>,
+    /// Latest attempt's conversation pane (the same items
+    /// `factory log --transcript` renders). `None` when the ticket has no
+    /// attempts; `Some` with `session: None` when no session was recorded.
+    pub transcript: Option<TicketTranscriptPane>,
 }
 
 /// Calm sentence when the ticket has no attempts yet (Bea: ready, not broken).
@@ -1274,6 +1287,7 @@ pub fn ticket_detail(number: u64, tail: usize) -> Option<TicketDetail> {
         labels: issue.labels,
         state: issue.state,
         attempts: ticket_attempt_views(number, tail),
+        transcript: ticket_transcript_pane(number),
     })
 }
 
@@ -1306,14 +1320,26 @@ pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
         "labels": detail.labels,
         "state": detail.state,
         "attempts": attempts,
+        "transcript_pane": detail.transcript.as_ref().map(|p| serde_json::json!({
+            "ticket": p.ticket,
+            "attempt": p.attempt_no,
+            "slot": p.slot,
+            "session": p.session,
+            "items": p.items,
+            "total": p.total,
+            "truncated": p.truncated,
+            "partial": p.partial,
+        })),
     })
 }
 
 /// Fragment HTML for one ticket (the polling unit). Pure over the detail
 /// so tests assert markers without a server: `data-ticket` plus
 /// `data-ticket-body`, per-attempt `data-attempt` with `data-summary`
-/// before `data-transcript`, and `data-truncated` naming the bound when
-/// older lines were dropped.
+/// before `data-transcript`, `data-truncated` naming the bound when older
+/// lines were dropped, and the agent-conversation pane
+/// (`data-transcript-pane`) rendering the same normalized items
+/// `factory log --transcript` shows.
 pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
     let mut html = String::new();
     html.push_str(&format!(
@@ -1354,6 +1380,9 @@ pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
             html.push_str("</li>");
         }
         html.push_str("</ol>");
+    }
+    if let Some(pane) = detail.transcript.as_ref() {
+        html.push_str(&ticket_transcript_pane_html(pane));
     }
     html
 }
@@ -10538,6 +10567,484 @@ fn log_tail(text: &str, tail: usize) -> (String, bool) {
 }
 
 // ---------------------------------------------------------------------------
+// TRANSCRIPT (ticket #93): normalized agent conversation
+//
+// The attempt log shows tool output (what happened); the agent session
+// file shows the conversation (what was said and decided): the user brief,
+// assistant turns, thinking, tool calls, results. This section reduces one
+// session file to typed items — one reducer every surface renders — so the
+// CLI and the UI never parse jsonl twice. Unknown entry types are skipped
+// by design (a live file may hold flush markers, not conversation); corrupt
+// lines yield partial items plus a named gap, never an error. Reads are
+// file reads only: rendering never touches a live run, and a missing
+// session reads calmly (an attempt may predate its session).
+// ---------------------------------------------------------------------------
+
+/// Default transcript items shown (`--tail 0` means full). Items are
+/// denser than log lines, so this is smaller than LOG_DEFAULT_TAIL.
+pub const TRANSCRIPT_DEFAULT_TAIL: usize = 20;
+/// Per-item text cap: full turns survive, runaway tool output does not.
+const TRANSCRIPT_ITEM_CAP: usize = 4000;
+/// Override for the agent sessions root in tests
+/// (`$HOME/.pi/agent/sessions` in production).
+const PI_SESSIONS_DIR_ENV: &str = "FACTORY_PI_SESSIONS_DIR";
+
+/// One normalized transcript row: the user brief, assistant prose, thinking,
+/// one tool call (name + key arguments), or one tool result. `name` carries
+/// the tool name for calls/results, else empty.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct TranscriptItem {
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    pub text: String,
+}
+
+/// Char-boundary-safe clip with an ellipsis marker when cut.
+fn transcript_clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(n).collect();
+    format!("{cut}[\u{2026}]")
+}
+
+fn transcript_text_block(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|b| match b {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(m) => {
+                    m.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Reduce one session file to items plus the count of skipped lines
+/// (blank lines are ignored, unparsable ones are counted — a live file may
+/// be mid-flush). Never fails: corrupt input yields partial items, never
+/// an error. THE shared normalization: both the CLI renderer and the UI
+/// pane below consume these items, so no surface parses jsonl twice.
+pub fn session_transcript_items(text: &str) -> (Vec<TranscriptItem>, usize) {
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if entry.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let message = entry.get("message");
+        let role = message
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        match role {
+            "user" => {
+                let text = message
+                    .map(|m| transcript_text_block(&m["content"]))
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    items.push(TranscriptItem {
+                        kind: "user".to_string(),
+                        name: String::new(),
+                        text: transcript_clip(&text, TRANSCRIPT_ITEM_CAP),
+                    });
+                }
+            }
+            "assistant" => {
+                let empty = Vec::new();
+                let blocks = message
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .unwrap_or(&empty);
+                for block in blocks {
+                    let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match btype {
+                        "thinking" => {
+                            let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                            if !text.trim().is_empty() {
+                                items.push(TranscriptItem {
+                                    kind: "thinking".to_string(),
+                                    name: String::new(),
+                                    text: transcript_clip(text.trim(), 300),
+                                });
+                            }
+                        }
+                        "text" => {
+                            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            if !text.trim().is_empty() {
+                                items.push(TranscriptItem {
+                                    kind: "assistant".to_string(),
+                                    name: String::new(),
+                                    text: transcript_clip(text.trim(), TRANSCRIPT_ITEM_CAP),
+                                });
+                            }
+                        }
+                        "toolCall" => {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let args = block
+                                .get("arguments")
+                                .map(|a| {
+                                    serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string())
+                                })
+                                .unwrap_or_else(|| "{}".to_string());
+                            items.push(TranscriptItem {
+                                kind: "tool_call".to_string(),
+                                name: name.to_string(),
+                                text: transcript_clip(&args, 200),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "toolResult" => {
+                let name = message
+                    .and_then(|m| m.get("toolName"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let empty = Vec::new();
+                let content = message
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .unwrap_or(&empty);
+                let text: Vec<String> = content
+                    .iter()
+                    .filter_map(|b| {
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .filter(|t| !t.trim().is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                if !text.is_empty() {
+                    items.push(TranscriptItem {
+                        kind: "tool_result".to_string(),
+                        name: name.to_string(),
+                        text: transcript_clip(&text.join("\n"), 600),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (items, skipped)
+}
+
+/// Agent sessions root: override-first for tests, home-based in
+/// production. Missing/unset home reads as no sessions (calm).
+fn pi_sessions_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(PI_SESSIONS_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return PathBuf::from(".pi/agent/sessions");
+    }
+    PathBuf::from(home).join(".pi/agent/sessions")
+}
+
+/// Latest session file whose recorded cwd matches the attempt worktree:
+/// session dirs are keyed by worktree path, but the key encoding is the
+/// agent's business, so match on the recorded `cwd` of each dir's newest
+/// file instead of reconstructing the key. Read-only; `None` when
+/// nothing matches (attempt predates its session, or none was kept).
+pub fn resolve_attempt_session(state: &std::path::Path, worktree: &str) -> Option<PathBuf> {
+    let root = pi_sessions_dir();
+    let dirs = std::fs::read_dir(&root).ok()?;
+    let mut best: Option<(String, PathBuf)> = None;
+    for dir in dirs.flatten() {
+        if !dir.path().is_dir() {
+            continue;
+        }
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if files.is_empty() {
+            continue;
+        }
+        files.sort();
+        let file = files.last().cloned()?;
+        let head = std::fs::read_to_string(&file).ok()?;
+        let first = head.lines().find(|l| !l.trim().is_empty())?;
+        let entry: serde_json::Value = serde_json::from_str(first).ok()?;
+        let cwd = entry.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+        let matches = cwd == worktree
+            || Path::new(&cwd) == state.join(worktree)
+            || cwd == state.join(worktree).to_string_lossy();
+        if !matches {
+            continue;
+        }
+        let key = file.file_name()?.to_string_lossy().into_owned();
+        if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+            best = Some((key, file));
+        }
+    }
+    best.map(|(_, file)| file)
+}
+
+/// Human transcript: one readable block per item, oldest first.
+/// `total` is the full item count so a bounded view states its window
+/// honestly instead of understating it.
+fn render_transcript_human(
+    ticket: u64,
+    attempt_no: u64,
+    slot: &str,
+    items: &[TranscriptItem],
+    total: usize,
+) -> String {
+    let mut out = format!(
+        "Transcript for ticket {ticket} attempt {attempt_no} (slot {slot}, {total} turns):\n",
+    );
+    for item in items {
+        match item.kind.as_str() {
+            "user" => out.push_str(&format!("\n[user]\n{}\n", item.text)),
+            "assistant" => out.push_str(&format!("\n[agent]\n{}\n", item.text)),
+            "thinking" => out.push_str(&format!("\n[thinking]\n{}\n", item.text)),
+            "tool_call" => out.push_str(&format!("\n[tool {}({})]\n", item.name, item.text)),
+            "tool_result" => out.push_str(&format!("\n[result {}]\n{}\n", item.name, item.text)),
+            _ => out.push_str(&format!("\n[{}]\n{}\n", item.kind, item.text)),
+        }
+    }
+    out
+}
+
+/// `--transcript` read path for `log`: latest attempt's session file
+/// reduced to items, bounded to the newest `tail` items (`0` = full).
+/// An observer like every log path: missing sessions and partial files
+/// read calmly with exit 0, never an error shape.
+fn cmd_log_transcript(ticket: u64, attempt: &DispatchAttempt, tail: usize, json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let slot = format!("T{ticket}-a{}", attempt.attempt_no);
+    let Some(file) = resolve_attempt_session(&state, &attempt.worktree) else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"ticket": ticket, "attempt": attempt.attempt_no, "slot": slot, "session": null, "items": []})
+            );
+        } else {
+            println!(
+                "Ticket {ticket} attempt {} has no recorded session yet.",
+                attempt.attempt_no
+            );
+        }
+        return 0;
+    };
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let (items, skipped) = session_transcript_items(&text);
+    let total = items.len();
+    let (shown, truncated) = if tail == 0 || items.len() <= tail {
+        (items, false)
+    } else {
+        (items[items.len() - tail..].to_vec(), true)
+    };
+    if json {
+        let mut doc = serde_json::json!({
+            "ticket": ticket,
+            "attempt": attempt.attempt_no,
+            "slot": slot,
+            "session": file.display().to_string(),
+            "items": shown,
+            "truncated": truncated,
+        });
+        if skipped > 0 {
+            doc["partial"] = serde_json::json!(format!(
+                "session file partially unreadable ({skipped} lines skipped)"
+            ));
+        }
+        println!("{doc}");
+        return 0;
+    }
+    print!(
+        "{}",
+        render_transcript_human(ticket, attempt.attempt_no, &slot, &shown, total)
+    );
+    if truncated {
+        println!("\n(showing newest {tail} of {total} items; --tail 0 for full)");
+    }
+    if skipped > 0 {
+        println!("(session file partially unreadable: {skipped} lines skipped)");
+    }
+    0
+}
+
+/// One ticket's agent-conversation pane as the UI sees it: the latest
+/// attempt's normalized items (the same items `factory log --transcript`
+/// renders, through the same `session_transcript_items` reducer), bounded
+/// to the newest TRANSCRIPT_DEFAULT_TAIL items. `session` is `None` when
+/// no session file was recorded yet — a calm empty pane, never an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketTranscriptPane {
+    pub ticket: u64,
+    pub attempt_no: u64,
+    pub slot: String,
+    pub session: Option<String>,
+    pub items: Vec<TranscriptItem>,
+    pub total: usize,
+    pub truncated: bool,
+    pub partial: usize,
+}
+
+/// Read-only pane assembly: latest attempt (same newest-first order as
+/// `cmd_log`), session file resolved worktree-keyed, items reduced once.
+/// Missing/unreadable ledger reads as no pane (`None`); a missing session
+/// reads as a pane with `session: None`. File reads only — rendering
+/// never disturbs a live run.
+pub fn ticket_transcript_pane(ticket: u64) -> Option<TicketTranscriptPane> {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let mut entries: Vec<&DispatchAttempt> = ledger
+        .attempts
+        .iter()
+        .filter(|a| a.ticket == ticket)
+        .collect();
+    entries.sort_by(|a, b| b.attempt_no.cmp(&a.attempt_no).then(b.id.cmp(&a.id)));
+    let latest = entries.first()?;
+    let slot = format!("T{ticket}-a{}", latest.attempt_no);
+    let Some(file) = resolve_attempt_session(&state, &latest.worktree) else {
+        return Some(TicketTranscriptPane {
+            ticket,
+            attempt_no: latest.attempt_no,
+            slot,
+            session: None,
+            items: Vec::new(),
+            total: 0,
+            truncated: false,
+            partial: 0,
+        });
+    };
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let (items, skipped) = session_transcript_items(&text);
+    let total = items.len();
+    let (shown, truncated) = if items.len() <= TRANSCRIPT_DEFAULT_TAIL {
+        (items, false)
+    } else {
+        (
+            items[items.len() - TRANSCRIPT_DEFAULT_TAIL..].to_vec(),
+            true,
+        )
+    };
+    Some(TicketTranscriptPane {
+        ticket,
+        attempt_no: latest.attempt_no,
+        slot,
+        session: Some(file.display().to_string()),
+        items: shown,
+        total,
+        truncated,
+        partial: skipped,
+    })
+}
+
+/// Calm sentence when the attempt has no recorded session yet (UI twin of
+/// the CLI's missing-session line: ready, not broken).
+pub fn transcript_no_session_sentence(ticket: u64, attempt_no: u64, slot: &str) -> String {
+    format!("Ticket {ticket} attempt {attempt_no} (slot {slot}) has no recorded session yet.")
+}
+
+/// Pane HTML for one transcript (the polling unit rides inside the ticket
+/// fragment, so it refreshes with the other fragments). Pure over the pane
+/// so tests assert markers without a server: `data-transcript-pane` with
+/// per-item `data-transcript-item` carrying the item kind, tool names in
+/// `data-tool-name`, item text in `data-transcript-text`, plus
+/// `data-transcript-gap` when corrupt lines were skipped and
+/// `data-transcript-truncated` naming the bound.
+pub fn ticket_transcript_pane_html(pane: &TicketTranscriptPane) -> String {
+    let mut html = String::new();
+    html.push_str(&format!(
+        "<section data-transcript-pane data-slot=\"{}\"><h2>Agent conversation (slot {})</h2>",
+        escape_html(&pane.slot),
+        escape_html(&pane.slot),
+    ));
+    let Some(session) = pane.session.as_deref() else {
+        html.push_str(&format!(
+            "<p data-no-transcript-session>{}</p>",
+            escape_html(&transcript_no_session_sentence(
+                pane.ticket,
+                pane.attempt_no,
+                &pane.slot
+            )),
+        ));
+        html.push_str("</section>");
+        return html;
+    };
+    html.push_str(&format!(
+        "<p data-transcript-source>Recorded session: <code>{}</code>. Matches <code>factory log {} --transcript</code>.</p>",
+        escape_html(session),
+        pane.ticket,
+    ));
+    if pane.items.is_empty() {
+        html.push_str("<p data-transcript-empty>(no conversation recorded yet)</p>");
+    } else {
+        html.push_str("<div data-transcript-items>");
+        for item in &pane.items {
+            let kind_label = match item.kind.as_str() {
+                "user" => "user",
+                "assistant" => "agent",
+                "thinking" => "thinking",
+                "tool_call" => "tool call",
+                "tool_result" => "result",
+                other => other,
+            };
+            html.push_str(&format!(
+                "<article data-transcript-item=\"{}\"><p data-transcript-kind>{}</p>",
+                escape_html(&item.kind),
+                kind_label,
+            ));
+            if (item.kind == "tool_call" || item.kind == "tool_result") && !item.name.is_empty() {
+                html.push_str(&format!(
+                    "<p data-tool-name>{}</p>",
+                    escape_html(&item.name),
+                ));
+            }
+            html.push_str(&format!(
+                "<p data-transcript-text>{}</p></article>",
+                escape_html(&item.text),
+            ));
+        }
+        html.push_str("</div>");
+    }
+    if pane.truncated {
+        html.push_str(&format!(
+            "<p data-transcript-truncated>Showing the newest {} of {} items \u{2014} older items are hidden. Full conversation: <code>factory log {} --transcript --tail 0</code>.</p>",
+            pane.items.len(),
+            pane.total,
+            pane.ticket,
+        ));
+    }
+    if pane.partial > 0 {
+        html.push_str(&format!(
+            "<p data-transcript-gap>Session file partially unreadable: {} lines skipped \u{2014} showing the items that parsed.</p>",
+            pane.partial,
+        ));
+    }
+    html.push_str("</section>");
+    html
+}
+
+// ---------------------------------------------------------------------------
 // FORK (ticket #80, spec #65 slice: fork creation + isolation)
 //
 // Experiments that start from full context without risking the original.
@@ -11344,7 +11851,13 @@ pub fn cmd_fork(
     0
 }
 
-pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool) -> i32 {
+pub fn cmd_log(
+    ticket_raw: &str,
+    tail: usize,
+    fork_sel: Option<&str>,
+    transcript: bool,
+    json: bool,
+) -> i32 {
     let ticket = match parse_issue_number(ticket_raw) {
         Ok(n) => n,
         Err(e) => {
@@ -11360,6 +11873,39 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
             return 1;
         }
     };
+    // Transcript read path: the latest attempt's conversation, not the log.
+    // --fork selects a different history view, so the combination is refused
+    // plainly rather than guessed at.
+    if transcript {
+        if fork_sel.is_some() {
+            eprintln!("log: --transcript with --fork is not supported yet");
+            return 1;
+        }
+        let mut latest: Vec<&DispatchAttempt> = ledger
+            .attempts
+            .iter()
+            .filter(|a| a.ticket == ticket)
+            .collect();
+        latest.sort_by(|a, b| b.attempt_no.cmp(&a.attempt_no).then(b.id.cmp(&a.id)));
+        match latest.first() {
+            None => {
+                if json {
+                    println!("{}", serde_json::json!({"ticket": ticket, "attempts": []}));
+                } else {
+                    println!("Ticket {ticket}: no attempts yet.");
+                }
+                return 0;
+            }
+            Some(a) => {
+                let tail_items = if tail == LOG_DEFAULT_TAIL {
+                    TRANSCRIPT_DEFAULT_TAIL
+                } else {
+                    tail
+                };
+                return cmd_log_transcript(ticket, a, tail_items, json);
+            }
+        }
+    }
     // Fork read path: addressable by name or number in daily commands.
     if let Some(sel) = fork_sel {
         let Some(f) = resolve_fork(&ledger, ticket, sel) else {
@@ -15595,7 +16141,12 @@ pub fn run() -> i32 {
             0
         }
         Commands::Status => cmd_status(cli.json),
-        Commands::Log { ticket, tail, fork } => cmd_log(&ticket, tail, fork.as_deref(), cli.json),
+        Commands::Log {
+            ticket,
+            tail,
+            fork,
+            transcript,
+        } => cmd_log(&ticket, tail, fork.as_deref(), transcript, cli.json),
         Commands::Facts { action } => match action {
             FactsAction::Show { path, at } => cmd_facts_show(cli.json, path.as_deref(), at),
             FactsAction::History { path, limit } => cmd_facts_history(cli.json, &path, limit),
