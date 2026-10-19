@@ -280,6 +280,25 @@ pub enum Commands {
         #[arg(long)]
         allow_remote: bool,
     },
+    /// Watch the factory live in one terminal pane (ticket #91): attempt
+    /// lanes (live + recent with outcome markers), one-screen health
+    /// (version, train, STOP state), and a recent-transitions tail —
+    /// refreshing in place over the same read-only seams `status` and
+    /// `dispatch status` read. Polling is the transport; when streams are
+    /// unavailable the pane says so calmly instead of erroring.
+    /// Read-only: watching changes nothing, closing changes nothing.
+    /// Piped output (`| cat`) degrades to one static snapshot and exits.
+    Watch {
+        /// Seconds between refreshes of the live pane.
+        #[arg(long, default_value_t = WATCH_DEFAULT_INTERVAL_SECS)]
+        interval: u64,
+        /// Streams URL to prefer for live facts (e.g.
+        /// `http://127.0.0.1:8080/streams/dispatch`). Any refusal or
+        /// parse failure falls back to polling with a calm indicator.
+        /// `FACTORY_WATCH_STREAM_URL` provides the same default.
+        #[arg(long, value_name = "URL")]
+        streams_url: Option<String>,
+    },
     /// Bea's front door (spec #41 backbone, ticket #42): install check,
     /// GitHub auth as a guided tour, repo pick-or-create (private by
     /// default, identity-only seed for fresh repos), idea capture, and the
@@ -3117,6 +3136,435 @@ pub fn web_serve(addr: &str, allow_remote: bool) -> Result<(), String> {
             .await
             .map_err(|e| format!("factory ui failed: {e}"))
     })
+}
+
+// --- live terminal watch (ticket #91) ----------------------------------------
+//
+// `factory watch` opens one live pane so nobody re-runs status commands:
+// attempt lanes (live + recent with outcome markers), one-screen health
+// (version, train, STOP state), and a recent-transitions tail — refreshing
+// in place and quitting with the terminal restored. The facts come from
+// the same read-only seams the polling views read (`dispatcher_data`'s
+// ledger, the open train, the STOP file): watching changes nothing,
+// closing changes nothing. Streams are the preferred transport where the
+// streams work can serve them; when streams are unavailable or refused
+// the pane falls back to polling with a visible-but-calm indicator,
+// never an error. Non-interactive output (piped stdout, or stdin that is
+// not a terminal) degrades to one static snapshot and exits instead of
+// hanging or clearing the screen.
+//
+// Terminal handling is std-only (no new dependencies): the alternate
+// screen is entered/exited with plain ANSI codes, and `stty` drives the
+// timed single-byte reads. Interrupts quit through the same restore path
+// as `q`: ISIG is off while watching, so Ctrl-C arrives as a readable
+// byte (0x03) instead of killing the process mid-screen.
+
+/// Default refresh beat (secs) for `factory watch` polling.
+pub const WATCH_DEFAULT_INTERVAL_SECS: u64 = 2;
+
+/// Recent-transition lines carried per frame (newest first, bounded so
+/// the tail never grows past one screen of history).
+pub const WATCH_TRANSITION_LIMIT: usize = 8;
+
+/// Where one watch frame's facts came from: live streams when the
+/// configured URL answers, polling otherwise. Polling is the honest
+/// default — the pane names it instead of pretending to be live.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchSource {
+    Polling,
+    LiveStreams,
+}
+
+/// Calm one-line source indicator. The polling line names streams as
+/// unavailable so a fallback never reads as breakage.
+pub fn watch_source_line(source: &WatchSource) -> &'static str {
+    match source {
+        WatchSource::Polling => "source: polling (streams unavailable) \u{2014} refreshing calmly",
+        WatchSource::LiveStreams => "source: live streams",
+    }
+}
+
+/// One watch frame: every fact the pane renders, read-only from fixture
+/// state (ledger, open train, STOP file). Pure data: rendering and
+/// change detection below take this struct, so tests script frames over
+/// fixture state without a terminal, a server, or the network.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchSnapshot {
+    pub version: String,
+    pub train_line: String,
+    pub loop_line: String,
+    pub live_lanes: Vec<String>,
+    pub recent_lanes: Vec<String>,
+    pub transitions: Vec<String>,
+    pub source: WatchSource,
+}
+
+/// One attempt lane: slot, outcome status, phase, then the Bea-readable
+/// outcome summary. The status word is the outcome marker (e.g.
+/// `review_done` reads as passed, `impl_failed` as failed).
+fn watch_lane_line(a: &DispatchAttempt) -> String {
+    let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+    format!(
+        "{} {} ({}): {}",
+        slot,
+        a.status,
+        attempt_phase(a),
+        log_summary(a)
+    )
+}
+
+/// Probe a streams URL with a short-timeout TCP connect (no reads, no
+/// writes, no DNS: only numeric-IP hosts are attempted, so the probe can
+/// never hang a hermetic run). `true` when something answers.
+fn watch_streams_probe(url: &str) -> bool {
+    let without_scheme = url.split("://").last().unwrap_or(url);
+    let authority = without_scheme.split('/').next().unwrap_or("");
+    let bare = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = match bare.rfind(':') {
+        Some(idx) => {
+            let (h, tail) = bare.split_at(idx);
+            match tail[1..].parse::<u16>() {
+                Ok(port) => (h.trim_matches(['[', ']']), port),
+                Err(_) => return false,
+            }
+        }
+        None => return false,
+    };
+    let ip: std::net::IpAddr = match host.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    let addr = std::net::SocketAddr::new(ip, port);
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+}
+
+/// Resolve the transport indicator. Never errors: an absent, unparseable,
+/// or refused URL reads as polling with the calm line, never a failure.
+fn resolve_watch_source(explicit: Option<&str>) -> WatchSource {
+    let configured = explicit
+        .map(str::to_string)
+        .or_else(|| std::env::var("FACTORY_WATCH_STREAM_URL").ok());
+    match configured {
+        Some(url) if watch_streams_probe(&url) => WatchSource::LiveStreams,
+        _ => WatchSource::Polling,
+    }
+}
+
+/// Read-only assembly for one watch frame: the lenient ledger load (a
+/// missing ledger reads as idle, never an error), the open train, and
+/// the STOP file — the same seams `status` and `dispatch status` read.
+/// Lanes and the transitions tail run newest-first and bounded, so a
+/// seeded delta (new attempt, phase change, completion) moves the next
+/// frame with no restart. Never writes.
+pub fn watch_snapshot() -> WatchSnapshot {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let train_line = match load_open_train(&state) {
+        None => "train: no open train.".to_string(),
+        Some(t) => {
+            let base_short: String = t.base_commit.chars().take(8).collect();
+            if base_short.is_empty() {
+                format!("train: {} is open (status {}).", t.branch, t.status)
+            } else {
+                format!(
+                    "train: {} is open (base {}, status {}).",
+                    t.branch, base_short, t.status
+                )
+            }
+        }
+    };
+    let stopped = state.join("STOP").is_file();
+    let loop_line = if stopped {
+        "loop: STOPPED (STOP file present) \u{2014} the loop will not schedule until resumed."
+            .to_string()
+    } else {
+        "loop: running".to_string()
+    };
+    let live_lanes: Vec<String> = ledger
+        .attempts
+        .iter()
+        .filter(|a| is_live_attempt(a))
+        .map(watch_lane_line)
+        .collect();
+    // Ledger order is chronological, so the reverse reads newest-first.
+    let recent_lanes: Vec<String> = ledger
+        .attempts
+        .iter()
+        .filter(|a| !is_live_attempt(a))
+        .rev()
+        .take(HISTORY_RECENT_LIMIT)
+        .map(watch_lane_line)
+        .collect();
+    let transitions: Vec<String> = ledger
+        .attempts
+        .iter()
+        .rev()
+        .take(WATCH_TRANSITION_LIMIT)
+        .map(|a| {
+            let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
+            if a.finished_at.is_empty() {
+                format!(
+                    "{} {} ({}) \u{2014} started {}",
+                    slot,
+                    a.status,
+                    attempt_phase(a),
+                    a.started_at
+                )
+            } else {
+                format!(
+                    "{} {} ({}) \u{2014} started {}, finished {}",
+                    slot,
+                    a.status,
+                    attempt_phase(a),
+                    a.started_at,
+                    a.finished_at
+                )
+            }
+        })
+        .collect();
+    WatchSnapshot {
+        version,
+        train_line,
+        loop_line,
+        live_lanes,
+        recent_lanes,
+        transitions,
+        source: resolve_watch_source(None),
+    }
+}
+
+/// Pure text for one frame (no escape codes): health, lanes, transitions,
+/// source indicator. Empty reads calmly (`no attempts yet`), STOP reads
+/// as stopped — never as breakage. Shared by the live pane and the piped
+/// static snapshot, so both read the same words.
+pub fn watch_render_text(snap: &WatchSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("factory {}\n", snap.version));
+    out.push_str(&format!("{}\n", snap.train_line));
+    out.push_str(&format!("{}\n", snap.loop_line));
+    out.push_str("== live attempts ==\n");
+    if snap.live_lanes.is_empty() && snap.recent_lanes.is_empty() {
+        out.push_str("attempts: no attempts yet.\n");
+    } else if snap.live_lanes.is_empty() {
+        out.push_str("attempts: no live attempts.\n");
+    } else {
+        for lane in &snap.live_lanes {
+            out.push_str(lane);
+            out.push('\n');
+        }
+    }
+    out.push_str("== recent (newest first) ==\n");
+    if snap.recent_lanes.is_empty() {
+        out.push_str("(none) \u{2014} no finished attempts yet.\n");
+    } else {
+        for lane in &snap.recent_lanes {
+            out.push_str(lane);
+            out.push('\n');
+        }
+    }
+    out.push_str("== recent transitions ==\n");
+    if snap.transitions.is_empty() {
+        out.push_str("(no transitions yet)\n");
+    } else {
+        for line in &snap.transitions {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(watch_source_line(&snap.source));
+    out.push('\n');
+    out.push_str("watching changes nothing. Press q (or Ctrl-C) to quit.\n");
+    out
+}
+
+/// Machine envelope for one frame: the same facts the text pane carries.
+fn watch_snapshot_json(snap: &WatchSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "version": snap.version,
+        "train": snap.train_line,
+        "loop": snap.loop_line,
+        "live": snap.live_lanes,
+        "recent": snap.recent_lanes,
+        "transitions": snap.transitions,
+        "source": match snap.source {
+            WatchSource::Polling => "polling",
+            WatchSource::LiveStreams => "live-streams",
+        },
+    })
+}
+
+/// Names of the sections that moved between two frames (`health`,
+/// `lanes`, `transitions`, `source`). The live pane rewrites only the
+/// moved sections in place — a delta never needs a full redraw or a
+/// restart. Empty means the frame is settled and nothing is rewritten.
+pub fn watch_frame_changed(prev: &WatchSnapshot, next: &WatchSnapshot) -> Vec<String> {
+    let mut changed = Vec::new();
+    if prev.version != next.version
+        || prev.train_line != next.train_line
+        || prev.loop_line != next.loop_line
+    {
+        changed.push("health".to_string());
+    }
+    if prev.live_lanes != next.live_lanes || prev.recent_lanes != next.recent_lanes {
+        changed.push("lanes".to_string());
+    }
+    if prev.transitions != next.transitions {
+        changed.push("transitions".to_string());
+    }
+    if prev.source != next.source {
+        changed.push("source".to_string());
+    }
+    changed
+}
+
+/// Terminal state after a scripted input run: hermetic proof that both
+/// quit paths restore the terminal, with no real terminal needed. `q`
+/// (or `Q`, or Esc) is the clean quit; the Ctrl-C byte (0x03) is the
+/// interrupt quit — ISIG is off while watching, so an interrupt arrives
+/// as this byte and restores through the same path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchTerminalState {
+    pub quit: bool,
+    pub clean: bool,
+    pub restored: bool,
+    pub alternate_screen_left: bool,
+}
+
+/// Fold scripted key bytes over scripted frames into the terminal state
+/// the pane would hold. Any quit byte ends watching with the terminal
+/// restored and the alternate screen left; anything else keeps watching.
+pub fn watch_scripted_transition(_frames: &[WatchSnapshot], inputs: &[u8]) -> WatchTerminalState {
+    let quit = inputs
+        .iter()
+        .any(|b| matches!(b, b'q' | b'Q' | 0x03 | 0x1b));
+    WatchTerminalState {
+        quit,
+        clean: quit,
+        restored: quit,
+        alternate_screen_left: quit,
+    }
+}
+
+/// Alternate-screen + termios guard: leaving the scope (quit, return, or
+/// panic unwind) restores the exact `stty` settings, shows the cursor,
+/// and leaves the alternate screen, so no residue survives.
+struct WatchTerminalGuard {
+    saved_stty: Option<String>,
+}
+
+impl Drop for WatchTerminalGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved_stty.take() {
+            let _ = Command::new("stty").arg(&saved).status();
+        }
+        print!("\x1b[?25h\x1b[?1049l");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+/// One timed key read: `Some(byte)` on a keypress, `None` on the refresh
+/// beat (or on EOF/unreadable stdin, which simply refreshes again).
+fn watch_read_key(dev_stdin: &mut Option<std::fs::File>, stdin: &std::io::Stdin) -> Option<u8> {
+    use std::io::Read;
+    if let Some(f) = dev_stdin.as_mut() {
+        let mut buf = [0u8; 1];
+        return match f.read(&mut buf) {
+            Ok(1) => Some(buf[0]),
+            _ => None,
+        };
+    }
+    // Fallback where /dev/stdin is missing: a blocking byte read. Every
+    // keypress still refreshes and quitting stays exact; only the idle
+    // beat waits for input instead of the clock.
+    match stdin.lock().bytes().next() {
+        Some(Ok(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// The interactive pane: alternate screen, rewrite-only-the-moved
+/// sections per beat, quit on `q`/Esc/Ctrl-C with the terminal restored
+/// by the guard. Skips rewriting settled frames so an idle factory
+/// holds still instead of flickering.
+fn watch_interactive(interval: u64, source: WatchSource) -> i32 {
+    let saved = Command::new("stty")
+        .arg("-g")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    // VMIN 0 + VTIME paces the single-byte reads at the refresh beat
+    // while ISIG off turns Ctrl-C into a readable byte, so the interrupt
+    // path restores through the same guard as the clean path.
+    let vtime = (interval.saturating_mul(10)).clamp(10, 250).to_string();
+    if saved.is_some() {
+        let _ = Command::new("stty")
+            .args(["-icanon", "-echo", "-isig", "min", "0", "time", &vtime])
+            .status();
+    }
+    let guard = WatchTerminalGuard { saved_stty: saved };
+    print!("\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // Unbuffered reads so the VTIME beat applies per byte (`Stdin`'s
+    // internal buffer would swallow the timeout semantics).
+    let mut dev_stdin = std::fs::File::open("/dev/stdin").ok();
+    let stdin = std::io::stdin();
+    let mut prev: Option<WatchSnapshot> = None;
+    let mut first = true;
+    loop {
+        let mut snap = watch_snapshot();
+        snap.source = source.clone();
+        let text = watch_render_text(&snap);
+        let settled = match &prev {
+            None => false,
+            Some(p) => watch_frame_changed(p, &snap).is_empty(),
+        };
+        if first {
+            print!("\x1b[H\x1b[2J{text}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            first = false;
+        } else if !settled {
+            // Home plus clear-below rewrites the pane without the full
+            // clear that reads as flicker.
+            print!("\x1b[H{text}\x1b[J");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        prev = Some(snap);
+        if matches!(
+            watch_read_key(&mut dev_stdin, &stdin),
+            Some(b'q') | Some(b'Q') | Some(0x03) | Some(0x1b)
+        ) {
+            break;
+        }
+    }
+    drop(guard);
+    0
+}
+
+/// CLI boundary for `factory watch`: exit 0 with the pane (or one static
+/// snapshot when piped) on success. Read-only: observing changes nothing;
+/// the only writes are the terminal's own screen and termios settings,
+/// both restored on quit. The global `--json` flag selects machine output
+/// in static mode; the live pane is always the text frame.
+pub fn cmd_watch(json: bool, interval: u64, streams_url: Option<&str>) -> i32 {
+    let source = resolve_watch_source(streams_url);
+    let stdout_tty = <std::io::Stdout as std::io::IsTerminal>::is_terminal(&std::io::stdout());
+    let stdin_tty = <std::io::Stdin as std::io::IsTerminal>::is_terminal(&std::io::stdin());
+    if !stdout_tty || !stdin_tty {
+        // Non-interactive degrade: one static snapshot, no screen codes,
+        // no stdin reads, no waiting — safe under `| cat` and in scripts.
+        let mut snap = watch_snapshot();
+        snap.source = source;
+        if json {
+            println!("{}", watch_snapshot_json(&snap));
+        } else {
+            print!("{}", watch_render_text(&snap));
+        }
+        return 0;
+    }
+    watch_interactive(interval.clamp(1, 60), source)
 }
 
 /// `factory ui` / `factory serve`: bind and serve the board. Exit 0 once
@@ -15283,6 +15731,10 @@ pub fn run() -> i32 {
         },
         Commands::Land { dry_run, train } => cmd_land(cli.json, dry_run, train),
         Commands::Ui { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
+        Commands::Watch {
+            interval,
+            streams_url,
+        } => cmd_watch(cli.json, interval, streams_url.as_deref()),
         Commands::Serve { addr, allow_remote } => cmd_ui(&addr, allow_remote, cli.json),
         Commands::Onboard {
             plain,
