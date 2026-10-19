@@ -5,6 +5,20 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+## 0.1.0-rc.10 — readable history: durations, real spend minutes, slots line
+
+### Presentation: history answers "how long" (no ticket)
+
+- Pre-cutover UTC civil timestamps count for minutes (spend-local;
+  reconcile metrics untouched): 70 old rows gain real durations and
+  the pending wall drains to a summary.
+- Every human span renders absolute bounds plus a duration —
+  `started …, finished … (took 71.0 min)` — in `status`, `dispatch
+  status`, `watch` transitions and `factory log`; `--json` untouched.
+- Spend lists measured + live rows; finished-pending rows collapse to
+  one summary line unless `--all`. `dispatch status` names the
+  resolved worker slots and their source.
+
 ## 0.1.0-rc.9 — supervised worker pool
 
 ### Concurrent attempts up to MAX_CONCURRENT, default serial (ticket #92)
