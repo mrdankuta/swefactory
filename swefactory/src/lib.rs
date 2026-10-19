@@ -9477,6 +9477,16 @@ pub fn cmd_dispatch_once(json: bool, dry_run: bool, idempotency_key: Option<&str
         }
     };
     let list: Vec<serde_json::Value> = serde_json::from_str(&list_text).unwrap_or_default();
+    // Oldest-ready-first: the tracker lists newest-first, but a pass works
+    // the queue in ascending ticket order so older tickets starve never.
+    // Numberless items sort last and are skipped below, as before.
+    let mut list = list;
+    list.sort_by_key(|item| {
+        item.get("number")
+            .and_then(|n| n.as_u64())
+            .or_else(|| item.as_u64())
+            .unwrap_or(u64::MAX)
+    });
     // Exactly-once keys (ticket #62, spec #59): the key binds to this
     // pass's operation fingerprint on first use. A repeat inside the
     // retention window replays the stored outcome (no double-admit, no
