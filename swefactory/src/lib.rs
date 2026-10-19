@@ -8670,6 +8670,20 @@ fn gh_relabel(ticket: u64, remove: Option<&str>, add: &str) {
     }
 }
 
+fn append_log_append(log_path: &std::path::Path, text: &str) {
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
 fn append_log(log_path: &std::path::Path, text: &str) {
     let mut existing = std::fs::read_to_string(log_path).unwrap_or_default();
     existing.push_str(text);
@@ -8728,11 +8742,33 @@ fn kill_process_tree(child: &mut std::process::Child) {
 }
 
 /// Run one phase (implement / verify / review) with slot + private TMPDIR
-/// isolation, appending all output to the attempt log. `timeout` bounds the
-/// wait for implement/review (None = unbounded, used by verify): on expiry
-/// the worker process tree is killed, the bound value is named in the log,
-/// and `TimedOut` carries the partial output. Never wedges: every path
-/// returns, killed or finished.
+/// isolation, streaming running output live to the attempt log.
+/// `timeout` bounds the wait for implement/review (None = unbounded,
+/// used by verify): on expiry the worker process tree is killed, the
+/// bound value is named in the log, and `TimedOut` carries the partial
+/// output. Never wedges: every path returns, killed or finished.
+///
+/// Live streaming (ticket #95): the attempt log grows line-buffered as
+/// the worker produces output, so `tail -f` and the future watch pane
+/// show movement during long phases instead of one burst at completion.
+/// A `running` header is appended before spawn (so a killed mid-stream
+/// log is a byte-prefix of the completed shape: header + flushed lines),
+/// each stdout/stderr line is appended verbatim as it arrives under one
+/// shared append-mode lock (slot-owned file: no two phases share a log,
+/// no two writers share a file, lines never interleave mid-line), and
+/// only the exit/timeout footer is appended at the end — the worker
+/// output section is never duplicated. The `PhaseResult` return strings
+/// keep the historical grouped shape (stdout + "\\n" + stderr) so the
+/// verdict reader and timeout callers see identical inputs.
+/// Non-blank output lines arrive in per-stream order and match the old
+/// capture-then-append content; blank-line framing may differ by flush
+/// boundaries (line-buffered splits), which no transcript parser or the
+/// `VERDICT:` reader depends on.
+///
+/// Reuse of the #85 partial-output path: transcript-bearing SSE scopes
+/// (`dispatcher-live`, `ticket`) already re-read these same log files at
+/// `stream_partial_ms()` (500ms default), so live appends surface to
+/// viewers within that bound with no SSE code change.
 #[allow(clippy::too_many_arguments)]
 fn run_phase(
     program: &str,
@@ -8746,7 +8782,11 @@ fn run_phase(
     ticket: u64,
     timeout: Option<std::time::Duration>,
 ) -> PhaseResult {
-    use std::io::Read;
+    use std::io::{BufRead, Write};
+    // Live header first: the log visibly grows from phase start, and a
+    // mid-stream kill leaves header + flushed lines as a prefix of the
+    // completed shape (append-only from here: flushed bytes never move).
+    append_log_append(log, &format!("--- {phase} {slot} running ---\n"));
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -8762,7 +8802,7 @@ fn run_phase(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            append_log(
+            append_log_append(
                 log,
                 &format!("--- {phase} failed to spawn {program}: {e} ---\n"),
             );
@@ -8770,24 +8810,75 @@ fn run_phase(
             return PhaseResult::Failure(String::new());
         }
     };
+    // Shared append-mode handle so the two pipe-drain threads serialize
+    // whole-line writes: per-file (slot-owned) and never mid-line mixed.
+    let live: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()
+        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
     // Drain both pipes on threads so a chatty worker can never block on a
-    // full pipe while the main thread polls the deadline.
+    // full pipe while the main thread polls the deadline. Each thread
+    // appends complete lines live (line-buffered) and collects its
+    // stream's raw bytes for the grouped return value.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
+    let live_out = live.clone();
     let out_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(ref mut p) = out_pipe {
-            let _ = p.read_to_end(&mut buf);
+        if let Some(p) = out_pipe.take() {
+            let mut reader = std::io::BufReader::new(p);
+            loop {
+                let mut chunk = Vec::new();
+                match reader.read_until(b'\n', &mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        buf.extend_from_slice(&chunk);
+                        if let Some(live) = live_out.as_ref() {
+                            let text = String::from_utf8_lossy(&chunk).into_owned();
+                            let mut f = live.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = f.write_all(text.as_bytes());
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         buf
     });
+    let live_err = live.clone();
     let err_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(ref mut p) = err_pipe {
-            let _ = p.read_to_end(&mut buf);
+        if let Some(p) = err_pipe.take() {
+            let mut reader = std::io::BufReader::new(p);
+            loop {
+                let mut chunk = Vec::new();
+                match reader.read_until(b'\n', &mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        buf.extend_from_slice(&chunk);
+                        if let Some(live) = live_err.as_ref() {
+                            let text = String::from_utf8_lossy(&chunk).into_owned();
+                            let mut f = live.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = f.write_all(text.as_bytes());
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         buf
     });
+    // A final partial line without trailing newline still counts as
+    // flushed output: the drain threads forward it at EOF as-is, and the
+    // footers below start on their own line via append_log_append's
+    // leading newline normalization is intentionally absent — footers
+    // are full lines, so a missing trailing newline only glues the
+    // footer marker to the partial line, which no parser depends on.
+    // (In practice workers newline-terminate; tests pin line content.)
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -8800,10 +8891,10 @@ fn run_phase(
                     String::from_utf8_lossy(&out),
                     String::from_utf8_lossy(&err)
                 );
-                append_log(
-                    log,
-                    &format!("--- {phase} {slot} (exit {code}) ---\n{combined}\n"),
-                );
+                // Output already streamed live: footer only, never
+                // duplicated, so the completed log is running-header +
+                // live lines + exit footer + event.
+                append_log_append(log, &format!("--- {phase} {slot} (exit {code}) ---\n"));
                 log_event(log, attempt_id, ticket, phase, code);
                 if status.success() {
                     return PhaseResult::Success(combined);
@@ -8812,7 +8903,7 @@ fn run_phase(
             }
             Ok(None) => {}
             Err(e) => {
-                append_log(log, &format!("--- {phase} wait failed: {e} ---\n"));
+                append_log_append(log, &format!("--- {phase} wait failed: {e} ---\n"));
                 log_event(log, attempt_id, ticket, phase, 1);
                 kill_process_tree(&mut child);
                 let _ = child.wait();
@@ -8838,10 +8929,12 @@ fn run_phase(
                     String::from_utf8_lossy(&out),
                     String::from_utf8_lossy(&err)
                 );
-                append_log(
+                // Partial output already flushed live stays in order;
+                // only the timeout marker is appended (no duplication).
+                append_log_append(
                     log,
                     &format!(
-                        "--- {phase} {slot} timed out after {secs}s (phase timeout {secs}s exceeded) — worker process tree killed, resumable ---\n{combined}\n"
+                        "--- {phase} {slot} timed out after {secs}s (phase timeout {secs}s exceeded) — worker process tree killed, resumable ---\n"
                     ),
                 );
                 log_event(log, attempt_id, ticket, phase, 124);
