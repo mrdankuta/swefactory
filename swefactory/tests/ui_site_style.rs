@@ -58,6 +58,7 @@ fn every_page_shell_carries_the_stylesheet() {
                 stopped: false,
                 worktrees: vec![],
                 max_concurrent: 1,
+                concurrency_source: "default".to_string(),
                 tasks: vec![],
             }),
         ),

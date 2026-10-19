@@ -186,11 +186,15 @@ fn factory_cmd(h: &Harness, args: &[&str]) -> Command {
         .env("ADAPTER_LOG", &h.adapter_log)
         .env("GH_VIEWS_DIR", &h.views)
         .env("GH_LIST_JSON", "[]")
-        // Hermetic budgets: scrub ambient service env (MAX_ATTEMPTS=3 /
-        // MAX_CONCURRENT=3); explicit per-test .env() wins (applied later).
         .env_remove("FACTORY_SLOT")
-        .env_remove("MAX_ATTEMPTS")
+        // Hermetic worker pool (ticket #92): ambient slot env from the
+        // operator's shell must not flip tests into wave mode. Tests that
+        // need parallelism set the level explicitly after this. MAX_ATTEMPTS
+        // gets the same treatment: the attempt budget defaults to 2 and
+        // tests that need another budget set it explicitly.
         .env_remove("MAX_CONCURRENT")
+        .env_remove("FACTORY_MAX_CONCURRENT")
+        .env_remove("MAX_ATTEMPTS")
         .env_remove("TIMEOUT_IMPL")
         .env_remove("TIMEOUT_REVIEW");
     cmd

@@ -397,6 +397,12 @@ pub enum DispatchAction {
         /// reuse of one key across different operations is rejected.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Live worker slots for this pass (1-8, default 1). The same
+        /// setting lives on the dispatcher UI; a change applies from the
+        /// next pass with no restart. FACTORY_MAX_CONCURRENT (then legacy
+        /// MAX_CONCURRENT) provides the same value without the flag.
+        #[arg(long)]
+        concurrency: Option<usize>,
     },
     /// Loop single passes on the interval until the STOP file appears
     /// (Rust port of the bash `factory-dispatch daemon` loop).
@@ -404,6 +410,13 @@ pub enum DispatchAction {
         /// Seconds to sleep between passes.
         #[arg(long, default_value_t = 300)]
         interval: u64,
+        /// Live worker slots per pass (1-8, default 1): the same setting
+        /// the dispatcher UI carries. The flag sets the initial level
+        /// (persisted so the UI agrees); later passes re-resolve from the
+        /// environment and the saved setting, so a UI change applies
+        /// without restarting the daemon.
+        #[arg(long)]
+        concurrency: Option<usize>,
         /// Bound for the implement wait in seconds (flag wins over
         /// TIMEOUT_IMPL; bash parity default 1800).
         #[arg(long, value_name = "SECS")]
@@ -1470,6 +1483,9 @@ pub struct DispatcherData {
     pub stopped: bool,
     pub worktrees: Vec<String>,
     pub max_concurrent: usize,
+    /// Where the effective level comes from (ticket #92): `concurrency_source`.
+    /// The UI shows it beside the control so both surfaces agree at all times.
+    pub concurrency_source: String,
     /// Live task-graph nodes (ticket #74): the same live rows
     /// `factory dispatch graph` lists, so the polling fragment and the
     /// dispatcher-live stream carry the current graph. Empty reads as
@@ -1603,11 +1619,13 @@ pub fn dispatcher_data() -> DispatcherData {
             finished: a.finished_at.clone(),
         });
     }
+    let max_concurrent = dispatch_max_concurrent();
     DispatcherData {
         attempts,
         stopped,
         worktrees,
-        max_concurrent: dispatch_max_concurrent(),
+        max_concurrent,
+        concurrency_source: concurrency_source(&state).to_string(),
         tasks: live_task_graph_views(&ledger),
     }
 }
@@ -1627,6 +1645,25 @@ pub fn dispatcher_fragment_html(data: &DispatcherData) -> String {
     html.push_str(&format!(
         "<p data-cli>Matches <code>factory dispatch status</code> + <code>factory dispatch graph</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>. Brake: <code>factory dispatch stop</code> / <code>factory dispatch resume</code>. Slots: up to {} concurrent.</p>",
         data.max_concurrent
+    ));
+    // Worker-pool control (ticket #92): the same setting the CLI flag
+    // carries, with the same bounds and default. A change applies from
+    // the next pass with no restart.
+    html.push_str(&format!(
+        "<section data-concurrency><p data-concurrency-level=\"{}\">Worker slots: {} concurrent (bounds {}-{}`).</p>\
+        <p data-concurrency-source>Source: {}.</p>\
+        <form method=\"post\" action=\"/dispatch/concurrency\" data-concurrency-form>\
+        <label for=\"concurrency-level\">Worker slots ({}-{})</label>\
+        <input id=\"concurrency-level\" name=\"level\" value=\"{}\">\
+        <button type=\"submit\">Set worker slots</button></form></section>",
+        data.max_concurrent,
+        data.max_concurrent,
+        CONCURRENCY_MIN,
+        CONCURRENCY_MAX,
+        escape_html(&data.concurrency_source),
+        CONCURRENCY_MIN,
+        CONCURRENCY_MAX,
+        data.max_concurrent,
     ));
     if data.attempts.is_empty() {
         html.push_str(&format!(
@@ -1847,6 +1884,27 @@ pub async fn dispatcher_stop_handler() -> axum::response::Redirect {
 pub async fn dispatcher_resume_handler() -> axum::response::Redirect {
     let _ = cmd_dispatch_resume(false);
     axum::response::Redirect::to("/dispatch")
+}
+
+/// Worker-slot form for POST /dispatch/concurrency (one field: the new
+/// level as text, so out-of-bounds input fails calmly instead of 400ing
+/// on an empty body).
+#[derive(Debug, serde::Deserialize)]
+pub struct ConcurrencyForm {
+    pub level: String,
+}
+
+/// POST /dispatch/concurrency: persist the operator's level through the
+/// same bounds the CLI enforces, then back to the screen. The next pass
+/// reads it with no restart. Out-of-bounds input is refused with the
+/// bounds named and nothing written.
+pub async fn dispatcher_concurrency_handler(
+    axum::Form(form): axum::Form<ConcurrencyForm>,
+) -> Result<axum::response::Redirect, (axum::http::StatusCode, String)> {
+    match set_concurrency_level(&dispatch_state_dir(), form.level.trim()) {
+        Ok(_) => Ok(axum::response::Redirect::to("/dispatch")),
+        Err(e) => Err((axum::http::StatusCode::UNPROCESSABLE_ENTITY, e)),
+    }
 }
 
 // --- git + files views (ticket #33, spec #27) --------------------------------
@@ -3102,6 +3160,10 @@ pub fn web_router() -> axum::Router {
             "/dispatch/resume",
             axum::routing::post(dispatcher_resume_handler),
         )
+        .route(
+            "/dispatch/concurrency",
+            axum::routing::post(dispatcher_concurrency_handler),
+        )
         .route("/git", axum::routing::get(git_page_handler))
         .route("/fragments/git", axum::routing::get(git_fragment_handler))
         .route("/api/git", axum::routing::get(git_api_handler))
@@ -3991,6 +4053,10 @@ fn dispatcher_commit_state(data: &DispatcherData) -> serde_json::Value {
         "attempts": attempts,
         "tasks": tasks,
         "worktrees": data.worktrees,
+        // The pool level rides the commit feed (finding #6): a UI write
+        // that changes the level must be as audible as a STOP or a new
+        // attempt — otherwise the live pane stays silent on it.
+        "max_concurrent": data.max_concurrent,
     })
 }
 
@@ -4105,6 +4171,15 @@ fn summarize_dispatcher_change(old: &serde_json::Value, new: &serde_json::Value)
                 "dispatch loop resumed".to_string()
             },
         );
+    }
+    let old_level = old.get("max_concurrent").and_then(|v| v.as_u64());
+    let new_level = new.get("max_concurrent").and_then(|v| v.as_u64());
+    if old_level != new_level {
+        match (old_level, new_level) {
+            (Some(o), Some(n)) => out.push(format!("worker slots {o}\u{2192}{n}")),
+            (None, Some(n)) => out.push(format!("worker slots \u{2192}{n}")),
+            _ => {}
+        }
     }
     let mut before: std::collections::BTreeMap<String, (String, i64)> =
         std::collections::BTreeMap::new();
@@ -7930,6 +8005,33 @@ struct DispatchLedger {
     forks: Vec<ForkRecord>,
 }
 
+/// Ledger shared by a pass's worker threads (ticket #92): every mutation
+/// happens under this one mutex, so the in-memory state is always
+/// complete, and every persist carries the full state. Guards are always
+/// short-lived leaf blocks — never held across a subprocess wait — so
+/// workers overlap in real work while ledger writes stay serialized.
+/// A poisoned mutex (a worker panicked mid-guard) recovers its inner
+/// ledger: the next pass's stale-lease reaper converts any running row
+/// the panic left behind into a resumable checkpoint.
+type SharedLedger = std::sync::Mutex<DispatchLedger>;
+
+fn lock_ledger(shared: &SharedLedger) -> std::sync::MutexGuard<'_, DispatchLedger> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Mint a ledger row atomically (ticket #92): the row id, the push, and
+/// the row index resolve under ONE held guard, so concurrent wave workers
+/// can neither mint duplicate ids nor compute each other's index.
+/// Both admission paths (spec-gate refusal, fresh attempt) mint here;
+/// callers pass `id: 0` and use the returned authoritative id.
+fn push_attempt_row(shared: &SharedLedger, mut attempt: DispatchAttempt) -> (u64, usize) {
+    let mut ledger = lock_ledger(shared);
+    let id = ledger.attempts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+    attempt.id = id;
+    ledger.attempts.push(attempt);
+    (id, ledger.attempts.len() - 1)
+}
+
 /// One link in a fork's lineage chain, oldest-first (ticket #81,
 /// spec #65): `kind` is `"attempt"` (a fork rooted at an attempt line)
 /// or `"fork"` (a nested fork rooted at a parent fork line); `no` is
@@ -8267,12 +8369,90 @@ pub fn dispatch_state_dir() -> PathBuf {
         .join(".state")
 }
 
+/// Worker-pool bounds (ticket #92): the conservative default preserves
+/// today's serial pass byte-for-byte; the cap keeps parallel spend and
+/// worktree fan-out bounded. One setting, two surfaces: the CLI flag and
+/// the dispatcher UI read and write through the same resolver below.
+pub const CONCURRENCY_DEFAULT: usize = 1;
+pub const CONCURRENCY_MIN: usize = 1;
+pub const CONCURRENCY_MAX: usize = 8;
+
+/// Where the dispatcher UI persists the operator's level. The pass reads
+/// it fresh every time, so a change applies from the next pass with no
+/// restart. Never committed: local operator state, like the ledger.
+fn concurrency_file(state: &std::path::Path) -> PathBuf {
+    state.join("concurrency")
+}
+
+/// Parse one concurrency value against the shared bounds. `None` (absent)
+/// reads as the conservative default; anything outside 1-8 names the
+/// bounds. Single choke point so the CLI and the UI can never disagree.
+fn parse_concurrency(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(CONCURRENCY_DEFAULT),
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(n)
+                if (CONCURRENCY_MIN..=CONCURRENCY_MAX).contains(&n) =>
+            {
+                Ok(n)
+            }
+            _ => Err(format!(
+                "dispatch: concurrency {v} out of bounds ({CONCURRENCY_MIN}-{CONCURRENCY_MAX}, default {CONCURRENCY_DEFAULT})"
+            )),
+        },
+    }
+}
+
+/// Shared resolver (ticket #92): the CLI flag and the dispatcher UI agree
+/// at all times because both read through this one function. Precedence:
+/// explicit flag, then FACTORY_MAX_CONCURRENT, then legacy MAX_CONCURRENT,
+/// then the UI-persisted file, then the conservative default.
+pub fn resolve_max_concurrent(
+    flag: Option<usize>,
+    state: &std::path::Path,
+) -> Result<usize, String> {
+    if let Some(n) = flag {
+        return parse_concurrency(Some(&n.to_string()));
+    }
+    for key in ["FACTORY_MAX_CONCURRENT", "MAX_CONCURRENT"] {
+        if let Ok(v) = std::env::var(key) {
+            return parse_concurrency(Some(&v));
+        }
+    }
+    match std::fs::read_to_string(concurrency_file(state)) {
+        Ok(v) => parse_concurrency(Some(&v)),
+        Err(_) => Ok(CONCURRENCY_DEFAULT),
+    }
+}
+
+/// Where the effective level comes from: environment pins beat the saved
+/// UI setting, which beats the default. The UI shows this beside the
+/// control so the operator always knows what won.
+pub fn concurrency_source(state: &std::path::Path) -> &'static str {
+    for key in ["FACTORY_MAX_CONCURRENT", "MAX_CONCURRENT"] {
+        if std::env::var_os(key).is_some() {
+            return "environment (the saved setting is ignored until it is unset)";
+        }
+    }
+    if concurrency_file(state).is_file() {
+        return "saved setting (change it here or with --concurrency)";
+    }
+    "default (serial pass, unchanged behavior)"
+}
+
+/// Persist the operator's level from the dispatcher UI. Validates the
+/// same bounds the CLI enforces; the next pass reads it with no restart.
+pub fn set_concurrency_level(state: &std::path::Path, raw: &str) -> Result<usize, String> {
+    let n = parse_concurrency(Some(raw))?;
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("dispatch: cannot create {}: {e}", state.display()))?;
+    std::fs::write(concurrency_file(state), format!("{n}\n"))
+        .map_err(|e| format!("dispatch: cannot save concurrency: {e}"))?;
+    Ok(n)
+}
+
 fn dispatch_max_concurrent() -> usize {
-    std::env::var("MAX_CONCURRENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .max(1)
+    resolve_max_concurrent(None, &dispatch_state_dir()).unwrap_or(CONCURRENCY_DEFAULT)
 }
 
 fn dispatch_max_attempts() -> u64 {
@@ -8501,12 +8681,21 @@ fn print_paused_copy(resumable_present: bool) {
 /// (tmp + rename): a crash between the two leaves the previous ledger.
 fn checkpoint_phase(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     idx: usize,
     phase: &str,
 ) -> Result<(), String> {
     debug_assert!(ATTEMPT_PHASES.contains(&phase), "unknown phase {phase}");
-    ledger.attempts[idx].phase = phase.to_string();
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].phase = phase.to_string();
+    }
+    // Serialize + tmp-write + rename under one lock so concurrent worker
+    // saves can never interleave into a torn file, and rename order
+    // matches snapshot order (the disk always holds the newest snapshot
+    // taken, never an older one renamed later).
+    let _write = LEDGER_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ledger = lock_ledger(shared);
     std::fs::create_dir_all(state)
         .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
     let tmp = state.join("dispatch.json.tmp");
@@ -8521,6 +8710,25 @@ fn checkpoint_phase(
     std::fs::rename(&tmp, ledger_path(state)).map_err(|e| format!("cannot replace ledger: {e}"))?;
     Ok(())
 }
+
+/// Atomic ledger persist shared by every worker: serialize + tmp-write +
+/// rename under one lock so concurrent saves can never interleave into a
+/// torn file, and rename order matches snapshot order (the disk always
+/// holds the newest snapshot taken). Never holds the ledger lock while
+/// acquiring the save lock anywhere else, so no lock ordering cycles.
+static LEDGER_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn save_shared_ledger(state: &std::path::Path, shared: &SharedLedger) -> Result<(), String> {
+    let _write = LEDGER_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ledger = lock_ledger(shared);
+    save_ledger(state, &ledger)
+}
+
+/// Serializes concurrent train mutations (ticket #92): two workers whose
+/// reviews accept in the same wave must cut/merge into the train one at a
+/// time, exactly as sequential passes do. Lock order is always train-then-
+/// ledger (leaf ledger blocks only), so no deadlock cycle exists.
+static TRAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Exactly-once key retention horizon (ticket #62, spec #59): a repeat
 /// inside this window replays the stored outcome; older records read as
@@ -9133,7 +9341,16 @@ fn parse_verdict(text: &str) -> Option<String> {
 
 enum TicketOutcome {
     Done,
-    Skipped,
+    /// Admission refused: the human-readable reason (e.g. "not ready",
+    /// "waiting on open deps: #9") feeds the dry-run worker plan, which
+    /// names every skip instead of silently dropping it.
+    Skipped(String),
+    /// Dry-run survey only: the ticket would be admitted this pass
+    /// (`resume`: continue its checkpoint vs open a fresh attempt).
+    /// Never produced outside dry-run; changes nothing, writes nothing.
+    DryRunAdmit {
+        resume: bool,
+    },
 }
 
 // --- answer delivery (ticket #44, spec #41) -------------------------------
@@ -9347,15 +9564,18 @@ pub fn render_answers_section(answers: &[ParsedAnswer]) -> String {
 
 fn finish_attempt(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     idx: usize,
     status: &str,
     exit_code: i32,
 ) {
-    ledger.attempts[idx].status = status.to_string();
-    ledger.attempts[idx].exit_code = exit_code;
-    ledger.attempts[idx].finished_at = now_stamp();
-    if let Err(e) = save_ledger(state, ledger) {
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].status = status.to_string();
+        ledger.attempts[idx].exit_code = exit_code;
+        ledger.attempts[idx].finished_at = now_stamp();
+    }
+    if let Err(e) = save_shared_ledger(state, shared) {
         eprintln!("dispatch: {e}");
     }
 }
@@ -9410,22 +9630,25 @@ fn reap_stale_leases(state: &std::path::Path, ledger: &mut DispatchLedger) -> us
 /// (resume recreates it from the recorded phase). Counts as attempted.
 fn interrupt_attempt(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     idx: usize,
     log_path: &std::path::Path,
     worktree: &std::path::Path,
     ticket: u64,
     phase: &str,
 ) -> TicketOutcome {
-    let attempt_no = ledger.attempts[idx].attempt_no;
+    let attempt_no = lock_ledger(shared).attempts[idx].attempt_no;
     let slot = format!("T{ticket}-a{attempt_no}");
     append_log(
         log_path,
         &format!("interrupted during {phase} (slot {slot}) — resumable\n"),
     );
-    ledger.attempts[idx].status = format!("{phase}_interrupted");
-    ledger.attempts[idx].finished_at = now_stamp();
-    if let Err(e) = save_ledger(state, ledger) {
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].status = format!("{phase}_interrupted");
+        ledger.attempts[idx].finished_at = now_stamp();
+    }
+    if let Err(e) = save_shared_ledger(state, shared) {
         eprintln!("dispatch: {e}");
     }
     println!("  interrupted during {phase} — resumable next pass");
@@ -9449,7 +9672,7 @@ fn interrupt_attempt(
 #[allow(clippy::too_many_arguments)]
 fn expire_attempt(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     idx: usize,
     log_path: &std::path::Path,
     worktree: &std::path::Path,
@@ -9457,17 +9680,20 @@ fn expire_attempt(
     phase: &str,
     timeout_secs: u64,
 ) -> TicketOutcome {
-    let attempt_no = ledger.attempts[idx].attempt_no;
+    let attempt_no = lock_ledger(shared).attempts[idx].attempt_no;
     let slot = format!("T{ticket}-a{attempt_no}");
     append_log(
         log_path,
         &format!("expired: {phase} timed out after {timeout_secs}s (phase timeout {timeout_secs}s exceeded, worker killed) — resumable\n"),
     );
-    ledger.attempts[idx].status = format!("{phase}_interrupted");
-    ledger.attempts[idx].finished_at = now_stamp();
-    ledger.attempts[idx].timed_out = true;
-    ledger.attempts[idx].timeout_secs = timeout_secs;
-    if let Err(e) = save_ledger(state, ledger) {
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].status = format!("{phase}_interrupted");
+        ledger.attempts[idx].finished_at = now_stamp();
+        ledger.attempts[idx].timed_out = true;
+        ledger.attempts[idx].timeout_secs = timeout_secs;
+    }
+    if let Err(e) = save_shared_ledger(state, shared) {
         eprintln!("dispatch: {e}");
     }
     println!("  {phase} timed out after {timeout_secs}s (slot {slot}, worker killed) — resumable next pass");
@@ -9507,7 +9733,7 @@ struct PhaseCtx {
 /// replay from implement, the safe superset.
 fn run_attempt_phases(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     idx: usize,
     ctx: &PhaseCtx,
     start_phase: &str,
@@ -9549,14 +9775,14 @@ fn run_attempt_phases(
         // Implement checkpoint: committed before the implementer runs.
         // On failure settle as interrupted at the last committed phase
         // (ticket #75) — never leave the activated row running.
-        if let Err(e) = checkpoint_phase(state, ledger, idx, "implement") {
+        if let Err(e) = checkpoint_phase(state, shared, idx, "implement") {
             eprintln!("dispatch: {e}");
             append_log(log_path, &format!("checkpoint implement failed: {e}\n"));
-            let phase = attempt_phase(&ledger.attempts[idx]).to_string();
-            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, &phase);
+            let phase = attempt_phase(&lock_ledger(shared).attempts[idx]).to_string();
+            return interrupt_attempt(state, shared, idx, log_path, wt, ticket, &phase);
         }
         if simulated_kill_phase("implement") {
-            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "implement");
+            return interrupt_attempt(state, shared, idx, log_path, wt, ticket, "implement");
         }
         println!(
             "  implement: pi -p (slot {slot}, timeout {}s)",
@@ -9578,7 +9804,7 @@ fn run_attempt_phases(
             PhaseResult::TimedOut(_) => {
                 return expire_attempt(
                     state,
-                    ledger,
+                    shared,
                     idx,
                     log_path,
                     wt,
@@ -9590,7 +9816,7 @@ fn run_attempt_phases(
             PhaseResult::Failure(_) => {
                 println!("  implement failed — will retry next pass");
                 gh_comment(ticket, &format!("DISPATCH: implementer failed (attempt {attempt_no}/{max_attempts}). Log kept in dispatcher state."));
-                finish_attempt(state, ledger, idx, "impl_failed", 1);
+                finish_attempt(state, shared, idx, "impl_failed", 1);
                 remove_worktree(wt);
                 return TicketOutcome::Done;
             }
@@ -9608,20 +9834,20 @@ fn run_attempt_phases(
                 ticket,
                 &format!("DISPATCH: no check adapter found (attempt {attempt_no}/{max_attempts})."),
             );
-            finish_attempt(state, ledger, idx, "impl_failed", 1);
+            finish_attempt(state, shared, idx, "impl_failed", 1);
             remove_worktree(wt);
             return TicketOutcome::Done;
         };
         // Verify checkpoint: committed before the check adapter runs.
         // On failure settle as interrupted (ticket #75), never running.
-        if let Err(e) = checkpoint_phase(state, ledger, idx, "verify") {
+        if let Err(e) = checkpoint_phase(state, shared, idx, "verify") {
             eprintln!("dispatch: {e}");
             append_log(log_path, &format!("checkpoint verify failed: {e}\n"));
-            let phase = attempt_phase(&ledger.attempts[idx]).to_string();
-            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, &phase);
+            let phase = attempt_phase(&lock_ledger(shared).attempts[idx]).to_string();
+            return interrupt_attempt(state, shared, idx, log_path, wt, ticket, &phase);
         }
         if simulated_kill_phase("verify") {
-            return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "verify");
+            return interrupt_attempt(state, shared, idx, log_path, wt, ticket, "verify");
         }
         // Verify keeps its own contract (check adapter exit code); only
         // implement/review carry bounded waits (ticket #94).
@@ -9641,13 +9867,13 @@ fn run_attempt_phases(
             println!("  checks FAILED — routing back");
             let log_text = std::fs::read_to_string(log_path).unwrap_or_default();
             gh_comment(ticket, &format!("DISPATCH: factory-check failed (attempt {attempt_no}/{max_attempts}). Tail:\n```\n{}\n```", last_lines(&log_text, 30)));
-            finish_attempt(state, ledger, idx, "impl_failed", 1);
+            finish_attempt(state, shared, idx, "impl_failed", 1);
             remove_worktree(wt);
             return TicketOutcome::Done;
         }
     }
     // Review resumes straight onto the recorded head; earlier phases overwrite it above.
-    let mut head = ledger.attempts[idx].head_commit.clone();
+    let mut head = lock_ledger(shared).attempts[idx].head_commit.clone();
     if from <= 2 {
         // --- evidence: HANDOFF.md goes to the issue, scaffolding never commits ---
         let mut handoff_text = String::new();
@@ -9675,7 +9901,7 @@ fn run_attempt_phases(
                     ticket,
                     "DISPATCH: implementer produced no changes. Human decision required.",
                 );
-                finish_attempt(state, ledger, idx, "impl_done", 0);
+                finish_attempt(state, shared, idx, "impl_done", 0);
                 remove_worktree(wt);
                 return TicketOutcome::Done;
             }
@@ -9708,10 +9934,13 @@ fn run_attempt_phases(
             );
             head = git_head(wt);
         }
-        ledger.attempts[idx].head_commit = head.clone();
-        ledger.attempts[idx].exit_code = 0;
-        ledger.attempts[idx].status = "impl_done".to_string();
-        if let Err(e) = save_ledger(state, ledger) {
+        {
+            let mut ledger = lock_ledger(shared);
+            ledger.attempts[idx].head_commit = head.clone();
+            ledger.attempts[idx].exit_code = 0;
+            ledger.attempts[idx].status = "impl_done".to_string();
+        }
+        if let Err(e) = save_shared_ledger(state, shared) {
             eprintln!("dispatch: {e}");
         }
         gh_relabel(ticket, Some("ready"), "review");
@@ -9728,12 +9957,15 @@ fn run_attempt_phases(
     } else {
         println!("  review worktree failed — routing back to ready");
         gh_relabel(ticket, Some("review"), "ready");
-        finish_attempt(state, ledger, idx, "review_failed", 1);
+        finish_attempt(state, shared, idx, "review_failed", 1);
         remove_worktree(wt);
         return TicketOutcome::Done;
     }
-    ledger.attempts[idx].status = "review_running".to_string();
-    if let Err(e) = save_ledger(state, ledger) {
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].status = "review_running".to_string();
+    }
+    if let Err(e) = save_shared_ledger(state, shared) {
         eprintln!("dispatch: {e}");
     }
     let rlog = state
@@ -9752,16 +9984,16 @@ fn run_attempt_phases(
     let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
     // Review checkpoint: committed before the reviewer runs.
     // On failure settle as interrupted (ticket #75), never running.
-    if let Err(e) = checkpoint_phase(state, ledger, idx, "review") {
+    if let Err(e) = checkpoint_phase(state, shared, idx, "review") {
         eprintln!("dispatch: {e}");
         append_log(log_path, &format!("checkpoint review failed: {e}\n"));
-        let phase = attempt_phase(&ledger.attempts[idx]).to_string();
+        let phase = attempt_phase(&lock_ledger(shared).attempts[idx]).to_string();
         remove_worktree(&rwt);
-        return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, &phase);
+        return interrupt_attempt(state, shared, idx, log_path, wt, ticket, &phase);
     }
     if simulated_kill_phase("review") {
         remove_worktree(&rwt);
-        return interrupt_attempt(state, ledger, idx, log_path, wt, ticket, "review");
+        return interrupt_attempt(state, shared, idx, log_path, wt, ticket, "review");
     }
     println!("  review: pi -p (timeout {}s)", ctx.review_timeout_secs);
     let review_outcome = run_phase(
@@ -9781,7 +10013,7 @@ fn run_attempt_phases(
             remove_worktree(&rwt);
             return expire_attempt(
                 state,
-                ledger,
+                shared,
                 idx,
                 log_path,
                 wt,
@@ -9810,6 +10042,9 @@ fn run_attempt_phases(
     remove_worktree(&rwt);
     remove_worktree(wt);
     if verdict.as_deref() == Some("accept") {
+        // One train mutation at a time (ticket #92): concurrent waves
+        // serialize here, exactly as sequential passes do.
+        let _train = TRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Accept path: with an open train, auto-merge cleanly or route to
         // blocked on conflict (never forced). With no open train, auto-cut
         // a default-slug train (T35) and merge there instead of waiting;
@@ -9821,13 +10056,13 @@ fn run_attempt_phases(
                     gh_relabel(ticket, Some("review"), "integrated");
                     gh_comment(ticket, &format!("DISPATCH: review accepted; merged into train `{open_train_branch}` ({short}). Human: covered by the train→dev review."));
                     println!("  ACCEPTED + INTEGRATED into {open_train_branch} — #{ticket}");
-                    finish_attempt(state, ledger, idx, "review_done", 0);
+                    finish_attempt(state, shared, idx, "review_done", 0);
                 }
                 Err(e) => {
                     println!("  merge into train failed — routing to blocked (never forced)");
                     gh_relabel(ticket, Some("review"), "blocked");
                     gh_comment(ticket, &format!("DISPATCH: review accepted but merge into train `{open_train_branch}` failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
-                    finish_attempt(state, ledger, idx, "review_failed", 0);
+                    finish_attempt(state, shared, idx, "review_failed", 0);
                 }
             }
         } else {
@@ -9863,8 +10098,11 @@ fn run_attempt_phases(
             };
             match train {
                 Some(t) => {
-                    ledger.attempts[idx].train_branch = t.clone();
-                    if let Err(e) = save_ledger(state, ledger) {
+                    {
+                        let mut ledger = lock_ledger(shared);
+                        ledger.attempts[idx].train_branch = t.clone();
+                    }
+                    if let Err(e) = save_shared_ledger(state, shared) {
                         eprintln!("dispatch: {e}");
                     }
                     match do_train_merge(ticket, branch, &t, state) {
@@ -9872,13 +10110,13 @@ fn run_attempt_phases(
                             gh_relabel(ticket, Some("review"), "integrated");
                             gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` and merged into it ({short}). Human: covered by the train→dev review."));
                             println!("  ACCEPTED + INTEGRATED into {t} (auto-cut) — #{ticket}");
-                            finish_attempt(state, ledger, idx, "review_done", 0);
+                            finish_attempt(state, shared, idx, "review_done", 0);
                         }
                         Err(e) => {
                             println!("  merge into auto-cut train failed — routing to blocked (never forced)");
                             gh_relabel(ticket, Some("review"), "blocked");
                             gh_comment(ticket, &format!("DISPATCH: review accepted; auto-cut train `{t}` but merge failed ({e}) — merge aborted, nothing forced. Human: resolve, or `release drop {ticket}`."));
-                            finish_attempt(state, ledger, idx, "review_failed", 0);
+                            finish_attempt(state, shared, idx, "review_failed", 0);
                         }
                     }
                 }
@@ -9887,14 +10125,14 @@ fn run_attempt_phases(
                     gh_relabel(ticket, Some("review"), "accepted");
                     gh_comment(ticket, &format!("DISPATCH: review accepted. Base `{base}` → head `{head}` on `{branch}`. Human: verify and land."));
                     println!("  ACCEPTED — #{ticket} awaiting human land");
-                    finish_attempt(state, ledger, idx, "review_done", 0);
+                    finish_attempt(state, shared, idx, "review_done", 0);
                 }
             }
         }
     } else {
         println!("  changes_requested (or unreadable verdict) — back to ready");
         gh_relabel(ticket, Some("review"), "ready");
-        finish_attempt(state, ledger, idx, "review_failed", 0);
+        finish_attempt(state, shared, idx, "review_failed", 0);
     }
     TicketOutcome::Done
 }
@@ -9906,33 +10144,52 @@ fn run_attempt_phases(
 /// answers are replayed into the resumed brief, so a restart never loses
 /// them and never redelivers anything new.
 #[allow(clippy::too_many_arguments)]
+/// Per-pass admission + bound knobs (ticket #92): the resolved concurrency
+/// level travels with the attempt budget and phase timeouts as one value,
+/// so inner admission gates can never re-resolve a different level —
+/// finding #2 is structural, not conventional.
+#[derive(Clone, Copy)]
+struct PassTuning {
+    max_attempts: u64,
+    max_concurrent: usize,
+    timeout_impl: Option<u64>,
+    timeout_review: Option<u64>,
+}
+
 fn resume_ticket_attempt(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     ticket: u64,
     idx: usize,
     view: &serde_json::Value,
     dry_run: bool,
-    timeout_impl: Option<u64>,
-    timeout_review: Option<u64>,
+    tuning: PassTuning,
 ) -> TicketOutcome {
-    let attempt_no = ledger.attempts[idx].attempt_no;
-    let phase = attempt_phase(&ledger.attempts[idx]).to_string();
+    let max_concurrent = tuning.max_concurrent;
+    let timeout_impl = tuning.timeout_impl;
+    let timeout_review = tuning.timeout_review;
+    let max_attempts = tuning.max_attempts;
+    let attempt_no = lock_ledger(shared).attempts[idx].attempt_no;
+    let phase = attempt_phase(&lock_ledger(shared).attempts[idx]).to_string();
     let slot = format!("T{ticket}-a{attempt_no}");
     // Slot gate: a resume is admitted exactly like fresh work — never past
     // capacity. The pass loop checks this too; this is the enforcement at
     // the admission point itself.
-    if dispatch_active(ledger) >= dispatch_max_concurrent() {
+    // Named binding (never a guard inside the `if` scrutinee): guard
+    // temporaries in a condition live for the whole statement, which
+    // would self-deadlock the non-reentrant ledger mutex.
+    let live_now = dispatch_active(&lock_ledger(shared));
+    if live_now >= max_concurrent {
         println!("dispatch: #{ticket} resume deferred — slot gate at capacity");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped("slot gate at capacity".to_string());
     }
     if dry_run {
         println!("dry-run: would resume #{ticket} attempt {attempt_no} from {phase} checkpoint (no writes)");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::DryRunAdmit { resume: true };
     }
-    let record_branch = ledger.attempts[idx].branch.clone();
-    let record_base = ledger.attempts[idx].base_commit.clone();
-    let record_log = ledger.attempts[idx].log_path.clone();
+    let record_branch = lock_ledger(shared).attempts[idx].branch.clone();
+    let record_base = lock_ledger(shared).attempts[idx].base_commit.clone();
+    let record_log = lock_ledger(shared).attempts[idx].log_path.clone();
     let wt = state.join("worktrees").join(&slot);
     let tmpdir = state.join("tmp").join(&slot);
     let _ = std::fs::create_dir_all(&tmpdir);
@@ -9948,29 +10205,35 @@ fn resume_ticket_attempt(
     };
     if let Err(e) = ensure_ticket_worktree(state, &record_branch, &wt, &base) {
         println!("dispatch: #{ticket} resume {e}");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped(format!("resume worktree: {e}"));
     }
-    let n = ledger.attempts[idx].resumed + 1;
-    ledger.attempts[idx].resumed = n;
-    ledger.attempts[idx].status = if phase == "review" {
-        "review_running".to_string()
-    } else {
-        "impl_running".to_string()
-    };
-    ledger.attempts[idx].finished_at = String::new();
+    let n = lock_ledger(shared).attempts[idx].resumed + 1;
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].resumed = n;
+        ledger.attempts[idx].status = if phase == "review" {
+            "review_running".to_string()
+        } else {
+            "impl_running".to_string()
+        };
+        ledger.attempts[idx].finished_at = String::new();
+    }
     append_log(
         Path::new(&record_log),
         &format!(
             "resumed from {phase} checkpoint (slot {slot}, resume #{n}) — transcript preserved\n"
         ),
     );
-    if let Err(e) = save_ledger(state, ledger) {
+    if let Err(e) = save_shared_ledger(state, shared) {
         // Re-activation never persisted (ticket #75): revert to the
         // interrupted checkpoint in memory so no running row escapes,
         // then Done so the loop retries the save loudly.
         eprintln!("dispatch: {e}");
-        ledger.attempts[idx].status = format!("{phase}_interrupted");
-        ledger.attempts[idx].finished_at = now_stamp();
+        {
+            let mut ledger = lock_ledger(shared);
+            ledger.attempts[idx].status = format!("{phase}_interrupted");
+            ledger.attempts[idx].finished_at = now_stamp();
+        }
         remove_worktree(&wt);
         return TicketOutcome::Done;
     }
@@ -10009,13 +10272,10 @@ fn resume_ticket_attempt(
         })
         .unwrap_or_default();
     let (found, _) = collect_answers(&comment_bodies);
+    let delivered = lock_ledger(shared).delivered_answers.clone();
     let replay: Vec<ParsedAnswer> = found
         .into_iter()
-        .filter(|a| {
-            ledger
-                .delivered_answers
-                .contains(&answer_delivery_key(ticket, a))
-        })
+        .filter(|a| delivered.contains(&answer_delivery_key(ticket, a)))
         .collect();
     let mut brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {record_branch} (base {base})\n\n{body}\n");
     if !replay.is_empty() {
@@ -10026,7 +10286,7 @@ fn resume_ticket_attempt(
     let ctx = PhaseCtx {
         ticket,
         attempt_no,
-        id: ledger.attempts[idx].id,
+        id: lock_ledger(shared).attempts[idx].id,
         slot,
         branch: record_branch,
         base,
@@ -10036,23 +10296,24 @@ fn resume_ticket_attempt(
         wt,
         tmpdir,
         open_train_branch: live_train,
-        max_attempts: dispatch_max_attempts(),
+        max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
         review_timeout_secs: review_timeout_secs(timeout_review),
     };
-    run_attempt_phases(state, ledger, idx, &ctx, &phase, &brief)
+    run_attempt_phases(state, shared, idx, &ctx, &phase, &brief)
 }
 
 #[allow(clippy::too_many_lines)]
 fn cmd_dispatch_ticket(
     state: &std::path::Path,
-    ledger: &mut DispatchLedger,
+    shared: &SharedLedger,
     ticket: u64,
-    max_attempts: u64,
     dry_run: bool,
-    timeout_impl: Option<u64>,
-    timeout_review: Option<u64>,
+    tuning: PassTuning,
 ) -> TicketOutcome {
+    let max_attempts = tuning.max_attempts;
+    let timeout_impl = tuning.timeout_impl;
+    let timeout_review = tuning.timeout_review;
     let view_text = match dgh(&[
         "issue",
         "view",
@@ -10063,51 +10324,42 @@ fn cmd_dispatch_ticket(
         Ok(t) => t,
         Err(e) => {
             println!("dispatch: #{ticket} unreadable — skip ({e})");
-            return TicketOutcome::Skipped;
+            return TicketOutcome::Skipped(format!("unreadable: {e}"));
         }
     };
     let view: serde_json::Value = match serde_json::from_str(&view_text) {
         Ok(v) => v,
         Err(e) => {
             println!("dispatch: #{ticket} unreadable — skip ({e})");
-            return TicketOutcome::Skipped;
+            return TicketOutcome::Skipped(format!("unreadable: {e}"));
         }
     };
     let labels = dgh_labels(&view);
     if labels.iter().any(|l| l == "blocked") {
         println!("dispatch: #{ticket} blocked — skip");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped("blocked label".to_string());
     }
     if !labels.iter().any(|l| l == "ready") {
         println!("dispatch: #{ticket} not ready — skip");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped("not ready".to_string());
     }
-    if ledger
-        .attempts
-        .iter()
-        .any(|a| a.ticket == ticket && (a.status == "impl_running" || a.status == "review_running"))
-    {
+    let already_active = lock_ledger(shared).attempts.iter().any(|a| {
+        a.ticket == ticket && (a.status == "impl_running" || a.status == "review_running")
+    });
+    if already_active {
         println!("dispatch: #{ticket} already active — skip");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped("already active".to_string());
     }
     // Resume (ticket #61, spec #59): the newest resumable checkpoint wins —
     // the same attempt continues its phase with its transcript preserved,
     // instead of opening a fresh attempt. Admission gates (budget, deps,
     // spec) were passed when the attempt opened; the slot gate is enforced
     // inside before anything is admitted.
-    if let Some(r_idx) = newest_resumable_index(ledger, ticket) {
-        return resume_ticket_attempt(
-            state,
-            ledger,
-            ticket,
-            r_idx,
-            &view,
-            dry_run,
-            timeout_impl,
-            timeout_review,
-        );
+    let resumable = newest_resumable_index(&lock_ledger(shared), ticket);
+    if let Some(r_idx) = resumable {
+        return resume_ticket_attempt(state, shared, ticket, r_idx, &view, dry_run, tuning);
     }
-    let past = ledger
+    let past = lock_ledger(shared)
         .attempts
         .iter()
         .filter(|a| {
@@ -10125,7 +10377,7 @@ fn cmd_dispatch_ticket(
             );
             gh_relabel(ticket, Some("ready"), "blocked");
         }
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped(format!("attempt budget exhausted ({past}/{max_attempts})"));
     }
     let title = view
         .get("title")
@@ -10160,14 +10412,14 @@ fn cmd_dispatch_ticket(
             .collect::<Vec<_>>()
             .join(" ");
         println!("dispatch: #{ticket} waiting on open deps: {list} — skip");
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped(format!("waiting on open deps: {list}"));
     }
     let spec = linked_spec(&body);
     // Numbering follows the newest record, not the budget count: an
     // interrupted attempt is resumable (outside the done/failed budget)
     // but still occupies its number. Identical to past + 1 when no
     // interrupted row exists.
-    let attempt_no = ledger
+    let attempt_no = lock_ledger(shared)
         .attempts
         .iter()
         .filter(|a| a.ticket == ticket)
@@ -10181,12 +10433,21 @@ fn cmd_dispatch_ticket(
             "dry-run: would build factory/T{ticket}-<slug> @ {}/worktrees/{slot}, run implement, verify, review",
             state.display()
         );
-        return TicketOutcome::Skipped;
+        return TicketOutcome::DryRunAdmit { resume: false };
     }
     let log_path = state
         .join("logs")
         .join(format!("T{ticket}-a{attempt_no}-impl.log"));
-    let id = ledger.attempts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+    // Cosmetic id for the worktree-add failure log line only (no row is
+    // pushed on that path): the authoritative row id always comes from
+    // `push_attempt_row` below, which mints id+push+index atomically.
+    let log_only_id = lock_ledger(shared)
+        .attempts
+        .iter()
+        .map(|a| a.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
 
     let open_train_branch: String = load_open_train(state).map(|t| t.branch).unwrap_or_default();
     // Spec freeze gate: a drifted spec refuses the ticket before any
@@ -10195,25 +10456,28 @@ fn cmd_dispatch_ticket(
         if let Err(e) = dispatch_verify_spec(s) {
             println!("dispatch: #{ticket} spec #{s} freeze mismatch — needs re-freeze");
             append_log(&log_path, &format!("spec gate refused: {e}\n"));
-            ledger.attempts.push(DispatchAttempt {
-                id,
-                ticket,
-                attempt_no,
-                base_commit: String::new(),
-                head_commit: String::new(),
-                branch: String::new(),
-                worktree: String::new(),
-                status: "impl_failed".to_string(),
-                exit_code: 1,
-                log_path: log_path.to_string_lossy().into_owned(),
-                started_at: now_stamp(),
-                finished_at: now_stamp(),
-                train_branch: open_train_branch.clone(),
-                phase: "unknown".to_string(),
-                resumed: 0,
-                timed_out: false,
-                timeout_secs: 0,
-            });
+            let (id, _) = push_attempt_row(
+                shared,
+                DispatchAttempt {
+                    id: 0,
+                    ticket,
+                    attempt_no,
+                    base_commit: String::new(),
+                    head_commit: String::new(),
+                    branch: String::new(),
+                    worktree: String::new(),
+                    status: "impl_failed".to_string(),
+                    exit_code: 1,
+                    log_path: log_path.to_string_lossy().into_owned(),
+                    started_at: now_stamp(),
+                    finished_at: now_stamp(),
+                    train_branch: open_train_branch.clone(),
+                    phase: "unknown".to_string(),
+                    resumed: 0,
+                    timed_out: false,
+                    timeout_secs: 0,
+                },
+            );
             log_event(&log_path, id, ticket, "spec-gate", 1);
             gh_comment(ticket, &format!("DISPATCH: linked spec #{s} body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs."));
             return TicketOutcome::Done;
@@ -10261,42 +10525,44 @@ fn cmd_dispatch_ticket(
         let msg = format!("dispatch: #{ticket} {e}");
         println!("{msg}");
         append_log(&log_path, &format!("{msg}\n"));
-        log_event(&log_path, id, ticket, "worktree-add", 1);
-        return TicketOutcome::Skipped;
+        log_event(&log_path, log_only_id, ticket, "worktree-add", 1);
+        return TicketOutcome::Skipped(format!("worktree: {e}"));
     }
     let wt_s = wt.to_string_lossy().to_string();
-    ledger.attempts.push(DispatchAttempt {
-        id,
-        ticket,
-        attempt_no,
-        base_commit: base.clone(),
-        head_commit: String::new(),
-        branch: branch.clone(),
-        worktree: wt_s.clone(),
-        status: "impl_running".to_string(),
-        exit_code: 0,
-        log_path: log_path.to_string_lossy().into_owned(),
-        started_at: now_stamp(),
-        finished_at: String::new(),
-        train_branch: open_train_branch.clone(),
-        phase: "plan".to_string(),
-        resumed: 0,
-        timed_out: false,
-        timeout_secs: 0,
-    });
-    let idx = ledger.attempts.len() - 1;
+    let (id, idx) = push_attempt_row(
+        shared,
+        DispatchAttempt {
+            id: 0,
+            ticket,
+            attempt_no,
+            base_commit: base.clone(),
+            head_commit: String::new(),
+            branch: branch.clone(),
+            worktree: wt_s.clone(),
+            status: "impl_running".to_string(),
+            exit_code: 0,
+            log_path: log_path.to_string_lossy().into_owned(),
+            started_at: now_stamp(),
+            finished_at: String::new(),
+            train_branch: open_train_branch.clone(),
+            phase: "plan".to_string(),
+            resumed: 0,
+            timed_out: false,
+            timeout_secs: 0,
+        },
+    );
     // Plan checkpoint: committed before any side-effecting work begins.
     // On failure the row was never activated on disk (this checkpoint is
     // its first persist — ticket #75), so drop it in memory and release
     // the ticket instead of leaving a running row behind.
-    if let Err(e) = checkpoint_phase(state, ledger, idx, "plan") {
+    if let Err(e) = checkpoint_phase(state, shared, idx, "plan") {
         eprintln!("dispatch: {e}");
-        ledger.attempts.pop();
+        lock_ledger(shared).attempts.pop();
         remove_worktree(&wt);
-        return TicketOutcome::Skipped;
+        return TicketOutcome::Skipped(format!("checkpoint: {e}"));
     }
     if simulated_kill_phase("plan") {
-        return interrupt_attempt(state, ledger, idx, &log_path, &wt, ticket, "plan");
+        return interrupt_attempt(state, shared, idx, &log_path, &wt, ticket, "plan");
     }
 
     // --- implement ---
@@ -10326,17 +10592,18 @@ fn cmd_dispatch_ticket(
             })
             .unwrap_or_default();
         let (found, _) = collect_answers(&comment_bodies);
-        let pending = pending_answers(&found, &ledger.delivered_answers, ticket);
+        let pending = pending_answers(&found, &lock_ledger(shared).delivered_answers, ticket);
         if !pending.is_empty() {
             brief.push('\n');
             brief.push_str(&render_answers_section(&pending));
             for answer in &pending {
                 let key = answer_delivery_key(ticket, answer);
+                let mut ledger = lock_ledger(shared);
                 if !ledger.delivered_answers.contains(&key) {
                     ledger.delivered_answers.push(key);
                 }
             }
-            if let Err(e) = save_ledger(state, ledger) {
+            if let Err(e) = save_shared_ledger(state, shared) {
                 eprintln!("dispatch: {e}");
             }
         }
@@ -10358,7 +10625,7 @@ fn cmd_dispatch_ticket(
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
         review_timeout_secs: review_timeout_secs(timeout_review),
     };
-    run_attempt_phases(state, ledger, idx, &ctx, "implement", &brief)
+    run_attempt_phases(state, shared, idx, &ctx, "implement", &brief)
 }
 
 /// Auto-finish (T35): when the open train's head is an ancestor of dev,
@@ -10413,10 +10680,123 @@ fn maybe_auto_finish(state: &std::path::Path, dry_run: bool) -> bool {
     }
 }
 
+/// One dry-run survey entry: admit (resume vs fresh) or skip with the
+/// human-readable reason. The pass renders the whole survey as one
+/// worker plan so nothing is silently dropped.
+enum PlanDecision {
+    Admit { resume: bool },
+    Skip(String),
+}
+
+/// The dry-run worker plan: which tickets would run now, which wait for a
+/// free slot, and which are skipped and why. Pure data; rendering is
+/// `render_worker_plan`, unit-tested without the network.
+struct WorkerPlan {
+    slots: usize,
+    run_now: Vec<(u64, bool)>,
+    waiting: Vec<(u64, bool)>,
+    skipped: Vec<(u64, String)>,
+}
+
+/// Split an ordered dry-run survey into now / waiting / skipped: the
+/// first `slots` admits run now, later admits wait, skips keep order.
+/// Pure over inputs for hermetic tests.
+fn build_worker_plan(slots: usize, decisions: &[(u64, PlanDecision)]) -> WorkerPlan {
+    let mut run_now = Vec::new();
+    let mut waiting = Vec::new();
+    let mut skipped = Vec::new();
+    let mut admitted = 0usize;
+    for (ticket, decision) in decisions {
+        match decision {
+            PlanDecision::Admit { resume } => {
+                if admitted < slots {
+                    run_now.push((*ticket, *resume));
+                } else {
+                    waiting.push((*ticket, *resume));
+                }
+                admitted += 1;
+            }
+            PlanDecision::Skip(reason) => skipped.push((*ticket, reason.clone())),
+        }
+    }
+    WorkerPlan {
+        slots,
+        run_now,
+        waiting,
+        skipped,
+    }
+}
+
+fn ticket_word(ticket: u64, resume: bool) -> String {
+    if resume {
+        format!("#{ticket} (resume)")
+    } else {
+        format!("#{ticket}")
+    }
+}
+
+fn tickets_word(tickets: &[u64]) -> String {
+    tickets
+        .iter()
+        .map(|t| format!("#{t}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One calm plan line naming every survey outcome (ticket #92): what
+/// would run now, what waits for a free slot, and what is skipped why.
+/// Empty segments are omitted; the line always starts with `dry-run:`.
+fn render_worker_plan(plan: &WorkerPlan) -> String {
+    let mut parts = vec![format!(
+        "dry-run: worker plan ({} slot{})",
+        plan.slots,
+        if plan.slots == 1 { "" } else { "s" }
+    )];
+    if plan.run_now.is_empty() && plan.waiting.is_empty() {
+        parts.push("would run nothing".to_string());
+    } else {
+        let now: Vec<String> = plan
+            .run_now
+            .iter()
+            .map(|(t, r)| ticket_word(*t, *r))
+            .collect();
+        parts.push(format!("would run {} now", now.join(" ")));
+    }
+    if !plan.waiting.is_empty() {
+        let waiting: Vec<String> = plan
+            .waiting
+            .iter()
+            .map(|(t, r)| ticket_word(*t, *r))
+            .collect();
+        parts.push(format!("waiting for a free slot: {}", waiting.join(" ")));
+    }
+    if !plan.skipped.is_empty() {
+        let skips = plan
+            .skipped
+            .iter()
+            .map(|(t, r)| format!("#{t} ({r})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("skipped: {skips}"));
+    }
+    parts.join("; ")
+}
+
+/// STOP observed between parallel waves: halt admission, let the joined
+/// wave's in-flight workers finish their phases (ticket #92). Serial
+/// mode keeps the historical pass-start-only gate, byte-for-byte.
+fn stop_now(state: &std::path::Path) -> bool {
+    state.join("STOP").is_file()
+}
+
+const STOP_HALT_LINE: &str =
+    "dispatch: STOP file present — halting admission (in-flight workers finish)";
+
 pub fn cmd_dispatch_once(
     json: bool,
     dry_run: bool,
     idempotency_key: Option<&str>,
+    concurrency: Option<usize>,
     timeout_impl: Option<u64>,
     timeout_review: Option<u64>,
 ) -> i32 {
@@ -10452,8 +10832,24 @@ pub fn cmd_dispatch_once(
     // train closes even on passes with no open tickets. Read-only fetch
     // first, unmerged trains untouched, dry-run changes nothing.
     maybe_auto_finish(&state, dry_run);
-    let max_concurrent = dispatch_max_concurrent();
+    // One setting, two surfaces (ticket #92): the flag, the env, and the
+    // UI-persisted file resolve here, every pass, with no restart.
+    let max_concurrent = match resolve_max_concurrent(concurrency, &state) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     let max_attempts = dispatch_max_attempts();
+    // One bundle for the whole pass (ticket #92): every admission gate
+    // and phase bound reads these values, never a re-resolved copy.
+    let tuning = PassTuning {
+        max_attempts,
+        max_concurrent,
+        timeout_impl,
+        timeout_review,
+    };
     // Effective bounded-wait values (ticket #94): flags win over env.
     // Dry-run announces them; every pass states them the same way.
     let impl_secs = implement_timeout_secs(timeout_impl);
@@ -10567,39 +10963,155 @@ pub fn cmd_dispatch_once(
         return 0;
     }
     let attempts_before = ledger.attempts.len();
+    // Worker pool (ticket #92): every admission shares one ledger under
+    // one mutex with short-lived leaf guards, so workers overlap only in
+    // real work (subprocesses in isolated slots) while ledger writes stay
+    // serialized. Dry-run and serial mode keep the historical survey loop
+    // byte-for-byte; parallel mode admits waves of up to N workers.
+    let shared = SharedLedger::new(ledger);
     let mut attempted = 0u64;
-    for item in &list {
-        if dispatch_active(&ledger) >= max_concurrent {
-            println!("dispatch: capacity reached");
-            break;
-        }
-        let ticket = item
-            .get("number")
-            .and_then(|n| n.as_u64())
-            .or_else(|| item.as_u64())
-            .unwrap_or(0);
-        if ticket == 0 {
-            continue;
-        }
-        match cmd_dispatch_ticket(
-            &state,
-            &mut ledger,
-            ticket,
-            max_attempts,
-            dry_run,
-            timeout_impl,
-            timeout_review,
-        ) {
-            TicketOutcome::Done => {
-                attempted += 1;
-                if let Err(e) = save_ledger(&state, &ledger) {
-                    eprintln!("dispatch: {e}");
-                    return 1;
-                }
+    if dry_run {
+        // Sequential survey, deterministic order, zero writes: collect
+        // every outcome, then print one worker plan naming each.
+        let mut decisions: Vec<(u64, PlanDecision)> = Vec::new();
+        for item in &list {
+            let ticket = item
+                .get("number")
+                .and_then(|n| n.as_u64())
+                .or_else(|| item.as_u64())
+                .unwrap_or(0);
+            if ticket == 0 {
+                continue;
             }
-            TicketOutcome::Skipped => {}
+            match cmd_dispatch_ticket(&state, &shared, ticket, true, tuning) {
+                TicketOutcome::DryRunAdmit { resume } => {
+                    decisions.push((ticket, PlanDecision::Admit { resume }));
+                }
+                TicketOutcome::Skipped(reason) => {
+                    decisions.push((ticket, PlanDecision::Skip(reason)));
+                }
+                TicketOutcome::Done => {}
+            }
+        }
+        println!(
+            "{}",
+            render_worker_plan(&build_worker_plan(max_concurrent, &decisions))
+        );
+    } else if max_concurrent == 1 {
+        // Serial pass, exactly as before: one ticket at a time, same
+        // lines, same ledger transitions, STOP gated at pass start only.
+        // (Halt-admission mid-pass is the parallel wave path below.)
+        for item in &list {
+            // Named binding: guard temporaries in a condition live for
+            // the whole statement (see the resume gate above).
+            let live_now = dispatch_active(&lock_ledger(&shared));
+            if live_now >= max_concurrent {
+                println!("dispatch: capacity reached");
+                break;
+            }
+            let ticket = item
+                .get("number")
+                .and_then(|n| n.as_u64())
+                .or_else(|| item.as_u64())
+                .unwrap_or(0);
+            if ticket == 0 {
+                continue;
+            }
+            match cmd_dispatch_ticket(&state, &shared, ticket, false, tuning) {
+                TicketOutcome::Done => {
+                    attempted += 1;
+                    if let Err(e) = save_shared_ledger(&state, &shared) {
+                        eprintln!("dispatch: {e}");
+                        return 1;
+                    }
+                }
+                TicketOutcome::Skipped(_) | TicketOutcome::DryRunAdmit { .. } => {}
+            }
+        }
+    } else {
+        // Parallel waves: up to N workers run their attempts
+        // simultaneously in isolated slots; the rest wait with a calm
+        // line naming them. A panicked worker never sticks a lease: the
+        // next pass's reaper converts its row into a resumable
+        // checkpoint. STOP between waves halts admission; the joined
+        // wave already finished its phases.
+        // Wave admission respects live rows, not just the survey list
+        // (finding #4): already-active tickets never consume a wave slot,
+        // and every wave re-checks capacity first — a concurrent pass
+        // sharing the slots can no longer push a wave past max_concurrent.
+        let tickets: Vec<u64> = list
+            .iter()
+            .map(|item| {
+                item.get("number")
+                    .and_then(|n| n.as_u64())
+                    .or_else(|| item.as_u64())
+                    .unwrap_or(0)
+            })
+            .filter(|t| *t != 0)
+            .filter(|t| {
+                !lock_ledger(&shared).attempts.iter().any(|a| {
+                    a.ticket == *t && (a.status == "impl_running" || a.status == "review_running")
+                })
+            })
+            .collect();
+        let waves = tickets.len().div_ceil(max_concurrent.max(1));
+        let mut rest = tickets.as_slice();
+        let mut wave = 0usize;
+        while !rest.is_empty() {
+            if wave > 0 && stop_now(&state) {
+                println!("{STOP_HALT_LINE}");
+                break;
+            }
+            // Re-check capacity at every wave start: live rows from a
+            // concurrent pass (or a wave that admitted resumes) count.
+            let live = dispatch_active(&lock_ledger(&shared));
+            if live >= max_concurrent {
+                println!("dispatch: capacity reached");
+                break;
+            }
+            let n = (max_concurrent - live).min(rest.len());
+            let (now, later) = rest.split_at(n);
+            if waves > 1 {
+                let waiting = if later.is_empty() {
+                    "queue clear".to_string()
+                } else {
+                    format!("waiting for a free slot: {}", tickets_word(later))
+                };
+                println!(
+                    "dispatch: wave {}/{}: admitting {}; {}",
+                    wave + 1,
+                    waves,
+                    tickets_word(now),
+                    waiting
+                );
+            }
+            std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for t in now {
+                    handles
+                        .push(s.spawn(|| cmd_dispatch_ticket(&state, &shared, *t, false, tuning)));
+                }
+                for (ticket, handle) in now.iter().zip(handles) {
+                    match handle.join() {
+                        Ok(TicketOutcome::Done) => {
+                            attempted += 1;
+                        }
+                        Ok(TicketOutcome::Skipped(_)) | Ok(TicketOutcome::DryRunAdmit { .. }) => {}
+                        Err(_) => {
+                            println!("dispatch: worker for #{ticket} panicked — its lease will be reaped next pass");
+                        }
+                    }
+                }
+            });
+            if let Err(e) = save_shared_ledger(&state, &shared) {
+                eprintln!("dispatch: {e}");
+                return 1;
+            }
+            rest = later;
+            wave += 1;
         }
     }
+    let mut ledger = shared.into_inner().unwrap_or_else(|e| e.into_inner());
     println!("dispatch: pass complete ({attempted} attempted)");
     if let Some(k) = key {
         if !dry_run {
@@ -10661,6 +11173,7 @@ pub fn cmd_dispatch_once(
 pub fn cmd_dispatch_daemon(
     json: bool,
     interval: u64,
+    concurrency: Option<usize>,
     timeout_impl: Option<u64>,
     timeout_review: Option<u64>,
 ) -> i32 {
@@ -10669,12 +11182,27 @@ pub fn cmd_dispatch_daemon(
     if json {
         println!(r#"{{"daemon":true,"interval":{interval}}}"#);
     }
+    // The startup --concurrency flag is consumed once (see below).
+    let mut first_pass = true;
     loop {
         // Each pass is exactly `dispatch once`: same ledger, same logs,
-        // same MAX_CONCURRENT slots. The lock is per-pass (acquired and
-        // released inside `cmd_dispatch_once`), so concurrent `once`
-        // processes share slots with the daemon exactly as they do today.
-        let code = cmd_dispatch_once(json, false, None, timeout_impl, timeout_review);
+        // same worker slots (re-resolved every pass, so a UI change
+        // applies without restarting the daemon). The startup --concurrency
+        // flag sets the initial level only (persisted on the first pass so
+        // the UI agrees); it never shadows later UI writes. The lock is
+        // per-pass (acquired and released inside `cmd_dispatch_once`), so
+        // concurrent `once` processes share slots with the daemon exactly
+        // as they do today.
+        if first_pass {
+            if let Some(n) = concurrency {
+                if let Err(e) = set_concurrency_level(&state, &n.to_string()) {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            }
+            first_pass = false;
+        }
+        let code = cmd_dispatch_once(json, false, None, None, timeout_impl, timeout_review);
         if code != 0 {
             // Transient failure: report and retry next interval instead of
             // killing autonomous operation (bash `set -e` would abort here;
@@ -11883,7 +12411,11 @@ fn resume_fork_line(
     }
     // Slot gate: a resume is admitted exactly like fresh work — never
     // past capacity. Shared with attempts: the gate applies across all
-    // lines of a ticket.
+    // lines of a ticket. Standalone command (no pass), so the level is
+    // resolved fresh here (env/file/default): there is no pass-resolved
+    // flag to thread (contrast resume_ticket_attempt, which takes the
+    // pass's level). A `fork --resume --concurrency` flag is out of
+    // contract.
     if dispatch_active(ledger) >= dispatch_max_concurrent() {
         eprintln!("fork: '{name}' resume deferred — slot gate at capacity");
         return 1;
@@ -14465,6 +14997,116 @@ pub fn cmd_dispatch_memo(
     0
 }
 
+/// One ticket's spend line (ticket #92): per-attempt minutes from the
+/// ledger's epoch stamps plus the shared cost statement. `None` minutes
+/// mean the logs are missing or the attempt is still live — a gap, never
+/// a zero. Cost is the shared not-yet-wired statement, never zero-filled,
+/// so parallel spend reads as parallel lines, never a hidden total.
+struct SpendRow {
+    pub ticket: u64,
+    pub attempts: usize,
+    pub live: usize,
+    pub per_attempt: Vec<(u64, Option<f64>)>,
+    pub total_minutes: Option<f64>,
+}
+
+fn attempt_minutes_secs(started: &str, finished: &str) -> Option<f64> {
+    if started.is_empty() || finished.is_empty() {
+        return None;
+    }
+    let s: i64 = started.parse().ok()?;
+    let f: i64 = finished.parse().ok()?;
+    if f < s {
+        return None;
+    }
+    Some((f - s) as f64 / 60.0)
+}
+
+/// Per-ticket spend rows in ascending ticket order (ticket #92). Pure
+/// over the ledger so tests pin the math without the network.
+fn spend_rows(ledger: &DispatchLedger) -> Vec<SpendRow> {
+    let mut tickets: Vec<u64> = ledger.attempts.iter().map(|a| a.ticket).collect();
+    tickets.sort_unstable();
+    tickets.dedup();
+    tickets
+        .into_iter()
+        .map(|ticket| {
+            let mut rows: Vec<&DispatchAttempt> = ledger
+                .attempts
+                .iter()
+                .filter(|a| a.ticket == ticket)
+                .collect();
+            rows.sort_by_key(|a| (a.attempt_no, a.id));
+            let per_attempt: Vec<(u64, Option<f64>)> = rows
+                .iter()
+                .map(|a| {
+                    (
+                        a.attempt_no,
+                        attempt_minutes_secs(&a.started_at, &a.finished_at),
+                    )
+                })
+                .collect();
+            let live = rows.iter().filter(|a| is_live_attempt(a)).count();
+            let total_minutes = if per_attempt.iter().any(|(_, m)| m.is_none()) {
+                None
+            } else {
+                Some(per_attempt.iter().map(|(_, m)| m.unwrap_or(0.0)).sum())
+            };
+            SpendRow {
+                ticket,
+                attempts: rows.len(),
+                live,
+                per_attempt,
+                total_minutes,
+            }
+        })
+        .collect()
+}
+
+/// One human spend line per ticket: minutes plus the shared cost
+/// statement, so parallel tickets read as parallel lines.
+fn spend_human_line(row: &SpendRow) -> String {
+    let attempts = if row.attempts == 1 {
+        "1 attempt".to_string()
+    } else {
+        format!("{} attempts", row.attempts)
+    };
+    let body = match row.total_minutes {
+        Some(total) => {
+            let parts: Vec<String> = row
+                .per_attempt
+                .iter()
+                .map(|(n, m)| format!("a{n}: {:.2} min", m.unwrap_or(0.0)))
+                .collect();
+            format!("{total:.2} min total ({})", parts.join(", "))
+        }
+        None => "minutes pending".to_string(),
+    };
+    let live = if row.live > 0 {
+        format!(" ({} live)", row.live)
+    } else {
+        String::new()
+    };
+    // `ticket N:` on purpose: the readable-views rule (ticket #90)
+    // forbids `#`-led lines in human output, so the ticket reads as a
+    // word, never as an internal ledger id.
+    format!(
+        "ticket {}: {attempts}{live}, {body}; {OUTCOME_COST_TEXT}",
+        row.ticket
+    )
+}
+
+fn spend_json(row: &SpendRow) -> serde_json::Value {
+    serde_json::json!({
+        "ticket": row.ticket,
+        "attempts": row.attempts,
+        "live": row.live,
+        "total_minutes": row.total_minutes,
+        "attempt_minutes": row.per_attempt.iter().map(|(n, m)| serde_json::json!({"attempt_no": n, "minutes": m})).collect::<Vec<_>>(),
+        "cost_text": OUTCOME_COST_TEXT,
+    })
+}
+
 pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
     let state = dispatch_state_dir();
     let ledger = load_ledger(&state);
@@ -14507,7 +15149,7 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
             .collect();
         println!(
             "{}",
-            serde_json::json!({"attempts": attempts, "decision_memos": memos, "owned_tasks": ledger.owned_tasks, "abort_log": ledger.abort_log, "worktrees": wt_lines, "stopped": stopped, "timeouts": {"implement": implement_timeout_secs(None), "review": review_timeout_secs(None)}})
+            serde_json::json!({"attempts": attempts, "decision_memos": memos, "owned_tasks": ledger.owned_tasks, "abort_log": ledger.abort_log, "worktrees": wt_lines, "stopped": stopped, "timeouts": {"implement": implement_timeout_secs(None), "review": review_timeout_secs(None)}, "spend": spend_rows(&ledger).iter().map(spend_json).collect::<Vec<_>>()})
         );
     } else {
         // Human contract (ticket #90): an aligned-column table over live
@@ -14704,6 +15346,17 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
             worktree_count,
             if stopped { "STOPPED" } else { "running" }
         );
+        // Per-ticket spend (ticket #92): one line per ticket in both
+        // modes, so parallel spend never hides. Empty ledgers print
+        // nothing new: old output stays byte-identical.
+        let spend = spend_rows(&ledger);
+        if !spend.is_empty() {
+            println!();
+            println!("== spend ==");
+            for row in &spend {
+                println!("{}", spend_human_line(row));
+            }
+        }
     }
     0
 }
@@ -16755,20 +17408,29 @@ pub fn run() -> i32 {
             DispatchAction::Once {
                 dry_run,
                 idempotency_key,
+                concurrency,
                 timeout_impl,
                 timeout_review,
             } => cmd_dispatch_once(
                 cli.json,
                 dry_run,
                 idempotency_key.as_deref(),
+                concurrency,
                 timeout_impl,
                 timeout_review,
             ),
             DispatchAction::Daemon {
                 interval,
+                concurrency,
                 timeout_impl,
                 timeout_review,
-            } => cmd_dispatch_daemon(cli.json, interval, timeout_impl, timeout_review),
+            } => cmd_dispatch_daemon(
+                cli.json,
+                interval,
+                concurrency,
+                timeout_impl,
+                timeout_review,
+            ),
             DispatchAction::Status { all } => cmd_dispatch_status(cli.json, all),
             DispatchAction::Graph { ticket } => cmd_dispatch_graph(cli.json, ticket.as_deref()),
             DispatchAction::Wait {
@@ -18234,6 +18896,228 @@ mod stream_backpressure_tests {
                 std::task::Poll::Ready(None)
             ),
             "then the server ends the stream instead of idling"
+        );
+    }
+}
+
+// --- worker pool, TDD green (ticket #92) ------------------------------------
+// Pure pins for the supervised pool: one resolver for both surfaces,
+// one plan renderer for dry-run, one spend math for status output.
+#[cfg(test)]
+mod worker_pool_tests {
+    use super::{
+        build_worker_plan, concurrency_source, parse_concurrency, render_worker_plan,
+        resolve_max_concurrent, set_concurrency_level, spend_human_line, spend_rows, PlanDecision,
+        WorkerPlan, CONCURRENCY_DEFAULT, CONCURRENCY_MAX, CONCURRENCY_MIN, OUTCOME_COST_TEXT,
+    };
+
+    /// Env-touching tests serialize on this lock: the process environment
+    /// is global, and other tests in this binary must never observe our
+    /// temporary removals.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn without_pool_env(f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(String, Option<String>)> = ["MAX_CONCURRENT", "FACTORY_MAX_CONCURRENT"]
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        std::env::remove_var("MAX_CONCURRENT");
+        std::env::remove_var("FACTORY_MAX_CONCURRENT");
+        f();
+        for (k, v) in saved {
+            if let Some(v) = v {
+                std::env::set_var(k, v);
+            } else {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    fn tmp_state(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "swefactory-pool-unit-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bounds_share_one_default() {
+        assert_eq!(CONCURRENCY_DEFAULT, 1);
+        assert_eq!(CONCURRENCY_MIN, 1);
+        assert_eq!(parse_concurrency(Some("2")).unwrap(), 2);
+        assert_eq!(parse_concurrency(None).unwrap(), 1);
+        assert_eq!(parse_concurrency(Some("1")).unwrap(), 1);
+        assert!(parse_concurrency(Some("0")).is_err());
+        assert!(parse_concurrency(Some("many")).is_err());
+        assert!(parse_concurrency(Some("99")).is_err());
+        let err = parse_concurrency(Some("99")).unwrap_err();
+        assert!(
+            err.contains('1') && err.contains('8'),
+            "bounds named: {err}"
+        );
+        assert_eq!(
+            parse_concurrency(Some(&CONCURRENCY_MAX.to_string())).unwrap(),
+            CONCURRENCY_MAX
+        );
+    }
+
+    #[test]
+    fn resolver_precedence_flag_env_file_default() {
+        without_pool_env(|| {
+            let state = tmp_state("resolve");
+            // Default with nothing set.
+            assert_eq!(resolve_max_concurrent(None, &state).unwrap(), 1);
+            // Flag wins over everything.
+            assert_eq!(resolve_max_concurrent(Some(3), &state).unwrap(), 3);
+            assert!(resolve_max_concurrent(Some(0), &state).is_err());
+            // Saved UI setting applies from the next pass.
+            set_concurrency_level(&state, "5").unwrap();
+            assert_eq!(resolve_max_concurrent(None, &state).unwrap(), 5);
+            // Flag beats the saved setting.
+            assert_eq!(resolve_max_concurrent(Some(2), &state).unwrap(), 2);
+            // Legacy env beats the saved setting; new key beats legacy.
+            std::env::set_var("MAX_CONCURRENT", "6");
+            assert_eq!(resolve_max_concurrent(None, &state).unwrap(), 6);
+            std::env::set_var("FACTORY_MAX_CONCURRENT", "2");
+            assert_eq!(resolve_max_concurrent(None, &state).unwrap(), 2);
+            // Out-of-bounds env is an error, never a silent clamp.
+            std::env::set_var("FACTORY_MAX_CONCURRENT", "99");
+            std::env::remove_var("MAX_CONCURRENT");
+            assert!(resolve_max_concurrent(None, &state).is_err());
+        });
+    }
+
+    #[test]
+    fn saved_level_validates_bounds_and_round_trips() {
+        without_pool_env(|| {
+            let state = tmp_state("persist");
+            assert!(set_concurrency_level(&state, "0").is_err());
+            assert!(set_concurrency_level(&state, "many").is_err());
+            assert_eq!(set_concurrency_level(&state, "4").unwrap(), 4);
+            assert_eq!(
+                std::fs::read_to_string(state.join("concurrency"))
+                    .unwrap()
+                    .trim(),
+                "4"
+            );
+            assert_eq!(
+                concurrency_source(&state),
+                "saved setting (change it here or with --concurrency)"
+            );
+        });
+    }
+
+    #[test]
+    fn worker_plan_splits_now_waiting_skipped() {
+        let decisions = vec![
+            (11, PlanDecision::Admit { resume: false }),
+            (12, PlanDecision::Admit { resume: true }),
+            (13, PlanDecision::Admit { resume: false }),
+            (
+                14,
+                PlanDecision::Skip("waiting on open deps: #99".to_string()),
+            ),
+        ];
+        let plan = build_worker_plan(2, &decisions);
+        assert_eq!(plan.run_now, vec![(11, false), (12, true)]);
+        assert_eq!(plan.waiting, vec![(13, false)]);
+        assert_eq!(plan.skipped.len(), 1);
+        let line = render_worker_plan(&plan);
+        assert!(line.starts_with("dry-run: worker plan (2 slots)"), "{line}");
+        assert!(line.contains("#11") && line.contains("#12"), "{line}");
+        assert!(line.contains("waiting for a free slot: #13"), "{line}");
+        assert!(line.contains("#14 (waiting on open deps: #99)"), "{line}");
+    }
+
+    #[test]
+    fn empty_plan_names_nothing_and_skips() {
+        let plan = WorkerPlan {
+            slots: 1,
+            run_now: vec![],
+            waiting: vec![],
+            skipped: vec![(11, "not ready".to_string())],
+        };
+        let line = render_worker_plan(&plan);
+        assert!(line.contains("would run nothing"), "{line}");
+        assert!(line.contains("#11 (not ready)"), "{line}");
+        assert!(!line.contains("waiting for a free slot"), "{line}");
+    }
+
+    #[test]
+    fn spend_math_blanks_instead_of_zeroes() {
+        let ledger: super::DispatchLedger = serde_json::from_str(
+            r#"{"attempts": [
+            {"id": 1, "ticket": 11, "attempt_no": 1, "base_commit": "", "head_commit": "",
+             "branch": "", "worktree": "", "status": "review_done", "exit_code": 0,
+             "log_path": "", "started_at": "1000", "finished_at": "1060",
+             "train_branch": "", "phase": "review", "resumed": 0},
+            {"id": 2, "ticket": 12, "attempt_no": 1, "base_commit": "", "head_commit": "",
+             "branch": "", "worktree": "", "status": "impl_running", "exit_code": 0,
+             "log_path": "", "started_at": "1000", "finished_at": "",
+             "train_branch": "", "phase": "implement", "resumed": 0}
+        ]}"#,
+        )
+        .unwrap();
+        let rows = spend_rows(&ledger);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].total_minutes, Some(1.0));
+        assert_eq!(rows[1].total_minutes, None);
+        assert_eq!(rows[1].live, 1);
+        let line = spend_human_line(&rows[0]);
+        assert!(
+            line.contains("ticket 11") && line.contains("1.00 min"),
+            "{line}"
+        );
+        assert!(line.contains(OUTCOME_COST_TEXT), "{line}");
+        let pending = spend_human_line(&rows[1]);
+        assert!(pending.contains("minutes pending"), "{pending}");
+        assert!(!pending.contains("0.00"), "never zero-filled: {pending}");
+    }
+
+    /// Finding #6: the pool level rides the commit feed, so a UI write
+    /// that changes it is as audible as a STOP or a new attempt.
+    fn commit_data(level: usize) -> super::DispatcherData {
+        super::DispatcherData {
+            attempts: vec![],
+            stopped: false,
+            worktrees: vec![],
+            max_concurrent: level,
+            concurrency_source: "test".to_string(),
+            tasks: vec![],
+        }
+    }
+
+    #[test]
+    fn commit_state_carries_the_pool_level() {
+        let state = super::dispatcher_commit_state(&commit_data(3));
+        assert_eq!(
+            state.get("max_concurrent").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn commit_summary_announces_level_changes_only() {
+        let before = super::dispatcher_commit_state(&commit_data(1));
+        let after = super::dispatcher_commit_state(&commit_data(3));
+        let lines = super::summarize_dispatcher_change(&before, &after);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("worker slots") && l.contains('1') && l.contains('3')),
+            "level change audible, got: {lines:?}"
+        );
+        let same = super::summarize_dispatcher_change(&before, &before);
+        assert!(
+            same.iter().all(|l| !l.contains("worker slots")),
+            "steady level stays silent, got: {same:?}"
         );
     }
 }
