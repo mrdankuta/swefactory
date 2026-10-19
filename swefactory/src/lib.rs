@@ -1039,7 +1039,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
     <p>Bea's home for the work being built. Matches <code>factory status</code> + <code>factory log</code>.</p>\
     <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
     <p data-version>factory {version}</p></header>\
-    <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\" data-stream-scope=\"board\" data-stream-url=\"/streams/board\" data-stream-silence-after-ms=\"{}\">\
+    <main><div id=\"board\" data-board-fragment=\"/fragments/board\" data-poll-ms=\"{}\" data-stream-scope=\"board\" data-stream-url=\"/streams/board\" data-stream-silence-after-ms=\"{}\" data-stream-partial-ms=\"{}\">\
     {fragment}</div>{}</main>\
     <script>(function(){{var el=document.getElementById('board');if(!el)return;var url=el.getAttribute('data-board-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
     setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
@@ -1047,6 +1047,7 @@ pub fn board_page_html(columns: &[BoardColumn]) -> String {
         SITE_CSS,
         BOARD_POLL_MS,
         STREAM_SILENCE_AFTER_MS,
+        STREAM_PARTIAL_MS,
         stream_viewer_html("board"),
     )
 }
@@ -1323,6 +1324,22 @@ pub struct DispatcherAttemptView {
     pub finished: String,
 }
 
+/// One live task node as the dispatcher screen sees it: the observable
+/// task graph (ticket #74, spec #66 follow-up) rendered beside the slot
+/// lanes, so the dispatcher-live stream carries the graph. Field-for-field
+/// the `factory dispatch graph --json` row, so prose and machine surfaces
+/// carry the same facts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskGraphNodeView {
+    pub id: String,
+    pub ticket: u64,
+    pub attempt: u64,
+    pub kind: String,
+    pub status: String,
+    pub owner: String,
+    pub waits_on: Vec<String>,
+}
+
 /// The live screen: attempts in slot lanes + STOP state + worktrees.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatcherData {
@@ -1330,6 +1347,11 @@ pub struct DispatcherData {
     pub stopped: bool,
     pub worktrees: Vec<String>,
     pub max_concurrent: usize,
+    /// Live task-graph nodes (ticket #74): the same live rows
+    /// `factory dispatch graph` lists, so the polling fragment and the
+    /// dispatcher-live stream carry the current graph. Empty reads as
+    /// the calm empty section, never a 500.
+    pub tasks: Vec<TaskGraphNodeView>,
 }
 
 /// Calm sentence for zero attempts (ready, not broken).
@@ -1347,6 +1369,75 @@ pub fn dispatcher_no_worktrees_sentence() -> &'static str {
     "No worktrees checked out right now \u{2014} nothing is running, so there is nothing to tidy."
 }
 
+/// Calm sentence for an empty task graph (mirrors the CLI's empty line).
+pub fn task_graph_empty_sentence() -> &'static str {
+    "No live tasks \u{2014} the graph is empty."
+}
+
+/// Read-only live task-graph rows for the dispatcher screen: every live
+/// task of every attempt as one node, owner edge and waits included.
+/// Same live filter and sort as `cmd_dispatch_graph`, so the screen, the
+/// CLI, and the dispatcher-live stream read one graph. Read-only: borrows
+/// the already-loaded ledger, never writes.
+fn live_task_graph_views(ledger: &DispatchLedger) -> Vec<TaskGraphNodeView> {
+    let mut live: Vec<&LiveTask> = ledger
+        .tasks
+        .iter()
+        .filter(|t| !is_task_terminal(&t.status))
+        .collect();
+    live.sort_by(|a, b| (a.ticket, a.attempt, &a.id).cmp(&(b.ticket, b.attempt, &b.id)));
+    live.iter()
+        .map(|t| TaskGraphNodeView {
+            id: t.id.clone(),
+            ticket: t.ticket,
+            attempt: t.attempt,
+            kind: task_kind_text(t).to_string(),
+            status: t.status.clone(),
+            owner: task_owner(t),
+            waits_on: t.waits_on.clone(),
+        })
+        .collect()
+}
+
+/// Fragment HTML for the live task graph (the polling unit): one article
+/// per live node keyed by task id, so a snapshot carries each node
+/// exactly once and reconnects never duplicate. Pure over data so tests
+/// assert markers without a server.
+pub fn task_graph_fragment_html(tasks: &[TaskGraphNodeView]) -> String {
+    let mut html = String::new();
+    html.push_str("<section data-task-graph><h2>Live task graph</h2>");
+    if tasks.is_empty() {
+        html.push_str(&format!(
+            "<p data-no-tasks>{}</p>",
+            task_graph_empty_sentence()
+        ));
+    } else {
+        html.push_str("<div data-task-nodes>");
+        for t in tasks {
+            let waits = if t.waits_on.is_empty() {
+                "waits on nothing".to_string()
+            } else {
+                format!("waits on {}", t.waits_on.join(", "))
+            };
+            html.push_str(&format!(
+                "<article data-task-node=\"{}\" data-ticket=\"{}\" data-attempt=\"{}\" data-kind=\"{}\" data-status=\"{}\" data-owner=\"{}\"><h3>{} {} {}</h3><p data-waits>{}</p></article>",
+                escape_html(&t.id),
+                t.ticket,
+                t.attempt,
+                escape_html(&t.kind),
+                escape_html(&t.status),
+                escape_html(&t.owner),
+                escape_html(&t.id),
+                escape_html(&t.kind),
+                escape_html(&t.status),
+                escape_html(&waits),
+            ));
+        }
+        html.push_str("</div>");
+    }
+    html.push_str("</section>");
+    html
+}
 /// Read-only: `git worktree list` lines. Failures read as none (the
 /// screen renders its calm empty state, never a 500 for missing git).
 fn dispatcher_worktree_lines() -> Vec<String> {
@@ -1394,6 +1485,7 @@ pub fn dispatcher_data() -> DispatcherData {
         stopped,
         worktrees,
         max_concurrent: dispatch_max_concurrent(),
+        tasks: live_task_graph_views(&ledger),
     }
 }
 
@@ -1410,7 +1502,7 @@ pub fn dispatcher_fragment_html(data: &DispatcherData) -> String {
     html.push_str("<div data-stop-controls><form method=\"post\" action=\"/dispatch/stop\" data-stop-form><button type=\"submit\">STOP the loop</button></form>");
     html.push_str("<form method=\"post\" action=\"/dispatch/resume\" data-resume-form><button type=\"submit\">Resume the loop</button></form></div>");
     html.push_str(&format!(
-        "<p data-cli>Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>. Brake: <code>factory dispatch stop</code> / <code>factory dispatch resume</code>. Slots: up to {} concurrent.</p>",
+        "<p data-cli>Matches <code>factory dispatch status</code> + <code>factory dispatch graph</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>. Brake: <code>factory dispatch stop</code> / <code>factory dispatch resume</code>. Slots: up to {} concurrent.</p>",
         data.max_concurrent
     ));
     if data.attempts.is_empty() {
@@ -1463,6 +1555,7 @@ pub fn dispatcher_fragment_html(data: &DispatcherData) -> String {
         }
         html.push_str("</section>");
     }
+    html.push_str(&task_graph_fragment_html(&data.tasks));
     html.push_str("<section data-worktrees><h2>Worktrees</h2>");
     if data.worktrees.is_empty() {
         html.push_str(&format!(
@@ -1502,14 +1595,14 @@ pub fn ticket_detail_page_html(detail: &TicketDetail) -> String {
 <body><header class=\"site\"><h1>Ticket #{}</h1>\
 <p>Body, attempts, and transcript tails. Matches <code>factory log {}</code>.</p>\
 <p data-version>factory {version}</p></header>\
-<main><div id=\"ticket\" data-ticket-fragment=\"/fragments/ticket/{}\" data-poll-ms=\"{}\" data-stream-scope=\"ticket\" data-stream-url=\"/streams/ticket/{}\" data-stream-silence-after-ms=\"{}\">\
+<main><div id=\"ticket\" data-ticket-fragment=\"/fragments/ticket/{}\" data-poll-ms=\"{}\" data-stream-scope=\"ticket\" data-stream-url=\"/streams/ticket/{}\" data-stream-silence-after-ms=\"{}\" data-stream-partial-ms=\"{}\">\
 {fragment}</div>{}</main>\
 <script>(function(){{var el=document.getElementById('ticket');if(!el)return;var url=el.getAttribute('data-ticket-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'15000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
 </body></html>",
         detail.number, SITE_CSS,
         detail.number, detail.number, detail.number, BOARD_POLL_MS,
-        detail.number, STREAM_SILENCE_AFTER_MS,
+        detail.number, STREAM_SILENCE_AFTER_MS, STREAM_PARTIAL_MS,
         stream_viewer_html("ticket"),
     )
 }
@@ -1593,10 +1686,10 @@ pub fn dispatcher_page_html(data: &DispatcherData) -> String {
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <title>Factory dispatcher</title><style>{}</style></head>\
 <body><header class=\"site\"><h1>Factory dispatcher</h1>\
-<p>The status/tail/worktree ritual as one live view. Matches <code>factory dispatch status</code> + <code>factory log &lt;ticket&gt; --tail</code> + <code>git worktree list</code>.</p>\
+<p>The status/tail/worktree ritual as one live view, with the live task graph beside the slot lanes. Matches <code>factory dispatch status</code> + <code>factory dispatch graph</code> + <code>factory log &lt;ticket&gt; --tail</code>.</p>\
 <nav><a href=\"/\">Board</a> | <a href=\"/dispatch\">Dispatcher live</a> | <a href=\"/git\">Git</a> | <a href=\"/files\">Files</a> | <a href=\"/train\">Train review</a></nav>\
 <p data-version>factory {version}</p></header>\
-<main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\" data-stream-scope=\"dispatcher-live\" data-stream-url=\"/streams/dispatch\" data-stream-silence-after-ms=\"{}\">\
+<main><div id=\"dispatch\" data-dispatch-fragment=\"/fragments/dispatch\" data-poll-ms=\"{}\" data-stream-scope=\"dispatcher-live\" data-stream-url=\"/streams/dispatch\" data-stream-silence-after-ms=\"{}\" data-stream-partial-ms=\"{}\">\
 {fragment}</div>{}</main>\
 <script>(function(){{var el=document.getElementById('dispatch');if(!el)return;var url=el.getAttribute('data-dispatch-fragment');var ms=parseInt(el.getAttribute('data-poll-ms')||'3000',10);\
 setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(function(h){{el.innerHTML=h;}}).catch(function(){{}});}},ms);}})();</script>\
@@ -1604,6 +1697,7 @@ setInterval(function(){{fetch(url).then(function(r){{return r.text();}}).then(fu
         SITE_CSS,
         DISPATCHER_POLL_MS,
         STREAM_SILENCE_AFTER_MS,
+        STREAM_PARTIAL_MS,
         stream_viewer_html("dispatch"),
     )
 }
@@ -3008,10 +3102,12 @@ pub fn cmd_ui(addr: &str, allow_remote: bool, json: bool) -> i32 {
 // no bind change (loopback by default, `--allow-remote` as before).
 //
 // Wire order per connection: `hello` (contract version, scope, server
-// time, plus the live rules: keepalive, silence bound, buffer bound)
-// then one `snapshot` (current fragment bytes) then `delta` events
-// only when the fragment bytes move, plus SSE keepalive comments at the
-// documented interval. Reconnects start from a fresh snapshot and are
+// time, plus the live rules: keepalive, silence bound, buffer bound,
+// partial-output bound) then one `snapshot` (current fragment bytes)
+// then `commit` + `delta` pairs only when the fragment bytes move: one
+// compact commit entry beside each full-state delta, so a consumer that
+// never wants full state still learns what moved. Plus SSE keepalive
+// comments at the documented interval. Reconnects start from a fresh snapshot and are
 // never a replay (the middle is simply missed; `status`/`log` stay the
 // record). A connection that delivers no bytes for `silence_after_ms`
 // counts as dead: the viewer says so and offers one re-attach action.
@@ -3066,6 +3162,25 @@ pub fn stream_silence_after_ms() -> u64 {
         .unwrap_or(STREAM_SILENCE_AFTER_MS)
 }
 
+/// Documented partial-output interval (ms): running tool output
+/// (attempt transcript tails) becomes visible within this bound while
+/// the call is still going. Sub-second by design: a long run must read
+/// as watchable, not stalled. The transcript-bearing scopes
+/// (dispatcher-live, ticket) check for output at this cadence even when
+/// the keepalive is long; the suite shortens it further via
+/// `FACTORY_STREAM_PARTIAL_MS`.
+pub const STREAM_PARTIAL_MS: u64 = 500;
+
+/// Effective partial-output interval (ms): the env override when it
+/// parses, the documented default otherwise. Read-only.
+pub fn stream_partial_ms() -> u64 {
+    std::env::var("FACTORY_STREAM_PARTIAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(STREAM_PARTIAL_MS)
+}
+
 /// Documented per-connection buffer bound (events): the most deltas the
 /// server will hold for one slow viewer. Past it the viewer is
 /// disconnected with a re-attach instruction instead of buffering
@@ -3111,11 +3226,35 @@ pub fn stream_hello_json(scope: &str, ticket: Option<u64>) -> serde_json::Value 
         "keepalive_ms": stream_keepalive_ms(),
         "silence_after_ms": stream_silence_after_ms(),
         "buffer_bound": stream_buffer_bound(),
+        "partial_ms": stream_partial_ms(),
     });
     if let Some(n) = ticket {
         hello["ticket"] = serde_json::Value::from(n);
     }
     hello
+}
+
+/// Compact commit entry for one emitted change (ticket #74): scope,
+/// per-connection sequence, content hash of the new state, server time,
+/// and the human entries describing what moved. The ticket scope also
+/// names its ticket. Pure over inputs except the server time.
+fn stream_commit_json(
+    scope: &StreamScope,
+    seq: u64,
+    commit_id: &str,
+    changes: &[String],
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "scope": scope.name(),
+        "seq": seq,
+        "commit": commit_id,
+        "server_time": stream_server_time_secs(),
+        "changes": changes,
+    });
+    if let Some(n) = scope.ticket() {
+        entry["ticket"] = serde_json::Value::from(n);
+    }
+    entry
 }
 
 /// One per-scope stream source: the exact bytes the matching polling
@@ -3157,17 +3296,330 @@ impl StreamScope {
         }
     }
 
-    /// Current fragment bytes for this scope: the same render calls the
-    /// polling handlers serve. Read-only (same seams, no writes).
-    fn snapshot_html(&self) -> String {
+    /// Change-detection tick for this scope (ms): a fifth of the
+    /// keepalive, clamped so slow defaults stay cheap and short test
+    /// beats stay responsive. Transcript-bearing scopes (dispatcher-live,
+    /// ticket) additionally cap at the partial-output interval, so running
+    /// output surfaces within the documented sub-second bound while the
+    /// call is still going. Board cards only move on ledger commits, so
+    /// the board keeps the keepalive-derived beat.
+    fn tick_ms(&self, keepalive_ms: u64) -> u64 {
+        let tick = stream_tick_ms(keepalive_ms);
         match self {
-            StreamScope::Board => board_fragment_html(&board_data()),
-            StreamScope::Ticket { number, raw } => ticket_detail(*number, TICKET_DETAIL_TAIL)
-                .map(|d| ticket_detail_fragment_html(&d))
-                .unwrap_or_else(|| ticket_missing_fragment_html(raw)),
-            StreamScope::DispatcherLive => dispatcher_fragment_html(&dispatcher_data()),
+            StreamScope::Board => tick,
+            StreamScope::Ticket { .. } | StreamScope::DispatcherLive => {
+                tick.min(stream_partial_ms())
+            }
         }
     }
+
+    /// Current fragment bytes for this scope plus the compact commit
+    /// state they derive from: one read of the polling seams renders the
+    /// full html and distills the small JSON the `commit` entries carry.
+    /// A stream can only ever push what polling already shows.
+    fn snapshot(&self) -> (String, serde_json::Value) {
+        match self {
+            StreamScope::Board => {
+                let data = board_data();
+                let html = board_fragment_html(&data);
+                (html, board_commit_state(&data))
+            }
+            StreamScope::Ticket { number, raw } => match ticket_detail(*number, TICKET_DETAIL_TAIL)
+            {
+                Some(detail) => {
+                    let html = ticket_detail_fragment_html(&detail);
+                    (html, ticket_commit_state(&detail))
+                }
+                None => (
+                    ticket_missing_fragment_html(raw),
+                    serde_json::json!({"missing": raw}),
+                ),
+            },
+            StreamScope::DispatcherLive => {
+                let data = dispatcher_data();
+                let html = dispatcher_fragment_html(&data);
+                (html, dispatcher_commit_state(&data))
+            }
+        }
+    }
+
+    /// One-line human entries describing what moved between two commit
+    /// states of this scope. Pure over the states for testing; the
+    /// producer calls it once per emitted change, so every `delta` rides
+    /// with exactly one `commit` entry beside it.
+    fn summarize_change(&self, old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
+        match self {
+            StreamScope::Board => summarize_board_change(old, new),
+            StreamScope::Ticket { .. } => summarize_ticket_change(old, new),
+            StreamScope::DispatcherLive => summarize_dispatcher_change(old, new),
+        }
+    }
+}
+
+/// Compact commit feed (ticket #74, spec #66 follow-up): one `commit`
+/// entry per emitted change, beside the full-state `snapshot`/`delta`
+/// events on the same connection. A consumer that never wants full
+/// state listens to `commit` entries only and still learns what moved:
+/// scope, per-connection sequence, content hash of the new state, and
+/// one-line human entries. Commit states distill the same polling-seam
+/// read the html renders from, so the feed can only ever describe what
+/// polling already shows. Pure builders and diffs over data/JSON so
+/// tests pin them without a server.
+///
+/// Compact commit state for one board snapshot: per-card column plus
+/// status text. Diffs key on issue number.
+fn board_commit_state(columns: &[BoardColumn]) -> serde_json::Value {
+    let cards: Vec<serde_json::Value> = columns
+        .iter()
+        .flat_map(|c| {
+            c.cards.iter().map(|card| {
+                serde_json::json!({
+                    "column": c.id,
+                    "number": card.number,
+                    "title": card.title,
+                    "status": card.status_text,
+                })
+            })
+        })
+        .collect();
+    serde_json::json!({"cards": cards})
+}
+
+/// Compact commit state for one ticket snapshot: issue state plus per-
+/// attempt status and transcript length. Diffs key on attempt number.
+fn ticket_commit_state(detail: &TicketDetail) -> serde_json::Value {
+    let attempts: Vec<serde_json::Value> = detail
+        .attempts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "n": a.attempt_no,
+                "status": a.status,
+                "tail_lines": a.transcript.lines().count(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "ticket": detail.number,
+        "state": detail.state,
+        "title": detail.title,
+        "attempts": attempts,
+    })
+}
+
+/// Compact commit state for one dispatcher snapshot: STOP flag, per-slot
+/// status plus transcript length, live task nodes, and worktrees. Diffs
+/// key attempts on slot and tasks on node id.
+fn dispatcher_commit_state(data: &DispatcherData) -> serde_json::Value {
+    let attempts: Vec<serde_json::Value> = data
+        .attempts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "slot": a.slot,
+                "status": a.status,
+                "tail_lines": a.transcript_tail.lines().count(),
+            })
+        })
+        .collect();
+    let tasks: Vec<serde_json::Value> = data
+        .tasks
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "kind": t.kind,
+                "status": t.status,
+                "owner": t.owner,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "stopped": data.stopped,
+        "attempts": attempts,
+        "tasks": tasks,
+        "worktrees": data.worktrees,
+    })
+}
+
+/// Items of one commit-state array, in order. Missing reads as empty.
+fn commit_state_items(state: &serde_json::Value, key: &str) -> Vec<serde_json::Value> {
+    state
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.to_vec())
+        .unwrap_or_default()
+}
+
+/// String field of one commit-state item. Missing reads as empty.
+fn commit_field(item: &serde_json::Value, field: &str) -> String {
+    item.get(field)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Board diff keyed on issue number: joins, leaves, column moves, and
+/// card updates. Sorted so the entry order is deterministic.
+fn summarize_board_change(old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
+    let mut before: std::collections::BTreeMap<u64, (String, String)> =
+        std::collections::BTreeMap::new();
+    for card in commit_state_items(old, "cards") {
+        if let Some(n) = card.get("number").and_then(|v| v.as_u64()) {
+            before.insert(
+                n,
+                (commit_field(&card, "column"), commit_field(&card, "status")),
+            );
+        }
+    }
+    let mut out = Vec::new();
+    for card in commit_state_items(new, "cards") {
+        let Some(n) = card.get("number").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let column = commit_field(&card, "column");
+        let status = commit_field(&card, "status");
+        match before.remove(&n) {
+            None => out.push(format!("#{n} joined {column}")),
+            Some((old_column, _)) if old_column != column => {
+                out.push(format!("#{n} {old_column}\u{2192}{column}"))
+            }
+            Some((_, old_status)) if old_status != status => {
+                out.push(format!("#{n} updated: {status}"))
+            }
+            _ => {}
+        }
+    }
+    for n in before.keys() {
+        out.push(format!("#{n} left"));
+    }
+    out.sort();
+    out
+}
+
+/// Ticket diff keyed on attempt number: starts, transitions, transcript
+/// growth, and leaves, plus an issue-level update marker. Sorted.
+fn summarize_ticket_change(old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if old.get("state") != new.get("state") || old.get("title") != new.get("title") {
+        out.push("ticket updated".to_string());
+    }
+    let mut before: std::collections::BTreeMap<u64, (String, i64)> =
+        std::collections::BTreeMap::new();
+    for a in commit_state_items(old, "attempts") {
+        if let Some(n) = a.get("n").and_then(|v| v.as_u64()) {
+            let lines = a.get("tail_lines").and_then(|v| v.as_i64()).unwrap_or(0);
+            before.insert(n, (commit_field(&a, "status"), lines));
+        }
+    }
+    for a in commit_state_items(new, "attempts") {
+        let Some(n) = a.get("n").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let status = commit_field(&a, "status");
+        let lines = a.get("tail_lines").and_then(|v| v.as_i64()).unwrap_or(0);
+        match before.remove(&n) {
+            None => out.push(format!("attempt {n} started")),
+            Some((old_status, old_lines)) => {
+                if old_status != status {
+                    out.push(format!("attempt {n} {old_status}\u{2192}{status}"));
+                }
+                if lines != old_lines {
+                    out.push(format!("attempt {n} {:+} lines", lines - old_lines));
+                }
+            }
+        }
+    }
+    for n in before.keys() {
+        out.push(format!("attempt {n} left"));
+    }
+    out.sort();
+    out
+}
+
+/// Dispatcher diff: STOP toggles, per-slot starts/transitions/output
+/// growth/leaves, task joins/leaves/transitions, worktree moves. Sorted.
+fn summarize_dispatcher_change(old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if old.get("stopped") != new.get("stopped") {
+        out.push(
+            if new
+                .get("stopped")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "STOP halted".to_string()
+            } else {
+                "dispatch loop resumed".to_string()
+            },
+        );
+    }
+    let mut before: std::collections::BTreeMap<String, (String, i64)> =
+        std::collections::BTreeMap::new();
+    for a in commit_state_items(old, "attempts") {
+        let lines = a.get("tail_lines").and_then(|v| v.as_i64()).unwrap_or(0);
+        before.insert(
+            commit_field(&a, "slot"),
+            (commit_field(&a, "status"), lines),
+        );
+    }
+    for a in commit_state_items(new, "attempts") {
+        let slot = commit_field(&a, "slot");
+        if slot.is_empty() {
+            continue;
+        }
+        let status = commit_field(&a, "status");
+        let lines = a.get("tail_lines").and_then(|v| v.as_i64()).unwrap_or(0);
+        match before.remove(&slot) {
+            None => out.push(format!("+attempt {slot}")),
+            Some((old_status, old_lines)) => {
+                if old_status != status {
+                    out.push(format!("{slot} {old_status}\u{2192}{status}"));
+                }
+                if lines != old_lines {
+                    out.push(format!("{slot} {:+} lines", lines - old_lines));
+                }
+            }
+        }
+    }
+    for slot in before.keys() {
+        out.push(format!("-attempt {slot}"));
+    }
+    let mut old_tasks: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for t in commit_state_items(old, "tasks") {
+        old_tasks.insert(commit_field(&t, "id"), commit_field(&t, "status"));
+    }
+    for t in commit_state_items(new, "tasks") {
+        let id = commit_field(&t, "id");
+        if id.is_empty() {
+            continue;
+        }
+        let status = commit_field(&t, "status");
+        match old_tasks.remove(&id) {
+            None => out.push(format!("+task {id}")),
+            Some(old_status) if old_status != status => {
+                out.push(format!("task {id} {old_status}\u{2192}{status}"))
+            }
+            _ => {}
+        }
+    }
+    for id in old_tasks.keys() {
+        out.push(format!("-task {id}"));
+    }
+    if old.get("worktrees") != new.get("worktrees") {
+        out.push("worktrees moved".to_string());
+    }
+    out.sort();
+    out
+}
+
+/// Short content hash naming one emitted state commit: two viewers that
+/// read the same state compute the same id, so the compact feed stays
+/// comparable across connections. Hex of the sha256, truncated.
+fn stream_commit_id(html: &str) -> String {
+    let digest = Sha256::digest(html.as_bytes());
+    format!("{digest:x}")[..16].to_string()
 }
 
 /// `?version=` gate: present and mismatched means a loud 400 naming the
@@ -3339,29 +3791,58 @@ fn spawn_stream_producer(
         ) {
             return;
         }
-        let mut last = scope.snapshot_html();
+        let (mut last_html, mut last_state) = scope.snapshot();
+        let mut seq: u64 = 0;
         if !producer.push(
             axum::response::sse::Event::default()
                 .event("snapshot")
-                .data(stream_html_envelope(&last)),
+                .data(stream_html_envelope(&last_html)),
         ) {
             return;
         }
-        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(stream_tick_ms(
-            keepalive_ms,
-        )));
+        // Per-connection commit sequence: the first emitted change is
+        // seq 1, so a compact-feed consumer can tell a missed middle
+        // (a gap in seq) from a quiet loop.
+        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(
+            scope.tick_ms(keepalive_ms),
+        ));
         ticks.tick().await;
         loop {
             ticks.tick().await;
             if producer.is_closed() {
                 return;
             }
-            let now = scope.snapshot_html();
-            if now != last {
-                last = now;
+            let (now_html, now_state) = scope.snapshot();
+            if now_html != last_html {
+                seq += 1;
+                let mut changes = scope.summarize_change(&last_state, &now_state);
+                if changes.is_empty() {
+                    changes.push("state moved".to_string());
+                }
+                let commit = serde_json::to_string(&stream_commit_json(
+                    &scope,
+                    seq,
+                    &stream_commit_id(&now_html),
+                    &changes,
+                ))
+                .unwrap_or_else(|_| "{}".to_string());
+                last_html = now_html;
+                last_state = now_state;
+                // One entry per commit, announced before the full state
+                // it derives from; the pair travels together past the
+                // same backpressure bound.
+                if !producer.push_delta(
+                    axum::response::sse::Event::default()
+                        .event("commit")
+                        .data(commit),
+                    &scope,
+                    buffer_bound,
+                ) {
+                    return;
+                }
                 let event = axum::response::sse::Event::default()
                     .event("delta")
-                    .data(stream_html_envelope(&last));
+                    .data(stream_html_envelope(&last_html));
                 if !producer.push_delta(event, &scope, buffer_bound) {
                     return;
                 }
@@ -15036,5 +15517,149 @@ mod outcome_tests {
         assert!(figures.autonomous);
         std::env::remove_var("FACTORY_STATE_DIR");
         std::env::remove_var("FACTORY_GH_BIN");
+    }
+}
+
+// --- compact commit feed + partial output, TDD red (ticket #74, spec #66) ---
+//
+// Pure diffs and tick selection pinned without a server: what moved
+// between two commit states, and which cadence each scope checks at.
+// The loopback suite (ui_streams.rs) pins the same behavior through
+// event order and view state on the wire.
+#[cfg(test)]
+mod stream_commit_tests {
+    use super::{
+        stream_commit_id, stream_partial_ms, stream_tick_ms, summarize_board_change,
+        summarize_dispatcher_change, summarize_ticket_change, StreamScope, STREAM_PARTIAL_MS,
+    };
+
+    fn dispatcher_states() -> (serde_json::Value, serde_json::Value) {
+        let old = serde_json::json!({
+            "stopped": false,
+            "attempts": [{"slot": "T9-a1", "status": "impl_running", "tail_lines": 2}],
+            "tasks": [{"id": "t1", "kind": "parent", "status": "running", "owner": "attempt:T9-a1"}],
+            "worktrees": ["/tmp/wt1"],
+        });
+        let new = serde_json::json!({
+            "stopped": false,
+            "attempts": [{"slot": "T9-a1", "status": "impl_done", "tail_lines": 4}],
+            "tasks": [
+                {"id": "t1", "kind": "parent", "status": "running", "owner": "attempt:T9-a1"},
+                {"id": "t2", "kind": "child", "status": "running", "owner": "task:t1"}
+            ],
+            "worktrees": ["/tmp/wt1"],
+        });
+        (old, new)
+    }
+
+    #[test]
+    fn dispatcher_diff_names_transitions_joins_and_output_growth() {
+        let (old, new) = dispatcher_states();
+        let changes = summarize_dispatcher_change(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|c| c == "T9-a1 impl_running\u{2192}impl_done"),
+            "status transition, got: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|c| c == "T9-a1 +2 lines"),
+            "output growth, got: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|c| c == "+task t2"),
+            "task join, got: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn dispatcher_diff_names_leaves_and_stop_toggles() {
+        let (mut old, _) = dispatcher_states();
+        old["stopped"] = serde_json::Value::Bool(true);
+        let new = serde_json::json!({
+            "stopped": false,
+            "attempts": [],
+            "tasks": [],
+            "worktrees": [],
+        });
+        let changes = summarize_dispatcher_change(&old, &new);
+        assert!(changes.contains(&"dispatch loop resumed".to_string()));
+        assert!(changes.contains(&"-attempt T9-a1".to_string()));
+        assert!(changes.contains(&"-task t1".to_string()));
+        assert!(changes.contains(&"worktrees moved".to_string()));
+    }
+
+    #[test]
+    fn board_diff_names_column_moves_and_updates() {
+        let old = serde_json::json!({"cards": [
+            {"column": "ready", "number": 9, "title": "Sprout", "status": "Ready to build."},
+            {"column": "open", "number": 10, "title": "Seed", "status": "New."},
+        ]});
+        let new = serde_json::json!({"cards": [
+            {"column": "running", "number": 9, "title": "Sprout", "status": "Being built now."},
+            {"column": "open", "number": 11, "title": "Root", "status": "New."},
+        ]});
+        let changes = summarize_board_change(&old, &new);
+        assert!(changes.contains(&"#9 ready\u{2192}running".to_string()));
+        assert!(changes.contains(&"#10 left".to_string()));
+        assert!(changes.contains(&"#11 joined open".to_string()));
+    }
+
+    #[test]
+    fn ticket_diff_names_starts_transitions_and_growth() {
+        let old = serde_json::json!({
+            "ticket": 9, "state": "open", "title": "Sprout",
+            "attempts": [{"n": 1, "status": "impl_running", "tail_lines": 2}],
+        });
+        let new = serde_json::json!({
+            "ticket": 9, "state": "open", "title": "Sprout",
+            "attempts": [
+                {"n": 1, "status": "impl_done", "tail_lines": 5},
+                {"n": 2, "status": "review_running", "tail_lines": 0},
+            ],
+        });
+        let changes = summarize_ticket_change(&old, &new);
+        assert!(changes.contains(&"attempt 1 impl_running\u{2192}impl_done".to_string()));
+        assert!(changes.contains(&"attempt 1 +3 lines".to_string()));
+        assert!(changes.contains(&"attempt 2 started".to_string()));
+    }
+
+    #[test]
+    fn identical_states_summarize_to_nothing() {
+        let (old, _) = dispatcher_states();
+        assert!(summarize_dispatcher_change(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn commit_ids_are_stable_short_hashes() {
+        let a = stream_commit_id("<section>same</section>");
+        assert_eq!(a, stream_commit_id("<section>same</section>"));
+        assert_eq!(a.len(), 16, "truncated hex, got: {a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, stream_commit_id("<section>moved</section>"));
+    }
+
+    #[test]
+    fn transcript_scopes_tick_at_the_partial_bound() {
+        assert_eq!(STREAM_PARTIAL_MS, 500, "documented sub-second bound");
+        assert_eq!(stream_partial_ms(), 500, "unset env reads as the default");
+        // Slow default keepalive (15s): the board keeps its cheap beat
+        // while running-output scopes cap at the partial bound.
+        let slow = 15_000;
+        assert_eq!(stream_tick_ms(slow), 1_000);
+        assert_eq!(StreamScope::Board.tick_ms(slow), 1_000);
+        for scope in [
+            StreamScope::DispatcherLive,
+            StreamScope::Ticket {
+                number: 9,
+                raw: "9".to_string(),
+            },
+        ] {
+            assert_eq!(
+                scope.tick_ms(slow),
+                500,
+                "running output surfaces within the documented bound"
+            );
+        }
     }
 }
