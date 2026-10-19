@@ -582,6 +582,13 @@ async fn seeded_attempt_transition_arrives_as_delta_after_snapshot() {
 
     let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
     assert_eq!(
+        event, "commit",
+        "transitions announce as one commit entry beside the delta"
+    );
+    let entry: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert_eq!(entry["scope"], "dispatcher-live", "got: {entry}");
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(
         event, "delta",
         "transitions ride as deltas, never a second snapshot"
     );
@@ -637,7 +644,10 @@ async fn second_client_sees_live_state_immediately_and_viewers_agree() {
     );
 
     // The first viewer converges on the same bytes within the documented
-    // keepalive interval: two viewers never disagree past it.
+    // keepalive interval: two viewers never disagree past it. The
+    // transition announces as one commit entry beside its delta.
+    let (event, _) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "commit");
     let (event, data) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
     assert_eq!(event, "delta");
     let converged: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
@@ -724,7 +734,12 @@ async fn stream_silence_and_buffer_bounds_are_documented() {
     // The hello advertises the live rules so viewers (and tests) read
     // them from the wire instead of the source.
     let hello = factory_lib::stream_hello_json("board", None);
-    for field in ["keepalive_ms", "silence_after_ms", "buffer_bound"] {
+    for field in [
+        "keepalive_ms",
+        "silence_after_ms",
+        "buffer_bound",
+        "partial_ms",
+    ] {
         assert!(
             hello
                 .get(field)
@@ -1348,6 +1363,400 @@ async fn closing_every_client_leaves_the_loop_running() {
             .unwrap()
             .contains("data-status=\"impl_done\""),
         "fresh snapshot after close-all shows the completed loop"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+// --- ticket #74 (spec #66 follow-up): task-graph watch + compact feed + partial output ---
+//
+// Three stream-transport gaps as one delivery, all riding the existing
+// transport and scopes (board, ticket, dispatcher-live): no new scopes,
+// no new auth, no replay. Tests pin external behavior only against a
+// loopback server: event order plus parsed payloads plus view-state
+// markers, never wire bytes beyond ordering or store internals.
+
+/// Rewrite the ledger's live-task nodes in place (the graph producers'
+/// write path; streams only ever read). Fields mirror LiveTask's serde
+/// shape; absent optionals parse by default.
+fn set_ledger_tasks(state: &Path, tasks: serde_json::Value) {
+    let path = state.join("dispatch.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    ledger["tasks"] = tasks;
+    fs::write(path, serde_json::to_string_pretty(&ledger).unwrap()).unwrap();
+}
+
+/// Append raw lines to the seeded attempt's log without touching its
+/// status: the call is still going, only its output grows.
+fn append_log_lines(state: &Path, extra: &str) {
+    let path = state.join("logs").join("T9-a1.log");
+    let mut cur = fs::read_to_string(&path).unwrap();
+    cur.push_str(extra);
+    fs::write(path, cur).unwrap();
+}
+
+/// Count literal occurrences of a view-state marker.
+fn count_occurrences(hay: &str, needle: &str) -> usize {
+    hay.match_indices(needle).count()
+}
+
+fn live_tasks_fixture() -> serde_json::Value {
+    serde_json::json!([
+        {"id": "t1", "ticket": 9, "attempt": 1, "parent": null, "kind": "parent", "status": "running", "waits_on": []},
+        {"id": "t2", "ticket": 9, "attempt": 1, "parent": "t1", "kind": "child", "status": "waiting", "waits_on": ["t3"]}
+    ])
+}
+
+#[tokio::test]
+async fn task_graph_streams_live_and_reconnects_never_duplicate_nodes() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("task-graph");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    // The graph exists before any viewer attaches: t1 runs, t2 waits on t3.
+    set_ledger_tasks(&state, live_tasks_fixture());
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("2000", "64");
+    let (port, server) = serve_port().await;
+
+    // The late joiner starts from the current graph: one node per live id.
+    let mut first = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    let html = snapshot["html"].as_str().unwrap().to_string();
+    assert!(
+        html.contains("data-task-graph"),
+        "dispatcher snapshot carries the live graph, got:\n{html:.500}"
+    );
+    assert_eq!(count_occurrences(&html, "data-task-node=\"t1\""), 1);
+    assert_eq!(count_occurrences(&html, "data-task-node=\"t2\""), 1);
+
+    // The loop moves while viewers watch: t2 finishes (leaves the graph
+    // on the commit that marks it terminal) and t3 joins.
+    set_ledger_tasks(
+        &state,
+        serde_json::json!([
+            {"id": "t1", "ticket": 9, "attempt": 1, "parent": null, "kind": "parent", "status": "running", "waits_on": []},
+            {"id": "t2", "ticket": 9, "attempt": 1, "parent": "t1", "kind": "child", "status": "done", "waits_on": []},
+            {"id": "t3", "ticket": 9, "attempt": 1, "parent": "t1", "kind": "child", "status": "running", "waits_on": []}
+        ]),
+    );
+
+    // A second viewer joins late, after the move: its snapshot is the
+    // current graph, never a replay of the middle.
+    let before = fs::read(state.join("dispatch.json")).unwrap();
+    let mut second = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    let html = snapshot["html"].as_str().unwrap().to_string();
+    assert_eq!(
+        count_occurrences(&html, "data-task-node=\"t1\""),
+        1,
+        "current graph keeps t1 exactly once, got:\n{html:.500}"
+    );
+    assert_eq!(
+        count_occurrences(&html, "data-task-node=\"t3\""),
+        1,
+        "current graph carries the joined node exactly once, got:\n{html:.500}"
+    );
+    assert_eq!(
+        count_occurrences(&html, "data-task-node=\"t2\""),
+        0,
+        "the terminal node left the graph, got:\n{html:.500}"
+    );
+    // Viewers are observers: attaching changed no ledger byte.
+    assert_eq!(
+        fs::read(state.join("dispatch.json")).unwrap(),
+        before,
+        "late attach is read-only"
+    );
+
+    // Reconnect after a kill: hello, then ONE fresh snapshot of now —
+    // the middle was missed, nothing is duplicated.
+    second.kill();
+    drop(second);
+    let mut reattached = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello", "reconnect opens with hello, not a replay");
+    let (event, data) = next_event(&mut reattached, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot", "reconnect lands on a fresh snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    let html = snapshot["html"].as_str().unwrap().to_string();
+    for id in ["t1", "t3"] {
+        assert_eq!(
+            count_occurrences(&html, &format!("data-task-node=\"{id}\"")),
+            1,
+            "reconnected graph carries {id} exactly once, got:\n{html:.500}"
+        );
+    }
+    assert_eq!(count_occurrences(&html, "data-task-node=\"t2\""), 0);
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn compact_feed_carries_one_entry_per_commit_on_every_scope() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("commit-feed");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("2000", "64");
+    let (port, server) = serve_port().await;
+
+    // One viewer per scope, every one past its snapshot.
+    let mut board = LiveTap::attach(port, "/streams/board").await;
+    let mut ticket = LiveTap::attach(port, "/streams/ticket/9").await;
+    let mut live = LiveTap::attach(port, "/streams/dispatch").await;
+    for tap in [&mut board, &mut ticket, &mut live] {
+        let (event, _) = next_event(tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "hello");
+        let (event, _) = next_event(tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "snapshot");
+    }
+
+    // One ledger commit: the running attempt finishes implement.
+    set_attempt_status(&state, "impl_done");
+
+    // Every scope carries exactly one compact entry beside its delta:
+    // commit first, then the full state it derives from.
+    for (tap, scope) in [
+        (&mut board, "board"),
+        (&mut ticket, "ticket"),
+        (&mut live, "dispatcher-live"),
+    ] {
+        let (event, data) = next_event(tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            event, "commit",
+            "{scope} announces the commit before its delta"
+        );
+        assert_eq!(data.len(), 1, "commit carries one JSON line");
+        let entry: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+        assert_eq!(entry["scope"], scope, "got: {entry}");
+        assert_eq!(
+            entry["seq"], 1,
+            "first commit on a fresh connection is seq 1, got: {entry}"
+        );
+        assert!(
+            entry["commit"].as_str().is_some_and(|c| !c.is_empty()),
+            "one entry names its commit, got: {entry}"
+        );
+        assert!(
+            entry["server_time"].as_u64().is_some_and(|t| t > 0),
+            "commit names server time, got: {entry}"
+        );
+        let changes = entry["changes"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !changes.is_empty(),
+            "the entry is sufficient without full state, got: {entry}"
+        );
+        let text = serde_json::to_string(&changes).unwrap();
+        let want = match scope {
+            "board" => "#9",
+            "ticket" => "attempt 1",
+            _ => "T9-a1",
+        };
+        assert!(
+            text.contains(want) && text.contains("impl_done"),
+            "a consumer that never wants full state still learns what moved, got: {entry}"
+        );
+        if scope == "ticket" {
+            assert_eq!(entry["ticket"], 9, "got: {entry}");
+        }
+
+        let (event, data) = next_event(tap, std::time::Duration::from_secs(10)).await;
+        assert_eq!(event, "delta", "{scope} follows with full state");
+        let delta: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+        let delta_html = delta["html"].as_str().unwrap();
+        let delta_want = match scope {
+            "ticket" => "finished implement, awaiting review",
+            _ => "impl_done",
+        };
+        assert!(
+            delta_html.contains(delta_want),
+            "{scope} delta carries the finished attempt"
+        );
+    }
+
+    // Exactly one entry per commit: nothing else was committed, so no
+    // scope may repeat or invent another entry.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+    for (tap, scope) in [
+        (&mut board, "board"),
+        (&mut ticket, "ticket"),
+        (&mut live, "dispatcher-live"),
+    ] {
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Some(block) = tap.next_block(remaining).await {
+                let (event, _) = parse_block(&block);
+                assert!(
+                    event.as_deref() != Some("commit") && event.as_deref() != Some("delta"),
+                    "{scope} emits exactly one entry per commit, got extra: {event:?}"
+                );
+            }
+        }
+    }
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn running_output_surfaces_within_partial_interval_while_call_continues() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("partial-output");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    unsafe {
+        // An hour-long keepalive: any fast arrival below is the partial
+        // beat's doing, never the keepalive's.
+        std::env::set_var("FACTORY_STREAM_KEEPALIVE_MS", "3600000");
+        std::env::set_var("FACTORY_STREAM_PARTIAL_MS", "100");
+    }
+    set_stream_rule_env("30000", "64");
+    let (port, server) = serve_port().await;
+
+    let mut tap = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    assert_eq!(
+        hello_payload(&data)["partial_ms"],
+        100,
+        "hello advertises the documented sub-second interval"
+    );
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("a1 implement line 2"),
+        "snapshot shows the seeded output"
+    );
+
+    // The call is still going (status untouched): only output grows.
+    let started = std::time::Instant::now();
+    append_log_lines(
+        &state,
+        "a1 implement line 3\npartial line 4 still running\n",
+    );
+
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "commit", "running output commits while going");
+    let entry: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    let text = serde_json::to_string(&entry["changes"]).unwrap();
+    assert!(
+        text.contains("T9-a1") && text.contains("+2 lines"),
+        "the entry names the growing output, got: {entry}"
+    );
+    let (event, data) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "delta");
+    let delta: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    let html = delta["html"].as_str().unwrap().to_string();
+    assert!(
+        html.contains("partial line 4 still running"),
+        "running output is visible mid-call, got:\n{html:.500}"
+    );
+    assert!(
+        html.contains("data-status=\"impl_running\""),
+        "the call is still going in the same delta, got:\n{html:.500}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "visible well inside any slow beat (keepalive is an hour)"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+#[tokio::test]
+async fn commit_feed_reconnects_from_snapshot_with_no_replay_and_changes_nothing() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("feed-reconnect");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    set_stream_rule_env("2000", "64");
+    let (port, server) = serve_port().await;
+
+    let mut first = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, _) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    set_attempt_status(&state, "impl_done");
+    let (event, data) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "commit");
+    let entry: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert_eq!(entry["seq"], 1);
+    let (event, _) = next_event(&mut first, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "delta");
+    first.kill();
+    drop(first);
+
+    // The loop moves while nobody watches: output grows, no viewer queued.
+    append_log_lines(&state, "unwatched line while dead\n");
+    let before = fs::read(state.join("dispatch.json")).unwrap();
+
+    // Reconnect: hello, then ONE fresh snapshot of now — the missed
+    // commit is never replayed as an entry.
+    let mut second = LiveTap::attach(port, "/streams/dispatch").await;
+    let (event, _) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello", "reconnect opens with hello, not a replay");
+    let (event, data) = next_event(&mut second, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot", "reconnect lands on a fresh snapshot");
+    let snapshot: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert!(
+        snapshot["html"]
+            .as_str()
+            .unwrap()
+            .contains("unwatched line while dead"),
+        "fresh snapshot shows what happened while dead"
+    );
+
+    // Quiet: no replayed commit, delta, or second snapshot follows.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Some(block) = second.next_block(remaining).await {
+            let (event, _) = parse_block(&block);
+            assert!(
+                event.as_deref() != Some("commit")
+                    && event.as_deref() != Some("delta")
+                    && event.as_deref() != Some("snapshot"),
+                "no replayed entries after a fresh snapshot, got: {event:?}"
+            );
+        }
+    }
+    // Viewers are observers: the whole attach/kill/reconnect cycle moved
+    // no ledger byte.
+    assert_eq!(
+        fs::read(state.join("dispatch.json")).unwrap(),
+        before,
+        "streaming changed nothing about the running loop"
     );
 
     server.abort();
