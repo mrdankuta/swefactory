@@ -39,7 +39,9 @@ pub enum Commands {
     /// Print the factory version.
     Version,
     /// One-screen factory health: version, project files, open train,
-    /// live attempts, STOP state. Read-only: observing changes nothing.
+    /// live attempts, loop state, plus a compact finished-history summary
+    /// (counts by state, most recent first). Full per-ticket history stays
+    /// behind `factory log <ticket>`. Read-only: observing changes nothing.
     /// Exit 0 whenever the state was read successfully (even when empty);
     /// nonzero only on unreadable state (missing/corrupt ledger) with the
     /// cause named. The global --json flag selects machine output.
@@ -364,8 +366,19 @@ pub enum DispatchAction {
         #[arg(long, default_value_t = 300)]
         interval: u64,
     },
-    /// Show attempts + worktrees + STOP state.
-    Status,
+    /// Show attempts + worktrees + loop state. Human output renders an
+    /// aligned-column table bounded to live attempts plus the most recent
+    /// finished attempts; `--all` opts into the full history. Read-only:
+    /// observing changes nothing. Exit 0 whenever the ledger read
+    /// succeeded (even when empty); nonzero only on unreadable state.
+    /// The global --json flag selects machine output carrying every
+    /// attempt with every field, bounded or not.
+    Status {
+        /// Show the full attempt history instead of live plus recent.
+        /// Machine output always carries every attempt either way.
+        #[arg(long)]
+        all: bool,
+    },
     /// Live task graph: every live task of every live attempt as a node
     /// with its owner edge (owning task, or the attempt itself), status,
     /// and what it is waiting on. Read-only: observing changes nothing.
@@ -7798,6 +7811,41 @@ fn is_resumable(a: &DispatchAttempt) -> bool {
     is_interrupted_status(&a.status)
 }
 
+/// Live vs finished (ticket #90): running or interrupted attempts still
+/// own the loop; everything else is finished history to summarize, not dump.
+fn is_live_attempt(a: &DispatchAttempt) -> bool {
+    matches!(a.status.as_str(), "impl_running" | "review_running")
+        || is_interrupted_status(&a.status)
+}
+
+/// Finished-history rows shown before the `--all` opt-in (ticket #90):
+/// live attempts always render, plus this many of the most recent finished.
+const HISTORY_RECENT_LIMIT: usize = 8;
+
+/// Counts of attempts by status, alphabetical for stable output.
+fn count_by_status<'a, I>(statuses: I) -> Vec<(String, usize)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for s in statuses {
+        *counts.entry(s).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(s, n)| (s.to_string(), n))
+        .collect()
+}
+
+/// Compact `state xN` words for a history/totals line.
+fn counts_words(counts: &[(String, usize)]) -> String {
+    counts
+        .iter()
+        .map(|(s, n)| format!("{s} x{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Newest resumable checkpoint wins (ticket #61, spec #59): the newest
 /// record for this ticket, when it reads interrupted. An older
 /// interrupted row under a newer running/done/failed row never resumes —
@@ -9840,10 +9888,27 @@ pub fn cmd_status(json: bool) -> i32 {
             );
         }
     }
-    if ledger.attempts.is_empty() {
-        println!("attempts: no attempts yet.");
+    // Human contract (ticket #90): version, project files, open train,
+    // live attempts, loop state — plus a compact finished-history summary.
+    // Full per-ticket history stays behind `factory log <ticket>`.
+    let live: Vec<&DispatchAttempt> = ledger
+        .attempts
+        .iter()
+        .filter(|a| is_live_attempt(a))
+        .collect();
+    let finished: Vec<&DispatchAttempt> = ledger
+        .attempts
+        .iter()
+        .filter(|a| !is_live_attempt(a))
+        .collect();
+    if live.is_empty() {
+        if ledger.attempts.is_empty() {
+            println!("attempts: no attempts yet.");
+        } else {
+            println!("attempts: no live attempts.");
+        }
     } else {
-        for a in &ledger.attempts {
+        for a in &live {
             let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
             let suffix = resumed_suffix(a);
             match a.status.as_str() {
@@ -9898,10 +9963,37 @@ pub fn cmd_status(json: bool) -> i32 {
         }
     }
     print_paused_copy(ledger.attempts.iter().any(is_resumable));
-    if stopped {
-        println!("STOP: dispatch loop is halted (STOP file present).");
+    if finished.is_empty() {
+        println!(
+            "history: (none) \u{2014} no finished attempts yet. Full per-ticket history: factory log <ticket>."
+        );
     } else {
-        println!("STOP: dispatch loop running (no STOP file).");
+        let counts = count_by_status(finished.iter().map(|a| a.status.as_str()));
+        println!(
+            "history: {} finished ({}).",
+            finished.len(),
+            counts_words(&counts)
+        );
+        println!("recent (newest first):");
+        for a in finished.iter().rev().take(HISTORY_RECENT_LIMIT) {
+            if a.finished_at.is_empty() {
+                println!(
+                    "  T{}-a{} {} (started {}).",
+                    a.ticket, a.attempt_no, a.status, a.started_at
+                );
+            } else {
+                println!(
+                    "  T{}-a{} {} (started {}, finished {}).",
+                    a.ticket, a.attempt_no, a.status, a.started_at, a.finished_at
+                );
+            }
+        }
+        println!("Full per-ticket history: factory log <ticket>.");
+    }
+    if stopped {
+        println!("loop: STOPPED");
+    } else {
+        println!("loop: running");
     }
     0
 }
@@ -12886,7 +12978,7 @@ pub fn cmd_dispatch_memo(
     0
 }
 
-pub fn cmd_dispatch_status(json: bool) -> i32 {
+pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
     let state = dispatch_state_dir();
     let ledger = load_ledger(&state);
     let worktrees = run_git(&["worktree", "list"], None)
@@ -12931,56 +13023,113 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
             serde_json::json!({"attempts": attempts, "decision_memos": memos, "owned_tasks": ledger.owned_tasks, "abort_log": ledger.abort_log, "worktrees": wt_lines, "stopped": stopped})
         );
     } else {
+        // Human contract (ticket #90): an aligned-column table over live
+        // attempts plus the most recent finished attempts (`--all` opts
+        // into the full history), then a totals line carrying the loop
+        // state. Internal ledger ids stay in `--json`; humans read slots.
         println!("== dispatch attempts ==");
         if ledger.attempts.is_empty() {
             println!("(none)");
-        }
-        for a in &ledger.attempts {
-            let base8: String = a.base_commit.chars().take(8).collect();
-            let head8: String = a.head_commit.chars().take(8).collect();
-            let resumable = if is_resumable(a) { " resumable" } else { "" };
-            let resumed = if a.resumed > 0 {
-                format!(" resumed={}", a.resumed)
+        } else {
+            let live: Vec<&DispatchAttempt> = ledger
+                .attempts
+                .iter()
+                .filter(|a| is_live_attempt(a))
+                .collect();
+            let finished: Vec<&DispatchAttempt> = ledger
+                .attempts
+                .iter()
+                .filter(|a| !is_live_attempt(a))
+                .collect();
+            let recent: Vec<&DispatchAttempt> = if all {
+                finished.clone()
             } else {
-                String::new()
-            };
-            // Memo facts ride the attempt line (ticket #67): empty when
-            // the attempt has no memos, so memo-less output is byte-identical.
-            let memos = attempt_memos(&ledger, a.ticket, a.attempt_no);
-            let memo_words = if memos.is_empty() {
-                String::new()
-            } else {
-                let pairs: Vec<String> = memos
+                finished
                     .iter()
-                    .map(|m| format!("{}={}", m.key, m.decision))
-                    .collect();
-                format!(" memos={} ({})", memos.len(), pairs.join(", "))
+                    .rev()
+                    .take(HISTORY_RECENT_LIMIT)
+                    .copied()
+                    .collect::<Vec<&DispatchAttempt>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
             };
-            // Background tasks belong to the attempt but not its current
-            // work: the attempt reads idle while they run (ticket #86).
-            let idle = if attempt_idle_background(&ledger, a.ticket, a.attempt_no) {
-                format!(
-                    " idle (background running: {})",
-                    attempt_background_running(&ledger, a.ticket, a.attempt_no)
-                )
-            } else {
-                String::new()
-            };
-            println!(
-                "#{} T{} a{} {} phase={}{}{}{}{} base={} head={} {}",
-                a.id,
-                a.ticket,
-                a.attempt_no,
-                a.status,
-                attempt_phase(a),
-                resumable,
-                resumed,
-                memo_words,
-                idle,
-                base8,
-                head8,
-                a.started_at
+            let shown: Vec<&DispatchAttempt> =
+                live.iter().copied().chain(recent.iter().copied()).collect();
+            // Column widths from the shown rows so the table aligns.
+            let mut ticket_w = "TICKET".len();
+            let mut attempt_w = "ATTEMPT".len();
+            let mut status_w = "STATUS".len();
+            let mut phase_w = "PHASE".len();
+            let mut slot_w = "SLOT".len();
+            let mut started_w = "STARTED".len();
+            let cells: Vec<[String; 6]> = shown
+                .iter()
+                .map(|a| {
+                    [
+                        a.ticket.to_string(),
+                        a.attempt_no.to_string(),
+                        a.status.clone(),
+                        attempt_phase(a).to_string(),
+                        format!("T{}-a{}", a.ticket, a.attempt_no),
+                        a.started_at.clone(),
+                    ]
+                })
+                .collect();
+            for c in &cells {
+                ticket_w = ticket_w.max(c[0].len());
+                attempt_w = attempt_w.max(c[1].len());
+                status_w = status_w.max(c[2].len());
+                phase_w = phase_w.max(c[3].len());
+                slot_w = slot_w.max(c[4].len());
+                started_w = started_w.max(c[5].len());
+            }
+            let header = format!(
+                "{:<ticket_w$} {:<attempt_w$} {:<status_w$} {:<phase_w$} {:<slot_w$} {:<started_w$}",
+                "TICKET", "ATTEMPT", "STATUS", "PHASE", "SLOT", "STARTED",
             );
+            println!("{}", header.trim_end());
+            for (a, c) in shown.iter().zip(cells.iter()) {
+                let mut extras = String::new();
+                if is_resumable(a) {
+                    extras.push_str(" resumable");
+                }
+                if a.resumed > 0 {
+                    extras.push_str(&format!(" resumed={}", a.resumed));
+                }
+                // Memo facts ride the attempt row (ticket #67): empty
+                // when the attempt has no memos, so memo-less rows read
+                // exactly like the header-padded columns plus extras.
+                let memos = attempt_memos(&ledger, a.ticket, a.attempt_no);
+                if !memos.is_empty() {
+                    let pairs: Vec<String> = memos
+                        .iter()
+                        .map(|m| format!("{}={}", m.key, m.decision))
+                        .collect();
+                    extras.push_str(&format!(" memos={} ({})", memos.len(), pairs.join(", ")));
+                }
+                // Background tasks belong to the attempt but not its
+                // current work: the attempt reads idle while they run
+                // (ticket #86).
+                if attempt_idle_background(&ledger, a.ticket, a.attempt_no) {
+                    extras.push_str(&format!(
+                        " idle (background running: {})",
+                        attempt_background_running(&ledger, a.ticket, a.attempt_no)
+                    ));
+                }
+                let line = format!(
+                    "{:<ticket_w$} {:<attempt_w$} {:<status_w$} {:<phase_w$} {:<slot_w$} {:<started_w$}{}",
+                    c[0], c[1], c[2], c[3], c[4], c[5], extras
+                );
+                println!("{}", line.trim_end());
+            }
+            if !all && finished.len() > HISTORY_RECENT_LIMIT {
+                println!(
+                    "showing live plus the most recent {} of {} finished attempts; full history: factory dispatch status --all.",
+                    HISTORY_RECENT_LIMIT,
+                    finished.len()
+                );
+            }
         }
         // Owned tasks read beside their attempts so an abort's scope is
         // visible where Engineer Eli already looks (ticket #86). Empty
@@ -13016,11 +13165,47 @@ pub fn cmd_dispatch_status(json: bool) -> i32 {
         if !worktrees.ends_with('\n') {
             println!();
         }
-        if stopped {
-            println!("STOPPED (STOP file present)");
+        let live_total = ledger
+            .attempts
+            .iter()
+            .filter(|a| is_live_attempt(a))
+            .count();
+        let finished_total = ledger.attempts.len().saturating_sub(live_total);
+        let live_counts = count_by_status(
+            ledger
+                .attempts
+                .iter()
+                .filter(|a| is_live_attempt(a))
+                .map(|a| a.status.as_str()),
+        );
+        let finished_counts = count_by_status(
+            ledger
+                .attempts
+                .iter()
+                .filter(|a| !is_live_attempt(a))
+                .map(|a| a.status.as_str()),
+        );
+        let live_words = if live_counts.is_empty() {
+            "none".to_string()
         } else {
-            println!("running (no STOP file)");
-        }
+            counts_words(&live_counts)
+        };
+        let finished_words = if finished_counts.is_empty() {
+            "none".to_string()
+        } else {
+            counts_words(&finished_counts)
+        };
+        let worktree_count = worktrees.lines().filter(|l| !l.trim().is_empty()).count();
+        println!(
+            "total: {} attempt(s) ({} live: {}; {} finished: {}) in {} worktree(s); loop: {}.",
+            ledger.attempts.len(),
+            live_total,
+            live_words,
+            finished_total,
+            finished_words,
+            worktree_count,
+            if stopped { "STOPPED" } else { "running" }
+        );
     }
     0
 }
@@ -15067,7 +15252,7 @@ pub fn run() -> i32 {
                 idempotency_key,
             } => cmd_dispatch_once(cli.json, dry_run, idempotency_key.as_deref()),
             DispatchAction::Daemon { interval } => cmd_dispatch_daemon(cli.json, interval),
-            DispatchAction::Status => cmd_dispatch_status(cli.json),
+            DispatchAction::Status { all } => cmd_dispatch_status(cli.json, all),
             DispatchAction::Graph { ticket } => cmd_dispatch_graph(cli.json, ticket.as_deref()),
             DispatchAction::Wait {
                 ticket,
