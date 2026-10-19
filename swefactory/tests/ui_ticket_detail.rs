@@ -110,6 +110,7 @@ fn fixture_detail() -> TicketDetail {
         body: "Grow the sprout.".to_string(),
         labels: vec!["ready".to_string()],
         state: "open".to_string(),
+        transcript: None,
         attempts: vec![
             TicketAttemptView {
                 attempt_no: 2,
