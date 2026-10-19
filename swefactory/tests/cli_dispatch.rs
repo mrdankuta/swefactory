@@ -1305,3 +1305,23 @@ fn dispatch_once_reaps_abandoned_running_lease() {
     );
     assert_never_touches_dev_or_lands(&git_log(&h), &gh_log(&h));
 }
+
+/// The human status names the resolved worker slots and their source
+/// (presentation): the opt-in state is visible where operators look,
+// defaulting to the serial level with no file or env set.
+#[test]
+fn dispatch_status_names_worker_slots_and_source() {
+    let h = setup("status-slots");
+    let out = dispatch_cmd(&h, &["dispatch", "status"])
+        .env("GH_LIST_JSON", r#"[]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains("worker slots: 1"),
+        "serial default named, got:\n{stdout}"
+    );
+}

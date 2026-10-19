@@ -3417,24 +3417,13 @@ pub fn watch_snapshot() -> WatchSnapshot {
         .take(WATCH_TRANSITION_LIMIT)
         .map(|a| {
             let slot = format!("T{}-a{}", a.ticket, a.attempt_no);
-            if a.finished_at.is_empty() {
-                format!(
-                    "{} {} ({}) \u{2014} started {}",
-                    slot,
-                    a.status,
-                    attempt_phase(a),
-                    format_stamp_human(&a.started_at)
-                )
-            } else {
-                format!(
-                    "{} {} ({}) \u{2014} started {}, finished {}",
-                    slot,
-                    a.status,
-                    attempt_phase(a),
-                    format_stamp_human(&a.started_at),
-                    format_stamp_human(&a.finished_at)
-                )
-            }
+            format!(
+                "{} {} ({}) \u{2014} {}",
+                slot,
+                a.status,
+                attempt_phase(a),
+                human_span(&a.started_at, &a.finished_at)
+            )
         })
         .collect();
     WatchSnapshot {
@@ -11411,17 +11400,14 @@ pub fn cmd_status(json: bool) -> i32 {
                     suffix
                 ),
                 other => {
-                    if a.finished_at.is_empty() {
-                        println!(
-                            "Ticket {} attempt {} finished: {other} (slot {}, started {}).{}",
-                            a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
-                        );
-                    } else {
-                        println!(
-                            "Ticket {} attempt {} finished: {other} (slot {}, started {}, finished {}).{}",
-                            a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), format_stamp_human(&a.finished_at), suffix
-                        );
-                    }
+                    println!(
+                        "Ticket {} attempt {} finished: {other} (slot {}, {}).{}",
+                        a.ticket,
+                        a.attempt_no,
+                        slot,
+                        human_span(&a.started_at, &a.finished_at),
+                        suffix
+                    );
                 }
             }
             // Idle-with-background reads beside the attempt line so Bea
@@ -11457,24 +11443,13 @@ pub fn cmd_status(json: bool) -> i32 {
         );
         println!("recent (newest first):");
         for a in finished.iter().rev().take(HISTORY_RECENT_LIMIT) {
-            if a.finished_at.is_empty() {
-                println!(
-                    "  T{}-a{} {} (started {}).",
-                    a.ticket,
-                    a.attempt_no,
-                    a.status,
-                    format_stamp_human(&a.started_at)
-                );
-            } else {
-                println!(
-                    "  T{}-a{} {} (started {}, finished {}).",
-                    a.ticket,
-                    a.attempt_no,
-                    a.status,
-                    format_stamp_human(&a.started_at),
-                    format_stamp_human(&a.finished_at)
-                );
-            }
+            println!(
+                "  T{}-a{} {} ({}).",
+                a.ticket,
+                a.attempt_no,
+                a.status,
+                human_span(&a.started_at, &a.finished_at)
+            );
         }
         println!("Full per-ticket history: factory log <ticket>.");
     }
@@ -13051,15 +13026,7 @@ pub fn cmd_log(
         let started = row.get("started").and_then(|v| v.as_str()).unwrap_or("");
         let finished = row.get("finished").and_then(|v| v.as_str()).unwrap_or("");
         let transcript = row.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
-        let span = if finished.is_empty() {
-            format!("started {}", format_stamp_human(started))
-        } else {
-            format!(
-                "started {}, finished {}",
-                format_stamp_human(started),
-                format_stamp_human(finished)
-            )
-        };
+        let span = human_span(started, finished);
         let head_words = if head.is_empty() {
             "head (none yet)".to_string()
         } else {
@@ -15014,12 +14981,88 @@ fn attempt_minutes_secs(started: &str, finished: &str) -> Option<f64> {
     if started.is_empty() || finished.is_empty() {
         return None;
     }
-    let s: i64 = started.parse().ok()?;
-    let f: i64 = finished.parse().ok()?;
+    let s = stamp_to_epoch_secs(started)?;
+    let f = stamp_to_epoch_secs(finished)?;
     if f < s {
         return None;
     }
     Some((f - s) as f64 / 60.0)
+}
+
+/// Epoch seconds from every shape the loop's own stores emit (ticket #96
+/// follow-up): bare integers (`now_stamp`), the pre-cutover UTC civil
+/// `YYYY-MM-DD HH:MM:SS` the bash dispatcher wrote via SQLite
+/// `datetime('now')`, and ISO-8601. Anything else is a gap (`None`).
+/// Spend-local on purpose: reconcile metrics read through
+/// `parse_epoch_secs` and must not move with presentation.
+fn stamp_to_epoch_secs(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(n);
+    }
+    if let Some(n) = parse_civil_space_utc(s) {
+        return Some(n);
+    }
+    parse_iso8601_epoch(s)
+}
+
+/// Strict UTC civil `YYYY-MM-DD HH:MM:SS` to epoch seconds. The shape the
+/// bash dispatcher stored; assumed UTC exactly as written (matches
+/// `format_stamp_human`'s render rule, so both eras agree).
+fn parse_civil_space_utc(s: &str) -> Option<i64> {
+    let (date_part, clock) = s.split_once(' ')?;
+    if clock.contains(' ') || clock.contains('T') {
+        return None;
+    }
+    let mut d = date_part.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if d.next().is_some() {
+        return None;
+    }
+    let mut c = clock.split(':');
+    let hh: i64 = c.next()?.parse().ok()?;
+    let mm: i64 = c.next()?.parse().ok()?;
+    let ss: i64 = c.next()?.parse().ok()?;
+    if c.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Civil shape is fixed-width by construction; reject padding drift.
+    if date_part.len() != 10 || clock.len() != 8 {
+        return None;
+    }
+    Some(days_from_civil(y, m, day) * 86_400 + hh * 3_600 + mm * 60 + ss)
+}
+
+/// Human span for one attempt's timestamps (presentation): absolute
+/// bounds in the one rule both eras share, plus a duration when both
+/// ends parse — e.g. `started 2026-10-19 08:47:17, finished 2026-10-19
+/// 09:58:14 (took 70.9 min)`. Unparseable ends omit the duration, never
+/// error; an empty finish reads as started-only. The duration derives
+/// from the same minutes the spend section totals, so both surfaces
+/// agree per row.
+fn human_span(started_raw: &str, finished_raw: &str) -> String {
+    let started = format_stamp_human(started_raw);
+    if finished_raw.trim().is_empty() {
+        return format!("started {started}");
+    }
+    let finished = format_stamp_human(finished_raw);
+    match attempt_minutes_secs(started_raw, finished_raw) {
+        Some(mins) if mins >= 1.0 => {
+            format!("started {started}, finished {finished} (took {mins:.1} min)")
+        }
+        Some(mins) => {
+            format!(
+                "started {started}, finished {finished} (took {:.0}s)",
+                mins * 60.0
+            )
+        }
+        None => format!("started {started}, finished {finished}"),
+    }
 }
 
 /// Per-ticket spend rows in ascending ticket order (ticket #92). Pure
@@ -15163,6 +15206,14 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
             "{}",
             timeout_bounds_line(implement_timeout_secs(None), review_timeout_secs(None))
         );
+        // Pool level (ticket #92): the resolved slots and where they came
+        // from ride the human status, so the opt-in state is visible
+        // exactly where operators already look.
+        {
+            let state = dispatch_state_dir();
+            let level = resolve_max_concurrent(None, &state).unwrap_or(CONCURRENCY_DEFAULT);
+            println!("worker slots: {} ({})", level, concurrency_source(&state));
+        }
         if ledger.attempts.is_empty() {
             println!("(none)");
         } else {
@@ -15353,8 +15404,24 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
         if !spend.is_empty() {
             println!();
             println!("== spend ==");
+            // Measured and live rows are the signal: always listed.
+            // Finished rows still pending measurement collapse to one
+            // summary line (full list behind --all), so a long-finished
+            // history never buries the minutes that exist.
+            let mut pending = 0usize;
             for row in &spend {
-                println!("{}", spend_human_line(row));
+                if row.total_minutes.is_some() || row.live > 0 || all {
+                    println!("{}", spend_human_line(row));
+                } else {
+                    pending += 1;
+                }
+            }
+            if pending > 0 {
+                println!(
+                    "{} ticket{} pending measurement; {OUTCOME_COST_TEXT}",
+                    pending,
+                    if pending == 1 { "" } else { "s" },
+                );
             }
         }
     }
@@ -19118,6 +19185,68 @@ mod worker_pool_tests {
         assert!(
             same.iter().all(|l| !l.contains("worker slots")),
             "steady level stays silent, got: {same:?}"
+        );
+    }
+}
+
+/// Presentation pins: civil timestamps count for minutes, spans name
+/// durations, the commit feed carries the level (all pure, no network).
+#[cfg(test)]
+mod presentation_tests {
+    use super::{human_span, parse_civil_space_utc, spend_human_line, spend_rows};
+
+    #[test]
+    fn civil_space_parses_as_utc() {
+        // 2026-10-08 13:01:30 UTC == date -u truth, independent of the code.
+        assert_eq!(
+            parse_civil_space_utc("2026-10-08 13:01:30"),
+            Some(1791464490)
+        );
+        assert_eq!(parse_civil_space_utc("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(parse_civil_space_utc(""), None);
+        assert_eq!(parse_civil_space_utc("1792399637"), None);
+        assert_eq!(parse_civil_space_utc("2026-10-08T13:01:30"), None);
+        assert_eq!(parse_civil_space_utc("2026-13-08 13:01:30"), None);
+        assert_eq!(parse_civil_space_utc("2026-10-08 13:01"), None);
+    }
+
+    #[test]
+    fn civil_eras_count_for_minutes() {
+        let ledger: super::DispatchLedger = serde_json::from_str(
+            r#"{"attempts": [
+            {"id": 1, "ticket": 11, "attempt_no": 1, "base_commit": "", "head_commit": "",
+             "branch": "", "worktree": "", "status": "review_done", "exit_code": 0,
+             "log_path": "", "started_at": "2026-10-08 13:01:30", "finished_at": "2026-10-08 13:16:25",
+             "train_branch": "", "phase": "review", "resumed": 0}
+        ]}"#,
+        )
+        .unwrap();
+        let rows = spend_rows(&ledger);
+        assert_eq!(rows.len(), 1);
+        // 14m55s of real history, no longer "pending".
+        assert_eq!(rows[0].total_minutes, Some(895.0 / 60.0));
+        assert!(spend_human_line(&rows[0]).contains("14.92 min total"));
+    }
+
+    #[test]
+    fn human_span_names_durations_where_parseable() {
+        let both = human_span("1792399637", "1792403894");
+        assert!(
+            both.contains(
+                "started 2026-10-19 08:47:17, finished 2026-10-19 09:58:14 (took 71.0 min)"
+            ),
+            "{both}"
+        );
+        let civil = human_span("2026-10-08 13:01:30", "2026-10-08 13:16:25");
+        assert!(civil.ends_with("(took 14.9 min)"), "{civil}");
+        let live = human_span("1792399637", "");
+        assert_eq!(live, "started 2026-10-19 08:47:17");
+        let gap = human_span("s", "e");
+        assert_eq!(gap, "started s, finished e");
+        let quick = human_span("100", "130");
+        assert_eq!(
+            quick,
+            "started 1970-01-01 00:01:40, finished 1970-01-01 00:02:10 (took 30s)"
         );
     }
 }
