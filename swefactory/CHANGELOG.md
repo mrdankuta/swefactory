@@ -5,6 +5,20 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+## 0.1.0-rc.8 — readable status, watch pane, transcript view, bounded waits, timestamp polish
+
+### One timestamp rule for both eras (ticket #96)
+
+- Human output in `watch`, `status`, `dispatch status` and `log`
+  renders epoch seconds and pre-cutover UTC civil strings identically
+  (`YYYY-MM-DD HH:MM:SS` UTC); `--json` keeps the raw ledger strings
+  in every machine timestamp field. Regression test pins one
+  formatted timestamp from each era through the watch CLI seam.
+- Test-harness hermeticity: every dispatch-running builder scrubs
+  ambient `MAX_ATTEMPTS` / `MAX_CONCURRENT` / `TIMEOUT_IMPL` /
+  `TIMEOUT_REVIEW` so the dogfood service env (budget 3) can no
+  longer flip the default-budget tests.
+
 ### Cutover: one-shot bash-SQLite → Rust-JSON import (ticket #88)
 
 - `factory dispatch import [--db PATH]`: reads the bash dispatcher's
