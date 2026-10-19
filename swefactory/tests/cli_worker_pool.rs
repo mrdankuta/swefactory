@@ -1170,3 +1170,89 @@ fn router_serves_concurrency_post_and_fragment_reflects_level() {
         }
     }
 }
+
+/// Pending spend collapses behind one summary line (presentation): measured
+/// and live rows always list; finished rows still pending measurement read
+/// as a single count unless `--all` asks for the full list.
+#[test]
+fn spend_pending_collapses_behind_summary_unless_all() {
+    let h = setup("spend-collapse");
+    write_view(
+        &h,
+        11,
+        "Measured",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    write_view(
+        &h,
+        12,
+        "Pending-a",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    write_view(
+        &h,
+        13,
+        "Pending-b",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    // One measured row (epoch stamps) + two finished rows whose stamps
+    // never parse (pre-cutover gap shape).
+    let ledger = serde_json::json!({"attempts": [
+        {"id": 1, "ticket": 11, "attempt_no": 1, "base_commit": "b", "head_commit": "h",
+         "branch": "factory/T11-x", "worktree": "", "status": "review_done", "exit_code": 0,
+         "log_path": "", "started_at": "1700000000", "finished_at": "1700000600",
+         "train_branch": "", "phase": "review", "resumed": 0},
+        {"id": 2, "ticket": 12, "attempt_no": 1, "base_commit": "b", "head_commit": "h",
+         "branch": "factory/T12-x", "worktree": "", "status": "review_done", "exit_code": 0,
+         "log_path": "", "started_at": "s", "finished_at": "e",
+         "train_branch": "", "phase": "review", "resumed": 0},
+        {"id": 3, "ticket": 13, "attempt_no": 1, "base_commit": "b", "head_commit": "h",
+         "branch": "factory/T13-x", "worktree": "", "status": "review_done", "exit_code": 0,
+         "log_path": "", "started_at": "s", "finished_at": "e",
+         "train_branch": "", "phase": "review", "resumed": 0},
+    ]});
+    fs::create_dir_all(&h.state).unwrap();
+    fs::write(
+        h.state.join("dispatch.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    let out = dispatch_cmd(&h, &["dispatch", "status"])
+        .env("GH_LIST_JSON", r#"[]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains("ticket 11: 1 attempt, 10.00 min total"),
+        "measured row lists, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2 tickets pending measurement"),
+        "pending collapses to a count, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ticket 12:") && !stdout.contains("ticket 13:"),
+        "pending rows hidden by default, got:\n{stdout}"
+    );
+    let out_all = dispatch_cmd(&h, &["dispatch", "status", "--all"])
+        .env("GH_LIST_JSON", r#"[]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout_all = String::from_utf8(out_all).unwrap();
+    assert!(
+        stdout_all.contains("ticket 12:") && stdout_all.contains("ticket 13:"),
+        "--all expands the pending rows, got:\n{stdout_all}"
+    );
+}
