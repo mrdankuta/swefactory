@@ -5,6 +5,24 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+## 0.1.0-rc.9 — supervised worker pool
+
+### Concurrent attempts up to MAX_CONCURRENT, default serial (ticket #92)
+
+- `factory dispatch once --concurrency N` (1–8) admits waves of up to N
+  tickets simultaneously in isolated slots (own worktree, branch, logs,
+  temp dir); with concurrency 1 the pass is byte-identical to the
+  historical serial pass. A third ticket waits with a calm waiting line.
+- One setting, two surfaces: the CLI flag, `FACTORY_MAX_CONCURRENT` /
+  `MAX_CONCURRENT` env, and the dispatcher UI control resolve every pass
+  (flag > env > saved file > default 1) with no restart; a daemon
+  startup flag seeds the saved level once and never shadows later UI
+  writes. Out-of-bounds input is refused with the bounds named.
+- A worker killed mid-attempt is reaped into a resumable checkpoint;
+  STOP halts admission between waves while in-flight workers finish
+  their phases. Per-ticket spend rides `status` output in both modes;
+  `--dry-run` prints the worker plan and changes nothing.
+
 ## 0.1.0-rc.8 — readable status, watch pane, transcript view, bounded waits, timestamp polish
 
 ### One timestamp rule for both eras (ticket #96)
