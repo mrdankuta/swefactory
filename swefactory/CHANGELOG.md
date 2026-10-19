@@ -5,6 +5,23 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+### Cutover: one-shot bash-SQLite → Rust-JSON import (ticket #88)
+
+- `factory dispatch import [--db PATH]`: reads the bash dispatcher's
+  SQLite history (`attempts` + `releases` rows) and writes the
+  equivalent Rust JSON ledger (`dispatch.json` + `train.json`), then
+  archives the `.db` byte-identical (sha256-verified, source re-hashed
+  to prove it was never mutated). Pure Rust with no new dependencies:
+  parses the SQLite format directly, never links sqlite — the binary
+  stays dependency-free on every target incl. musl-static. One-shot:
+  refuses when the state dir already holds a ledger, a train, or an
+  archive, so re-running never duplicates. Closed releases are terminal
+  history (counted, preserved in the archive, never carried); the newest
+  open release becomes the Rust open train. Cutover window documented
+  in `docs/runbooks/cutover.md`; hermetic fixture proof in
+  `cargo test --test cli_cutover` (no live state, no network, no
+  `sqlite3` at test time).
+
 ## 0.1.0-rc.7 — durable attempts, shared memory, experiments, live data
 
 ### Shared cross-attempt state, slice 1: facts document + reads (spec #64, ticket #77)
