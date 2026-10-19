@@ -186,7 +186,12 @@ fn factory_cmd(h: &Harness, args: &[&str]) -> Command {
         .env("ADAPTER_LOG", &h.adapter_log)
         .env("GH_VIEWS_DIR", &h.views)
         .env("GH_LIST_JSON", "[]")
-        .env_remove("FACTORY_SLOT");
+        .env_remove("FACTORY_SLOT")
+        // Hermetic worker pool (ticket #92): ambient slot env from the
+        // operator's shell must not flip tests into wave mode. Tests that
+        // need parallelism set the level explicitly after this.
+        .env_remove("MAX_CONCURRENT")
+        .env_remove("FACTORY_MAX_CONCURRENT");
     cmd
 }
 
