@@ -294,6 +294,9 @@ pub enum Commands {
     /// refreshing in place over the same read-only seams `status` and
     /// `dispatch status` read. Polling is the transport; when streams are
     /// unavailable the pane says so calmly instead of erroring.
+    /// Timestamps render under one rule (ticket #96): epoch seconds and
+    /// pre-cutover UTC civil strings both read as `YYYY-MM-DD HH:MM:SS`
+    /// UTC; `--json` keeps the raw ledger strings.
     /// Read-only: watching changes nothing, closing changes nothing.
     /// Piped output (`| cat`) degrades to one static snapshot and exits.
     Watch {
@@ -412,7 +415,10 @@ pub enum DispatchAction {
     },
     /// Show attempts + worktrees + loop state. Human output renders an
     /// aligned-column table bounded to live attempts plus the most recent
-    /// finished attempts; `--all` opts into the full history. Read-only:
+    /// finished attempts; `--all` opts into the full history. Timestamps
+    /// render under one rule (ticket #96): epoch seconds and pre-cutover
+    /// UTC civil strings both read as `YYYY-MM-DD HH:MM:SS` UTC; `--json`
+    /// keeps the raw ledger strings. Read-only:
     /// observing changes nothing. Exit 0 whenever the ledger read
     /// succeeded (even when empty); nonzero only on unreadable state.
     /// The global --json flag selects machine output carrying every
@@ -3355,7 +3361,7 @@ pub fn watch_snapshot() -> WatchSnapshot {
                     slot,
                     a.status,
                     attempt_phase(a),
-                    a.started_at
+                    format_stamp_human(&a.started_at)
                 )
             } else {
                 format!(
@@ -3363,8 +3369,8 @@ pub fn watch_snapshot() -> WatchSnapshot {
                     slot,
                     a.status,
                     attempt_phase(a),
-                    a.started_at,
-                    a.finished_at
+                    format_stamp_human(&a.started_at),
+                    format_stamp_human(&a.finished_at)
                 )
             }
         })
@@ -7488,6 +7494,59 @@ fn parse_epoch_secs(raw: &str) -> Option<i64> {
     parse_iso8601_epoch(s)
 }
 
+/// Inverse of `days_from_civil` (Hinnant's civil-from-days): days since
+/// the Unix epoch to (year, month, day). Pure date math, no timezone
+/// database: the loop renders UTC everywhere (see `format_stamp_human`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    (y, m, d)
+}
+
+/// One human rule for every timestamp the loop shows (ticket #96): epoch
+/// seconds (what `now_stamp` writes post-cutover) render as UTC civil
+/// `YYYY-MM-DD HH:MM:SS` — the exact shape the bash dispatcher wrote via
+/// SQLite `datetime('now')` (also UTC), so both eras read identically.
+/// Already-shaped strings pass through untouched; anything else passes
+/// through raw (a gap reads as the stored value, never an error).
+/// Machine output (`--json`) keeps the raw ledger strings untouched:
+/// every machine timestamp *field* stays byte-identical, only human
+/// prose (including the prose inside `watch --json` transitions) is
+/// formatted.
+fn format_stamp_human(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    match s.parse::<i64>() {
+        Ok(epoch) => {
+            let days = epoch.div_euclid(86_400);
+            let clock = epoch.rem_euclid(86_400);
+            let (y, m, d) = civil_from_days(days);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y,
+                m,
+                d,
+                clock / 3_600,
+                (clock % 3_600) / 60,
+                clock % 60
+            )
+        }
+        Err(_) => s.to_string(),
+    }
+}
+
 /// Reduce one `gh issue view --json number,createdAt,labels,comments`
 /// document to the signals the autonomy rule observes. Labels reuse the
 /// board's existing vocabulary (`blocked`, `needs-info`/`needs-you`);
@@ -10808,11 +10867,11 @@ pub fn cmd_status(json: bool) -> i32 {
             match a.status.as_str() {
                 "impl_running" => println!(
                     "Ticket {} attempt {} is being implemented (slot {}, started {}).{}",
-                    a.ticket, a.attempt_no, slot, a.started_at, suffix
+                    a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
                 ),
                 "review_running" => println!(
                     "Ticket {} attempt {} is being reviewed (slot {}, started {}).{}",
-                    a.ticket, a.attempt_no, slot, a.started_at, suffix
+                    a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
                 ),
                 s if is_interrupted_status(s) => println!(
                     "Ticket {} attempt {} interrupted during {} (slot {}, started {}, resumable).{}",
@@ -10820,19 +10879,19 @@ pub fn cmd_status(json: bool) -> i32 {
                     a.attempt_no,
                     attempt_phase(a),
                     slot,
-                    a.started_at,
+                    format_stamp_human(&a.started_at),
                     suffix
                 ),
                 other => {
                     if a.finished_at.is_empty() {
                         println!(
                             "Ticket {} attempt {} finished: {other} (slot {}, started {}).{}",
-                            a.ticket, a.attempt_no, slot, a.started_at, suffix
+                            a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
                         );
                     } else {
                         println!(
                             "Ticket {} attempt {} finished: {other} (slot {}, started {}, finished {}).{}",
-                            a.ticket, a.attempt_no, slot, a.started_at, a.finished_at, suffix
+                            a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), format_stamp_human(&a.finished_at), suffix
                         );
                     }
                 }
@@ -10873,12 +10932,19 @@ pub fn cmd_status(json: bool) -> i32 {
             if a.finished_at.is_empty() {
                 println!(
                     "  T{}-a{} {} (started {}).",
-                    a.ticket, a.attempt_no, a.status, a.started_at
+                    a.ticket,
+                    a.attempt_no,
+                    a.status,
+                    format_stamp_human(&a.started_at)
                 );
             } else {
                 println!(
                     "  T{}-a{} {} (started {}, finished {}).",
-                    a.ticket, a.attempt_no, a.status, a.started_at, a.finished_at
+                    a.ticket,
+                    a.attempt_no,
+                    a.status,
+                    format_stamp_human(&a.started_at),
+                    format_stamp_human(&a.finished_at)
                 );
             }
         }
@@ -10909,11 +10975,17 @@ fn log_summary(a: &DispatchAttempt) -> String {
     let base = match a.status.as_str() {
         "impl_running" => format!(
             "Ticket {} attempt {} is being implemented (slot {}, started {}).",
-            a.ticket, a.attempt_no, slot, a.started_at
+            a.ticket,
+            a.attempt_no,
+            slot,
+            format_stamp_human(&a.started_at)
         ),
         "review_running" => format!(
             "Ticket {} attempt {} is being reviewed (slot {}, started {}).",
-            a.ticket, a.attempt_no, slot, a.started_at
+            a.ticket,
+            a.attempt_no,
+            slot,
+            format_stamp_human(&a.started_at)
         ),
         "impl_done" => format!(
             "Ticket {} attempt {} finished implement, awaiting review (slot {}).",
@@ -12448,9 +12520,13 @@ pub fn cmd_log(
         let finished = row.get("finished").and_then(|v| v.as_str()).unwrap_or("");
         let transcript = row.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
         let span = if finished.is_empty() {
-            format!("started {started}")
+            format!("started {}", format_stamp_human(started))
         } else {
-            format!("started {started}, finished {finished}")
+            format!(
+                "started {}, finished {}",
+                format_stamp_human(started),
+                format_stamp_human(finished)
+            )
         };
         let head_words = if head.is_empty() {
             "head (none yet)".to_string()
@@ -14489,7 +14565,7 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
                         a.status.clone(),
                         attempt_phase(a).to_string(),
                         format!("T{}-a{}", a.ticket, a.attempt_no),
-                        a.started_at.clone(),
+                        format_stamp_human(&a.started_at),
                     ]
                 })
                 .collect();

@@ -405,3 +405,57 @@ fn watch_empty_stopped_and_piped_degrade_calmly() {
     );
     assert!(!stdout.contains('\x1b'), "still no escape bytes");
 }
+
+// Ticket #96: one formatting rule for both timestamp eras. Pre-cutover
+// rows carry UTC civil strings (the bash dispatcher wrote SQLite
+// `datetime('now')`, which is UTC); post-cutover rows carry raw epoch
+// seconds (`now_stamp`). Human output renders both identically; every
+// machine timestamp field in `--json` keeps its raw ledger string.
+#[test]
+fn watch_transitions_render_both_timestamp_eras_identically() {
+    let h = setup("watch-eras");
+    write_ledger(
+        &h,
+        &serde_json::json!({
+            "attempts": [
+                {
+                    "id": 1, "ticket": 11, "attempt_no": 1,
+                    "base_commit": "abc123def456", "head_commit": "def456abc123",
+                    "branch": "factory/T11-demo", "worktree": "/tmp/wt-T11-a1",
+                    "status": "review_done", "exit_code": 0,
+                    "log_path": "",
+                    "started_at": "2026-10-08 13:01:30",
+                    "finished_at": "2026-10-08 13:16:25",
+                    "train_branch": "", "phase": "review", "resumed": 0
+                },
+                {
+                    "id": 2, "ticket": 12, "attempt_no": 1,
+                    "base_commit": "abc123def456", "head_commit": "def456abc123",
+                    "branch": "factory/T12-demo", "worktree": "/tmp/wt-T12-a1",
+                    "status": "review_done", "exit_code": 0,
+                    "log_path": "",
+                    "started_at": "1792399637",
+                    "finished_at": "1792403894",
+                    "train_branch": "", "phase": "review", "resumed": 0
+                }
+            ]
+        }),
+    );
+    let out = watch_cmd(&h, &["watch"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    // 1792399637 = 2026-10-19 08:47:17 UTC; 1792403894 = 2026-10-19
+    // 09:58:14 UTC (independent `date -u` truth, not the formatter).
+    assert!(
+        text.contains("started 2026-10-08 13:01:30, finished 2026-10-08 13:16:25"),
+        "pre-cutover row keeps its UTC civil shape:\n{text}"
+    );
+    assert!(
+        text.contains("started 2026-10-19 08:47:17, finished 2026-10-19 09:58:14"),
+        "epoch row renders the identical shape:\n{text}"
+    );
+    assert!(
+        !text.contains("1792399637") && !text.contains("1792403894"),
+        "no raw epoch leaks into human output:\n{text}"
+    );
+}

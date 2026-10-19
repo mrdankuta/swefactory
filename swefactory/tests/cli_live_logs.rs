@@ -249,7 +249,11 @@ fn dispatch_command(
         .env("GIT_LOG", git_log)
         .env("PI_LOG", pi_log)
         .env("GH_VIEWS_DIR", views)
-        .env_remove("FACTORY_SLOT");
+        // Hermetic budgets: scrub ambient service env; extra_env
+        // overrides are applied after (explicit per-test wins).
+        .env_remove("FACTORY_SLOT")
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("MAX_CONCURRENT");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -416,7 +420,9 @@ fn killed_midstream_leaves_prefix_in_order() {
         .env("GH_LIST_JSON", r#"[{"number":11}]"#)
         .env("TIMEOUT_IMPL", "1")
         .env("TIMEOUT_REVIEW", "1200")
-        .env_remove("FACTORY_SLOT");
+        .env_remove("FACTORY_SLOT")
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("MAX_CONCURRENT");
     cmd.assert().success();
     let parsed = ledger(&h);
     let row = &parsed["attempts"][0];
@@ -488,7 +494,9 @@ fn concurrent_phases_stay_per_file() {
         .env("GH_LIST_JSON", r#"[{"number":11}]"#)
         .env("TIMEOUT_IMPL", "1200")
         .env("TIMEOUT_REVIEW", "1200")
-        .env_remove("FACTORY_SLOT");
+        .env_remove("FACTORY_SLOT")
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("MAX_CONCURRENT");
     cmd.assert().success();
     let parsed = ledger(&h);
     let row = &parsed["attempts"][0];
