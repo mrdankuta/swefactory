@@ -75,7 +75,12 @@ pub enum Commands {
     /// fields `cost` and `changed`. A forked line replays like a main
     /// line: `--interrupt NAME|NUMBER` marks it interrupted (resumable)
     /// and releases its worktree, `--resume NAME|NUMBER` continues the
-    /// same line with its transcript preserved.
+    /// same line with its transcript preserved. Ownership (ticket #73):
+    /// `--owned` roots an owned line (subagent-style: aborting the parent
+    /// propagates, cleanup follows the owned line); without it the fork
+    /// is ownerless (fully independent, the default). Ownership is
+    /// recorded in lineage and rendered in every lineage surface, human
+    /// and machine-readable, with identical facts.
     Fork {
         /// Ticket issue number (e.g. 80 or #80).
         ticket: String,
@@ -104,6 +109,11 @@ pub enum Commands {
         /// creation flags or --resume.
         #[arg(long, value_name = "NAME|NUMBER")]
         interrupt: Option<String>,
+        /// Own this line by its parent (subagent-style: aborting the
+        /// parent propagates, cleanup follows the owned line). Absent
+        /// the fork is ownerless (fully independent). Creation only.
+        #[arg(long)]
+        owned: bool,
     },
     /// Cross-attempt facts (spec #64): the revision-guarded document
     /// beside the dispatch ledger. Reads only in this slice (ticket
@@ -6828,6 +6838,13 @@ fn default_fork_status() -> String {
     "forked".to_string()
 }
 
+/// Default ownership for a fork row written before this ticket
+/// (ticket #73): fully independent — older rows behave exactly as
+/// before with no migration.
+fn default_fork_ownership() -> String {
+    "ownerless".to_string()
+}
+
 /// One experiment line (ticket #80, spec #65): the fork inherits the
 /// parent attempt's transcript prefix up to and including `parent_entry`
 /// and continues independently in its own worktree, branch, slot, and log.
@@ -6845,6 +6862,12 @@ fn default_fork_status() -> String {
 /// `#[serde(default)]` keeps pre-lifecycle rows parsing as live lines
 /// with no resume history (no migration: unforked tickets and old rows
 /// behave exactly as before).
+///
+/// Ownership (ticket #73): `ownership` is `"owned"` (subagent-style:
+/// aborting the parent propagates, cleanup follows the owned line) or
+/// `"ownerless"` (fully independent, the default). `#[serde(default)]`
+/// keeps pre-ownership rows parsing as ownerless (no migration: old
+/// forks behave exactly as before).
 #[derive(Serialize, serde::Deserialize, Clone, Debug)]
 struct ForkRecord {
     id: u64,
@@ -6857,6 +6880,8 @@ struct ForkRecord {
     parent_fork: String,
     #[serde(default)]
     lineage: Vec<ForkLineageLink>,
+    #[serde(default = "default_fork_ownership")]
+    ownership: String,
     slot: String,
     branch: String,
     worktree: String,
@@ -9516,6 +9541,32 @@ fn fork_resumed_suffix(f: &ForkRecord) -> String {
     }
 }
 
+/// Ownership words (ticket #73): who this line answers to, or that it
+/// answers to nothing. Shared by human output and the JSON `summary`
+/// so both modes hold the identical fact.
+fn fork_ownership_words(f: &ForkRecord) -> String {
+    if f.ownership == "owned" {
+        if f.parent_fork.is_empty() {
+            format!("owned by attempt {}", f.parent_attempt)
+        } else {
+            format!("owned by fork '{}'", f.parent_fork)
+        }
+    } else {
+        "ownerless".to_string()
+    }
+}
+
+/// Abort words (ticket #73): only aborted owned lines carry them, so
+/// every other row renders exactly as before. Shared by human output
+/// and the JSON `summary` so both modes hold the identical fact.
+fn fork_aborted_suffix(f: &ForkRecord) -> String {
+    if f.status == "aborted" {
+        " Aborted with parent task.".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Calm one-line experiment summary (ticket #81, spec #65): what line
 /// this is, where it descends from (oldest-first), and its per-line
 /// figures from the shared document. Missing figures read as
@@ -9523,6 +9574,9 @@ fn fork_resumed_suffix(f: &ForkRecord) -> String {
 /// output and in the JSON `summary` so scripts reason about the same
 /// tree a reader sees. Resume history (ticket #82) appends only for
 /// resumed rows, so never-resumed lines render exactly as before.
+/// Ownership (ticket #73) names the parent the line answers to, or
+/// that it answers to nothing; aborted owned lines carry their abort
+/// while every other row renders exactly as before.
 fn fork_summary(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> String {
     let chain = fork_chain(f);
     let cost = fork_figure(facts, f.ticket, &f.name, "cost");
@@ -9534,14 +9588,16 @@ fn fork_summary(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> Str
         (None, None) => "cost not yet recorded, changed not yet recorded".to_string(),
     };
     format!(
-        "Fork '{}' (#{}, {}): {}; {} (shared facts rev {}).{}",
+        "Fork '{}' (#{}, {}): {}; {}; {} (shared facts rev {}).{}{}",
         f.name,
         f.fork_no,
         f.slot,
         fork_lineage_words(&chain),
+        fork_ownership_words(f),
         figures,
         revision,
-        fork_resumed_suffix(f)
+        fork_resumed_suffix(f),
+        fork_aborted_suffix(f)
     )
 }
 
@@ -9570,6 +9626,7 @@ fn fork_json(f: &ForkRecord, facts: &serde_json::Value, revision: u64) -> serde_
         "parent_attempt": f.parent_attempt,
         "parent_entry": f.parent_entry,
         "parent_fork": f.parent_fork,
+        "ownership": f.ownership,
         "lineage": lineage,
         "slot": f.slot,
         "branch": f.branch,
@@ -9766,6 +9823,7 @@ pub fn cmd_fork(
     name_opt: Option<&str>,
     resume_sel: Option<&str>,
     interrupt_sel: Option<&str>,
+    owned: bool,
     json: bool,
 ) -> i32 {
     let ticket = match parse_issue_number(ticket_raw) {
@@ -9785,12 +9843,16 @@ pub fn cmd_fork(
     };
     // Lifecycle modes (ticket #82) name exactly one line and combine
     // with nothing else: creation flags root a new line, lifecycle
-    // flags continue one.
+    // flags continue one. Ownership (ticket #73) is a creation flag.
     if resume_sel.is_some() || interrupt_sel.is_some() {
-        if attempt_opt.is_some() || fork_sel.is_some() || entry_opt.is_some() || name_opt.is_some()
+        if attempt_opt.is_some()
+            || fork_sel.is_some()
+            || entry_opt.is_some()
+            || name_opt.is_some()
+            || owned
         {
             eprintln!(
-                "fork: --resume/--interrupt name one line; creation flags (--attempt/--fork/--at/--name) root a new one, never both (ticket #{ticket})"
+                "fork: --resume/--interrupt name one line; creation flags (--attempt/--fork/--at/--name/--owned) root a new one, never both (ticket #{ticket})"
             );
             return 1;
         }
@@ -10069,6 +10131,11 @@ pub fn cmd_fork(
             })
         })
         .collect();
+    let ownership = if owned {
+        "owned".to_string()
+    } else {
+        "ownerless".to_string()
+    };
     let record = ForkRecord {
         id,
         ticket,
@@ -10078,6 +10145,7 @@ pub fn cmd_fork(
         parent_entry: entry,
         parent_fork: parent_fork_name.clone(),
         lineage,
+        ownership: ownership.clone(),
         slot: slot.clone(),
         branch: branch.clone(),
         worktree: wt_s.clone(),
@@ -10105,6 +10173,7 @@ pub fn cmd_fork(
                 "parent_attempt": root_attempt,
                 "parent_entry": entry,
                 "parent_fork": parent_fork_name,
+                "ownership": ownership,
                 "lineage": lineage_rows,
                 "slot": slot,
                 "branch": branch,
@@ -11731,7 +11800,11 @@ pub fn cmd_dispatch_resume(json: bool) -> i32 {
 
 /// Abort an attempt's current work bottom-up over fixture state. Prints the
 /// unwind order as it goes; every undone effect persists before the next
-/// begins so a kill resumes the same order.
+/// begins so a kill resumes the same order. Owned experiment lines
+/// (ticket #73) abort with the parent ticket: each owned line still
+/// holding its work is marked aborted, its transcript marked, and its
+/// worktree released — the same release discipline interruption follows.
+/// Ownerless lines are fully independent and never touched.
 pub fn cmd_dispatch_abort(ticket_raw: &str, background: bool, json: bool) -> i32 {
     let ticket = match parse_issue_number(ticket_raw) {
         Ok(n) => n,
@@ -11749,15 +11822,37 @@ pub fn cmd_dispatch_abort(ticket_raw: &str, background: bool, json: bool) -> i32
         }
     };
     let plan = abort_plan(&ledger, ticket, background);
-    if plan.is_empty() {
+    // Owned lines answer to the parent ticket (ticket #73): every owned
+    // fork still holding its line aborts with the parent — including when
+    // the parent already failed and no task work remains to unwind.
+    // Ownerless lines are fully independent and never touched.
+    let owned_fork_idxs: Vec<usize> = ledger
+        .forks
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.ticket == ticket && f.ownership == "owned" && f.status != "aborted")
+        .map(|(i, _)| i)
+        .collect();
+    if plan.is_empty() && owned_fork_idxs.is_empty() {
         println!("Ticket {ticket}: nothing to abort.");
         if json {
             println!(
                 "{}",
-                serde_json::json!({"ticket": ticket, "aborted": [], "order": [], "background": background})
+                serde_json::json!({"ticket": ticket, "aborted": [], "aborted_forks": [], "order": [], "background": background})
             );
         }
         return 0;
+    }
+    if plan.is_empty() {
+        let names: Vec<String> = owned_fork_idxs
+            .iter()
+            .map(|&i| ledger.forks[i].name.clone())
+            .collect();
+        println!(
+            "Ticket {ticket}: aborting owned fork line(s) ({} line(s)): {}.",
+            names.len(),
+            names.join(", ")
+        );
     }
     let order_names: Vec<String> = plan
         .iter()
@@ -11813,16 +11908,46 @@ pub fn cmd_dispatch_abort(ticket_raw: &str, background: bool, json: bool) -> i32
         .iter()
         .map(|&i| ledger.owned_tasks[i].name.clone())
         .collect();
-    println!(
-        "Ticket {ticket}: aborted {} task(s) bottom-up.",
-        aborted_names.len()
-    );
+    if !plan.is_empty() {
+        println!(
+            "Ticket {ticket}: aborted {} task(s) bottom-up.",
+            aborted_names.len()
+        );
+    }
+    let mut aborted_forks: Vec<String> = Vec::new();
+    for &idx in &owned_fork_idxs {
+        let name = ledger.forks[idx].name.clone();
+        let slot = ledger.forks[idx].slot.clone();
+        let log_path = ledger.forks[idx].log_path.clone();
+        let worktree = PathBuf::from(ledger.forks[idx].worktree.clone());
+        append_log(
+            Path::new(&log_path),
+            &format!("aborted with parent ticket {ticket} (slot {slot}) — owned line\n"),
+        );
+        ledger.forks[idx].status = "aborted".to_string();
+        // Cleanup follows the owned line: the worktree is released here,
+        // exactly as interruption releases it. Ownerless lines keep theirs.
+        remove_worktree(&worktree);
+        if let Err(e) = save_ledger(&state, &ledger) {
+            eprintln!("abort: {e}");
+            return 1;
+        }
+        println!("  aborted fork '{name}' (owned line, slot {slot})");
+        aborted_forks.push(name);
+    }
+    if !aborted_forks.is_empty() {
+        println!(
+            "Ticket {ticket}: aborted {} owned fork line(s) with parent.",
+            aborted_forks.len()
+        );
+    }
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "ticket": ticket,
                 "aborted": aborted_names,
+                "aborted_forks": aborted_forks,
                 "order": ledger.abort_log,
                 "undone_now": undone_now,
                 "background": background,
@@ -13353,6 +13478,7 @@ pub fn run() -> i32 {
             name,
             resume,
             interrupt,
+            owned,
         } => cmd_fork(
             &ticket,
             attempt,
@@ -13361,6 +13487,7 @@ pub fn run() -> i32 {
             name.as_deref(),
             resume.as_deref(),
             interrupt.as_deref(),
+            owned,
             cli.json,
         ),
         Commands::Init {
