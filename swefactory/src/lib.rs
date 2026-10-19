@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod sqlite;
+
 /// swefactory: the software factory as a product (single static binary).
 #[derive(Parser, Debug)]
 #[command(
@@ -439,6 +441,21 @@ pub enum DispatchAction {
     /// no network, no tokens, no spend). Every failure names the mechanics
     /// that broke and exits non-zero.
     SelfTest,
+    /// One-shot cutover import (ticket #88): read the bash dispatcher's
+    /// SQLite history (`attempts` + `releases` rows) and write the
+    /// equivalent Rust JSON ledger, then archive the `.db` byte-identical.
+    /// Pure Rust: parses the SQLite format directly, never links sqlite,
+    /// so the binary stays dependency-free on every target incl.
+    /// musl-static. One-shot: refuses when the state dir already holds a
+    /// ledger, a train, or an archive, so re-running never duplicates.
+    /// Never mutates the source `.db` (read-only; re-hashed after).
+    Import {
+        /// Path to the bash dispatcher's `dispatch.db`. Defaults to
+        /// `<state>/dispatch.db` (the FACTORY_STATE_DIR, else
+        /// `./factory/.state`, sibling of the ledger it writes).
+        #[arg(long, value_name = "PATH")]
+        db: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -13029,6 +13046,252 @@ pub fn cmd_dispatch_stop(json: bool) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CUTOVER (ticket #88): one-shot bash-SQLite → Rust-JSON import
+//
+// The split brain retires here: the bash dispatcher's `dispatch.db`
+// (`attempts` + `releases` rows) is read once through the pure-Rust
+// `sqlite` module and written out as the Rust JSON ledger
+// (`dispatch.json` + `train.json`), then the `.db` is archived
+// byte-identical. After this pass the JSON ledger is the only store:
+// no dual reads, no dual writes, no sqlite linkage anywhere.
+//
+// Cutover runbook (human-authorized window only): stop the bash loop,
+// run `factory dispatch import`, verify `dispatch status` and
+// `log <ticket>` (human and `--json`) read the same facts `sqlite3`
+// read before, then start the Rust daemon. Closed releases are terminal
+// history with no live train behind them: they stay in the
+// byte-identical archive and are reported, never carried.
+// ---------------------------------------------------------------------------
+
+/// Outcome of one cutover pass, printed human- or machine-readable.
+struct CutoverReport {
+    attempts: usize,
+    open_train: Option<String>,
+    closed_skipped: usize,
+    ledger: PathBuf,
+    train: Option<PathBuf>,
+    archive: PathBuf,
+    sha256: String,
+}
+
+/// CLI boundary for `dispatch import`: exit 0 with the report on
+/// success, exit 1 with a plain-English cause naming the file.
+pub fn cmd_dispatch_import(json: bool, db_opt: Option<&std::path::Path>) -> i32 {
+    let state = dispatch_state_dir();
+    let db_path = db_opt
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.join("dispatch.db"));
+    match cutover_import(&state, &db_path) {
+        Ok(r) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "attempts": r.attempts,
+                        "open_train": r.open_train,
+                        "closed_releases_skipped": r.closed_skipped,
+                        "ledger": r.ledger.display().to_string(),
+                        "train": r.train.map(|p| p.display().to_string()),
+                        "archive": r.archive.display().to_string(),
+                        "sha256": r.sha256,
+                    })
+                );
+            } else {
+                println!(
+                    "import: {} attempt(s) from {}",
+                    r.attempts,
+                    db_path.display()
+                );
+                match &r.open_train {
+                    Some(t) => println!("import: open train {t}"),
+                    None => println!("import: no open train (nothing to carry)"),
+                }
+                if r.closed_skipped > 0 {
+                    println!(
+                        "import: skipped {} closed release(s) — terminal history, preserved in the archive",
+                        r.closed_skipped
+                    );
+                }
+                println!("import: ledger {}", r.ledger.display());
+                if let Some(t) = &r.train {
+                    println!("import: train {}", t.display());
+                }
+                println!(
+                    "import: archived byte-identical {} (sha256 {})",
+                    r.archive.display(),
+                    r.sha256
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// One import row → one ledger attempt, field for field. `NULL` commits,
+/// paths, and timestamps read as the same empty strings a
+/// pre-checkpoint Rust ledger carries; a `NULL` exit code (still
+/// running, never reported one) reads as 0, which no human or JSON
+/// summary prints for a running attempt.
+fn cutover_attempt(row: &sqlite::Row) -> Result<DispatchAttempt, String> {
+    Ok(DispatchAttempt {
+        id: row.req_u64("id")?,
+        ticket: row.req_u64("ticket")?,
+        attempt_no: row.req_u64("attempt_no")?,
+        base_commit: row.text("base_commit")?,
+        head_commit: row.text("head_commit")?,
+        branch: row.text("branch")?,
+        worktree: row.text("worktree")?,
+        status: row.req_text("status")?,
+        exit_code: row.opt_int("exit_code")?.unwrap_or(0) as i32,
+        log_path: row.text("log_path")?,
+        started_at: row.text("started_at")?,
+        finished_at: row.text("finished_at")?,
+        train_branch: row.maybe_text("train_branch")?,
+        phase: String::new(),
+        resumed: 0,
+    })
+}
+
+/// The live release state: the newest open release becomes the Rust open
+/// train, mirroring the bash reader (`ORDER BY id DESC LIMIT 1`). Closed
+/// releases are terminal history — counted so the report can say so,
+/// never carried, always preserved in the byte-identical archive.
+fn cutover_open_train(rows: &[sqlite::Row]) -> Result<(Option<TrainState>, usize), String> {
+    let mut open: Vec<&sqlite::Row> = Vec::new();
+    let mut closed = 0;
+    for row in rows {
+        if row.text("status")? == "open" {
+            open.push(row);
+        } else {
+            closed += 1;
+        }
+    }
+    open.sort_by_key(|r| r.req_u64("id").unwrap_or(0));
+    match open.last() {
+        None => Ok((None, closed)),
+        Some(row) => Ok((
+            Some(TrainState {
+                branch: row.req_text("branch")?,
+                base_commit: row.text("base_commit")?,
+                status: row.text("status")?,
+                created_at: row.text("created_at")?,
+            }),
+            closed,
+        )),
+    }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The one-shot pass. Refuses (before touching anything) when the state
+/// dir already holds a ledger, a train, or an archive — re-running
+/// against an already-imported state never duplicates. The source `.db`
+/// is opened read-only exactly once and re-hashed afterwards to prove
+/// it was never mutated.
+fn cutover_import(
+    state: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<CutoverReport, String> {
+    let ledger_path = state.join("dispatch.json");
+    if ledger_path.is_file() {
+        return Err(format!(
+            "import: {} already exists — this state dir was already imported (or holds Rust-native attempts); refusing to duplicate. To re-cutover, start from a fresh state dir.",
+            ledger_path.display()
+        ));
+    }
+    let train_path = state.join("train.json");
+    if train_path.is_file() {
+        return Err(format!(
+            "import: {} already exists — a Rust train is already open; refusing to clobber it.",
+            train_path.display()
+        ));
+    }
+    let archive = state.join("dispatch.db.archived");
+    if archive.exists() {
+        return Err(format!(
+            "import: {} already exists — this history was already archived; refusing to duplicate.",
+            archive.display()
+        ));
+    }
+    if !db_path.is_file() {
+        return Err(format!(
+            "import: no SQLite history at {} — nothing to import.",
+            db_path.display()
+        ));
+    }
+    let before = std::fs::read(db_path)
+        .map_err(|e| format!("import: cannot read {}: {e}", db_path.display()))?;
+    let sha = hex_sha256(&before);
+    let db = sqlite::Db::parse(before.clone()).map_err(|e| {
+        format!(
+            "import: cannot parse {} as SQLite history: {e}",
+            db_path.display()
+        )
+    })?;
+    let attempt_rows = db.table("attempts").map_err(|e| {
+        format!(
+            "import: cannot read attempts from {}: {e}",
+            db_path.display()
+        )
+    })?;
+    let release_rows = db.table("releases").map_err(|e| {
+        format!(
+            "import: cannot read releases from {}: {e}",
+            db_path.display()
+        )
+    })?;
+    let mut attempts = Vec::with_capacity(attempt_rows.len());
+    for row in &attempt_rows {
+        attempts.push(cutover_attempt(row)?);
+    }
+    let (open_train, closed_skipped) = cutover_open_train(&release_rows)?;
+    let ledger = DispatchLedger {
+        attempts,
+        ..Default::default()
+    };
+    save_ledger(state, &ledger)?;
+    let train_file = if let Some(ref train) = open_train {
+        save_train(state, train)?;
+        Some(train_path.clone())
+    } else {
+        None
+    };
+    std::fs::write(&archive, &before)
+        .map_err(|e| format!("import: cannot write {}: {e}", archive.display()))?;
+    let archived = std::fs::read(&archive)
+        .map_err(|e| format!("import: cannot verify {}: {e}", archive.display()))?;
+    if archived != before {
+        return Err(format!(
+            "import: archive {} differs from the source — refusing to report success.",
+            archive.display()
+        ));
+    }
+    let after = std::fs::read(db_path)
+        .map_err(|e| format!("import: cannot re-read {}: {e}", db_path.display()))?;
+    if after != before {
+        return Err(format!(
+            "import: {} changed during the import — refusing to report success.",
+            db_path.display()
+        ));
+    }
+    Ok(CutoverReport {
+        attempts: ledger.attempts.len(),
+        open_train: open_train.map(|t| t.branch),
+        closed_skipped,
+        ledger: ledger_path,
+        train: train_file,
+        archive,
+        sha256: sha,
+    })
+}
+
 pub fn cmd_dispatch_resume(json: bool) -> i32 {
     let state = dispatch_state_dir();
     let stop = state.join("STOP");
@@ -14823,6 +15086,7 @@ pub fn run() -> i32 {
                 decision,
             } => cmd_dispatch_memo(cli.json, &ticket, attempt, &key, &decision),
             DispatchAction::SelfTest => cmd_dispatch_selftest(cli.json),
+            DispatchAction::Import { db } => cmd_dispatch_import(cli.json, db.as_deref()),
         },
         Commands::Release { action } => match action {
             ReleaseAction::Start { slug } => cmd_release_start(cli.json, slug.as_deref()),
@@ -15733,6 +15997,86 @@ pub fn cmd_verify_freeze(json: bool, issue_raw: &str) -> i32 {
             )
         );
         1
+    }
+}
+
+// --- cutover selection, TDD red (ticket #88) --------------------------------
+// Release rows that are not the live open train never reach the Rust
+// store: closed releases are terminal history (preserved in the
+// byte-identical archive), and the newest open release wins, mirroring
+// the bash reader (`ORDER BY id DESC LIMIT 1`).
+#[cfg(test)]
+mod cutover_tests {
+    use super::{cutover_attempt, cutover_open_train};
+    use crate::sqlite::{Row, Value};
+
+    fn row(pairs: Vec<(&str, Value)>) -> Row {
+        Row {
+            columns: pairs.iter().map(|(c, _)| c.to_string()).collect(),
+            values: pairs.into_iter().map(|(_, v)| v).collect(),
+        }
+    }
+
+    fn release(id: i64, branch: &str, status: &str) -> Row {
+        row(vec![
+            ("id", Value::Int(id)),
+            ("branch", Value::Text(branch.to_string())),
+            ("base_commit", Value::Text("abc".to_string())),
+            ("status", Value::Text(status.to_string())),
+            ("created_at", Value::Text("2026-09-01 09:00:00".to_string())),
+        ])
+    }
+
+    #[test]
+    fn closed_releases_are_counted_never_carried() {
+        let rows = vec![
+            release(1, "integration/20260901-old", "closed"),
+            release(2, "integration/20260901-train", "open"),
+        ];
+        let (train, closed) = cutover_open_train(&rows).unwrap();
+        assert_eq!(train.unwrap().branch, "integration/20260901-train");
+        assert_eq!(closed, 1);
+    }
+
+    #[test]
+    fn newest_open_release_wins_like_the_bash_reader() {
+        let rows = vec![
+            release(1, "integration/20260901-first", "open"),
+            release(2, "integration/20260901-second", "open"),
+        ];
+        let (train, closed) = cutover_open_train(&rows).unwrap();
+        assert_eq!(train.unwrap().branch, "integration/20260901-second");
+        assert_eq!(closed, 0);
+    }
+
+    #[test]
+    fn no_releases_means_no_train() {
+        let (train, closed) = cutover_open_train(&[]).unwrap();
+        assert!(train.is_none());
+        assert_eq!(closed, 0);
+    }
+
+    #[test]
+    fn sparse_attempt_rows_read_as_empty_strings() {
+        let r = row(vec![
+            ("id", Value::Int(9)),
+            ("ticket", Value::Int(77)),
+            ("attempt_no", Value::Int(1)),
+            ("base_commit", Value::Null),
+            ("head_commit", Value::Null),
+            ("branch", Value::Text("factory/T77".to_string())),
+            ("worktree", Value::Null),
+            ("status", Value::Text("impl_done".to_string())),
+            ("exit_code", Value::Null),
+            ("log_path", Value::Null),
+            ("started_at", Value::Text("2026-09-05 10:00:00".to_string())),
+            ("finished_at", Value::Null),
+        ]);
+        let a = cutover_attempt(&r).unwrap();
+        assert_eq!(a.id, 9);
+        assert_eq!(a.base_commit, "");
+        assert_eq!(a.exit_code, 0);
+        assert_eq!(a.train_branch, "");
     }
 }
 
