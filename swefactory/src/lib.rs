@@ -457,6 +457,28 @@ pub enum FactsAction {
         /// whole document.
         #[arg(value_name = "PATH")]
         path: Option<String>,
+        /// Read the value as of this revision (time travel). Omit for
+        /// the latest revision (the default read, unchanged). Refused
+        /// past the current revision with both revisions named.
+        #[arg(long, value_name = "REV")]
+        at: Option<u64>,
+    },
+    /// Bounded history for one facts path (ticket #71, spec #64): the
+    /// last --limit recorded values oldest-first, human-readable by
+    /// default, machine-readable with the global --json flag carrying
+    /// the same revision-plus-value facts. Read-only: observing changes
+    /// nothing. --limit is required (1 to 50 entries per read); an
+    /// absent, zero, or over-cap limit is refused with the cap stated
+    /// and nothing dumped. A never-written path reads as empty history
+    /// (exit 0), never error-shaped.
+    History {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Entries returned, most recent first kept, oldest-first
+        /// shown (1 to 50). Required: history is never unbounded.
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
     },
     /// Create one facts path with the revision the reader observed.
     /// Refuses when the path already exists (nothing changed). One
@@ -11129,7 +11151,130 @@ fn save_facts_document(state: &std::path::Path, doc: &FactsDocument) -> Result<(
     Ok(())
 }
 
-/// Add `delta` to `current` for `facts increment` (ticket #79).
+/// History-file name beside the facts document (ticket #71, spec
+/// #64): one small entry per accepted write, appended after the live
+/// document commits. No retention eviction in v1 (growth is one entry
+/// per write; reads stay bounded by --limit instead).
+const FACTS_HISTORY_FILENAME: &str = "facts.history.json";
+
+/// Bound on one history read (ticket #71): at most 50 entries per
+/// invocation, mirroring the log transcript tail scale. Stated in
+/// every history-bound refusal; there is no unbounded history dump.
+const FACTS_HISTORY_MAX_ENTRIES: u64 = 50;
+
+fn facts_history_path(state: &std::path::Path) -> PathBuf {
+    state.join(FACTS_HISTORY_FILENAME)
+}
+
+/// One recorded write, as stored: the revision it committed plus the
+/// path and its stored value (or the deletion marker). Kept as plain
+/// JSON values (no struct) so a corrupt entry fails the load loudly
+/// instead of half-deserializing.
+fn facts_history_entry(
+    revision: u64,
+    path: &str,
+    stored: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    match stored {
+        Some(value) => serde_json::json!({
+            "revision": revision,
+            "path": path,
+            "value": value,
+        }),
+        None => serde_json::json!({
+            "revision": revision,
+            "path": path,
+            "deleted": true,
+        }),
+    }
+}
+
+/// Read-only history load. An absent file (or absent state dir) reads
+/// as empty history with nothing created — no migration, mirroring the
+/// facts document. Unreadable or corrupt files error naming the facts
+/// history document.
+fn load_facts_history(state: &std::path::Path) -> Result<Vec<serde_json::Value>, String> {
+    let path = facts_history_path(state);
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("facts: cannot read {}: {e}", path.display())),
+        Ok(t) => t,
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("facts: cannot parse {}: {e}", path.display()))?;
+    let entries = parsed
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| {
+            format!(
+                "facts: cannot parse {}: expected an object with entries",
+                path.display()
+            )
+        })?;
+    for e in entries {
+        let shape_ok = e.as_object().is_some()
+            && e.get("revision").and_then(|r| r.as_u64()).is_some()
+            && e.get("path").and_then(|p| p.as_str()).is_some();
+        if !shape_ok {
+            return Err(format!(
+                "facts: cannot parse {}: every entry needs a revision and a path",
+                path.display()
+            ));
+        }
+    }
+    Ok(entries.clone())
+}
+
+/// Atomic history append (temp file + rename, like the facts
+/// document): readers see whole histories, never torn ones.
+fn save_facts_history(
+    state: &std::path::Path,
+    entries: &[serde_json::Value],
+) -> Result<(), String> {
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("facts: cannot create {}: {e}", state.display()))?;
+    let text = serde_json::to_string_pretty(&serde_json::json!({ "entries": entries }))
+        .map_err(|e| format!("facts: cannot serialize facts history: {e}"))?;
+    let tmp = facts_history_path(state).with_extension("json.hist.tmp");
+    std::fs::write(&tmp, &text)
+        .map_err(|e| format!("facts: cannot stage {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, facts_history_path(state)).map_err(|e| {
+        format!(
+            "facts: cannot replace {}: {e}",
+            facts_history_path(state).display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Rebuild the facts tree as of `revision` from recorded entries:
+/// entries apply in file (revision) order, each at most once, so a
+/// path reads the newest value at or before the requested revision.
+/// Revisions that predate recording (no migration, per spec #64) or
+/// a deleted path replay to missing — stated plainly, never an error.
+/// Unparseable entries are skipped so one bad row cannot hide the rest.
+fn replay_facts_at(entries: &[serde_json::Value], revision: u64) -> serde_json::Value {
+    let mut facts = serde_json::json!({});
+    for e in entries {
+        let entry_rev = match e.get("revision").and_then(|r| r.as_u64()) {
+            Some(r) => r,
+            None => continue,
+        };
+        if entry_rev > revision {
+            continue;
+        }
+        let path = match e.get("path").and_then(|p| p.as_str()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if e.get("deleted").and_then(|d| d.as_bool()).unwrap_or(false) {
+            let _ = facts_delete_value(&mut facts, path);
+        } else if let Some(v) = e.get("value") {
+            let _ = facts_set_value(&mut facts, path, v.clone());
+        }
+    }
+    facts
+}
 /// Integers that fit stay integers; anything else goes float. Errors
 /// (nothing changed) on overflow or a non-finite result.
 fn facts_add_delta(
@@ -11339,7 +11484,25 @@ fn cmd_facts_write(
             return code;
         }
     }
+    // Read the history before committing: a corrupt history refuses
+    // the whole write (nothing changed) instead of committing facts
+    // the history can no longer describe.
+    let mut history = match load_facts_history(&state) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     if let Err(e) = save_facts_document(&state, &new_doc) {
+        eprintln!("{e}");
+        return 1;
+    }
+    // History appends after the live document commits (conservative
+    // gap on crash: an as-of read never shows an uncommitted value).
+    // A failed append is reported but the committed write stands.
+    history.push(facts_history_entry(new_revision, &path, stored.as_ref()));
+    if let Err(e) = save_facts_history(&state, &history) {
         eprintln!("{e}");
         return 1;
     }
@@ -11466,7 +11629,11 @@ fn print_facts_path_attach(json: bool, doc: &FactsDocument, path: &str) {
 
 /// Read the facts document: whole or one path, human or machine.
 /// Read-only like `status`/`log`: observing changes nothing.
-pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
+/// With `at`, the value as of that revision (time travel, ticket
+/// #71); without it, the latest revision (the default read).
+/// An as-of read of the current revision serves the live document,
+/// so it is exactly the latest read.
+pub fn cmd_facts_show(json: bool, path_raw: Option<&str>, at_raw: Option<u64>) -> i32 {
     let state = dispatch_state_dir();
     let doc = match load_facts_document(&state) {
         Ok(d) => d,
@@ -11482,33 +11649,210 @@ pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
             Err(e) => return refuse_bad_path(json, raw, &e),
         },
     };
+    if let Some(r) = at_raw {
+        if r > doc.revision {
+            let label = path.clone().unwrap_or_else(|| "document".to_string());
+            return refuse_future_revision(json, &label, r, doc.revision);
+        }
+    }
+    // Latest and as-of-current serve the live document; older
+    // revisions replay the recorded entries. One render below (the
+    // attach block shared with `facts watch`), so both modes carry
+    // identical facts at every revision.
+    let view: FactsDocument = match at_raw {
+        Some(r) if r < doc.revision => {
+            let entries = match load_facts_history(&state) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            FactsDocument {
+                revision: r,
+                facts: replay_facts_at(&entries, r),
+            }
+        }
+        _ => doc,
+    };
 
     match path {
         None => {
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"revision": doc.revision, "facts": doc.facts})
+                    serde_json::json!({"revision": view.revision, "facts": view.facts})
                 );
                 return 0;
             }
-            if doc.facts == serde_json::json!({}) {
-                println!("facts at revision {}: empty (no values set).", doc.revision);
+            if view.facts == serde_json::json!({}) {
+                println!(
+                    "facts at revision {}: empty (no values set).",
+                    view.revision
+                );
             } else {
-                println!("facts at revision {}:", doc.revision);
-                println!("{}", facts_pretty(&doc.facts));
+                println!("facts at revision {}:", view.revision);
+                println!("{}", facts_pretty(&view.facts));
             }
             println!("{FACTS_LOCALITY_LINE}");
             0
         }
         Some(p) => {
-            print_facts_path_attach(json, &doc, &p);
+            print_facts_path_attach(json, &view, &p);
             if !json {
                 println!("{FACTS_LOCALITY_LINE}");
             }
             0
         }
     }
+}
+/// Future-revision refusal shared by as-of reads: names the presented
+/// and current revisions, changes nothing. Machine output keeps both
+/// revisions structurally so scripts can reread latest and retry.
+fn refuse_future_revision(json: bool, label: &str, presented: u64, current: u64) -> i32 {
+    eprintln!(
+        "facts: cannot show {label} at revision {presented}: current revision is {current}; nothing changed."
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": label,
+                "presented": presented,
+                "current": current,
+                "unavailable": true,
+            })
+        );
+    }
+    1
+}
+
+/// Missing --limit refusal for history reads: states the bound so the
+/// retry is explicit. Machine output keeps the bound structurally.
+fn refuse_history_limit_required(json: bool, path: &str) -> i32 {
+    eprintln!(
+        "facts: history needs an explicit --limit (1 to {FACTS_HISTORY_MAX_ENTRIES} entries per read); nothing dumped."
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path,
+                "max": FACTS_HISTORY_MAX_ENTRIES,
+                "limit_required": true,
+            })
+        );
+    }
+    1
+}
+
+/// Zero or over-cap --limit refusal: states the bound, dumps nothing.
+fn refuse_history_limit_invalid(json: bool, path: &str, limit: u64) -> i32 {
+    eprintln!(
+        "facts: history --limit must be 1 to {FACTS_HISTORY_MAX_ENTRIES} (got {limit}); nothing dumped."
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path,
+                "max": FACTS_HISTORY_MAX_ENTRIES,
+                "invalid_limit": true,
+            })
+        );
+    }
+    1
+}
+/// Bounded history for one facts path: the last `limit` recorded
+/// values oldest-first, human or machine. Read-only like
+/// `status`/`log`: observing changes nothing.
+pub fn cmd_facts_history(json: bool, path_raw: &str, limit_raw: Option<u64>) -> i32 {
+    let state = dispatch_state_dir();
+    let path = match validate_facts_path(path_raw) {
+        Ok(p) => p,
+        Err(e) => return refuse_bad_path(json, path_raw, &e),
+    };
+    let limit = match limit_raw {
+        None => return refuse_history_limit_required(json, &path),
+        Some(n) if n == 0 || n > FACTS_HISTORY_MAX_ENTRIES => {
+            return refuse_history_limit_invalid(json, &path, n);
+        }
+        Some(n) => n as usize,
+    };
+    let doc = match load_facts_document(&state) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let entries = match load_facts_history(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let for_path: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e.get("path").and_then(|p| p.as_str()) == Some(path.as_str()))
+        .collect();
+    let total = for_path.len();
+    let shown: Vec<&&serde_json::Value> =
+        for_path.iter().skip(total.saturating_sub(limit)).collect();
+    if json {
+        let out: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|e| {
+                if e.get("deleted").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    serde_json::json!({
+                        "revision": e.get("revision"),
+                        "deleted": true,
+                    })
+                } else {
+                    serde_json::json!({
+                        "revision": e.get("revision"),
+                        "value": e.get("value").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                }
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path,
+                "revision": doc.revision,
+                "limit": limit as u64,
+                "entries": out,
+            })
+        );
+        return 0;
+    }
+    if shown.is_empty() {
+        println!(
+            "facts {path} history at revision {}: no entries.",
+            doc.revision
+        );
+        println!("{FACTS_LOCALITY_LINE}");
+        return 0;
+    }
+    println!(
+        "facts {path} history at revision {} (showing last {} of {total}):",
+        doc.revision,
+        shown.len(),
+    );
+    for e in &shown {
+        let rev = e.get("revision").and_then(|r| r.as_u64()).unwrap_or(0);
+        if e.get("deleted").and_then(|d| d.as_bool()).unwrap_or(false) {
+            println!("revision {rev}: deleted.");
+        } else {
+            let value = e.get("value").cloned().unwrap_or(serde_json::Value::Null);
+            println!("revision {rev}:");
+            println!("{}", facts_pretty(&value));
+        }
+    }
+    println!("{FACTS_LOCALITY_LINE}");
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -14280,7 +14624,8 @@ pub fn run() -> i32 {
         Commands::Status => cmd_status(cli.json),
         Commands::Log { ticket, tail, fork } => cmd_log(&ticket, tail, fork.as_deref(), cli.json),
         Commands::Facts { action } => match action {
-            FactsAction::Show { path } => cmd_facts_show(cli.json, path.as_deref()),
+            FactsAction::Show { path, at } => cmd_facts_show(cli.json, path.as_deref(), at),
+            FactsAction::History { path, limit } => cmd_facts_history(cli.json, &path, limit),
             FactsAction::Create {
                 path,
                 revision,
