@@ -165,8 +165,8 @@ fn status_empty_state_reads_as_sentences() {
         "empty attempts read as a sentence, got:\n{text}"
     );
     assert!(
-        text.contains("no STOP file"),
-        "STOP state reported, got:\n{text}"
+        text.contains("loop: running"),
+        "loop state reported, got:\n{text}"
     );
 
     let out = status_cmd(&h, &["status", "--json"]).output().unwrap();
