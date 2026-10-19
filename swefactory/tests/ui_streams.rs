@@ -897,6 +897,24 @@ async fn quiet_connection_past_silence_bound_counts_as_dead() {
 }
 
 #[tokio::test]
+// Ticket #89 (flake quarantine): this test drives the bounded-queue
+// disconnect through REAL TCP backpressure, which is timing-dependent
+// and failed intermittently on timing-neutral commits (local #84 attempt
+// 1, CI on the rc.7 tag which touched only version/changelog, CI on the
+// #88 landing). Mechanism: the collapse needs 3 detected changes queued
+// while the socket is stalled, but each 40ms producer tick re-renders a
+// ~1.5MB fragment (ticks alias against the 60ms toggle beat under load)
+// and kernel loopback buffers absorb whole deltas before backpressure
+// bites — so whether the bound trips depends on machine scheduling, not
+// the logic. 15 consecutive local runs (9 idle + 6 under synthetic CPU
+// load, plus the full binary) all passed, which is itself the signature:
+// the trigger is environmental, not reproducible on demand. The collapse
+// logic itself is pinned deterministically by
+// `stream_backpressure_tests` in src/lib.rs (no sockets, no clock).
+// RE-ENABLE when the stall is driven deterministically — e.g. a test-only
+// hook capping the connection's socket buffers or a virtual producer
+// clock — so the disconnect no longer depends on real TCP timing.
+#[ignore = "ticket #89: real-TCP-backpressure timing flake; re-enable on a deterministic stall hook"]
 async fn stalled_consumer_past_buffer_bound_gets_reattach_then_disconnects() {
     let _guard = ENV_LOCK.lock().await;
     let root = tmpdir("stall");

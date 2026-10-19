@@ -16429,3 +16429,105 @@ mod stream_commit_tests {
         }
     }
 }
+
+//
+// Ticket #89: bounded-queue disconnect pinned without a server. The
+// loopback slow-consumer test (`stalled_consumer_...` in ui_streams.rs)
+// drives this same collapse through real TCP backpressure, which is
+// timing-dependent (kernel loopback buffers absorb whole 1.5MB deltas,
+// and 40ms producer ticks alias against the 60ms toggle beat under
+// load); it is quarantined there with the re-enable criterion. This
+// module pins the mechanism deterministically: past `buffer_bound`
+// queued events the backlog collapses into one terminal reattach
+// instruction and the stream ends — no sockets, no clock.
+#[cfg(test)]
+mod stream_backpressure_tests {
+    use super::{StreamChannel, StreamInner, StreamScope, StreamShared};
+    use futures_core::Stream;
+
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn dummy_event(name: &str) -> axum::response::sse::Event {
+        axum::response::sse::Event::default()
+            .event(name)
+            .data("dummy")
+    }
+
+    #[test]
+    fn queued_past_the_bound_collapses_to_one_terminal_reattach_then_ends() {
+        // Mirrors the quarantined wire test's rule (`buffer_bound = 4`):
+        // hello + snapshot are consumed before the stall, so the queue
+        // starts empty and each detected change costs two slots
+        // (commit, then delta). The third change past a full queue must
+        // collapse the backlog instead of buffering forever.
+        let scope = StreamScope::DispatcherLive;
+        let bound = 4usize;
+        let shared = std::sync::Arc::new(StreamShared {
+            inner: std::sync::Mutex::new(StreamInner {
+                queue: std::collections::VecDeque::new(),
+                closed: false,
+                waker: None,
+            }),
+        });
+        assert!(shared.push(dummy_event("commit")));
+        assert!(shared.push(dummy_event("delta")));
+        assert!(shared.push_delta(dummy_event("commit"), &scope, bound));
+        assert!(shared.push_delta(dummy_event("delta"), &scope, bound));
+        assert!(
+            !shared.push_delta(dummy_event("commit"), &scope, bound),
+            "past a full queue the producer must exit with the collapse"
+        );
+        assert!(
+            shared.is_closed(),
+            "the collapse ends the stream: no task or buffer is held"
+        );
+        assert_eq!(
+            shared
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .queue
+                .len(),
+            1,
+            "the backlog collapses to the single terminal instruction"
+        );
+        assert!(
+            !shared.push(dummy_event("delta")),
+            "nothing queues after the terminal instruction"
+        );
+
+        // The same interface Axum polls: exactly one event (the
+        // reattach instruction), then the end of the stream — the
+        // payload copy itself stays pinned by the quarantined wire
+        // test (`-- --ignored`), since axum's `Event` exposes no
+        // payload getters to unit tests.
+        let waker = noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut channel = StreamChannel {
+            shared: shared.clone(),
+        };
+        assert!(
+            matches!(
+                std::pin::Pin::new(&mut channel).poll_next(&mut cx),
+                std::task::Poll::Ready(Some(_))
+            ),
+            "the viewer drains the terminal instruction first"
+        );
+        assert!(
+            matches!(
+                std::pin::Pin::new(&mut channel).poll_next(&mut cx),
+                std::task::Poll::Ready(None)
+            ),
+            "then the server ends the stream instead of idling"
+        );
+    }
+}
