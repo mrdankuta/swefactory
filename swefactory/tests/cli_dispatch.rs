@@ -194,9 +194,12 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
         .env_remove("FACTORY_SLOT")
         // Hermetic worker pool (ticket #92): ambient slot env from the
         // operator's shell must not flip tests into wave mode. Tests that
-        // need parallelism set the level explicitly after this.
+        // need parallelism set the level explicitly after this. MAX_ATTEMPTS
+        // gets the same treatment: the attempt budget defaults to 2 and
+        // tests that need another budget set it explicitly.
         .env_remove("MAX_CONCURRENT")
-        .env_remove("FACTORY_MAX_CONCURRENT");
+        .env_remove("FACTORY_MAX_CONCURRENT")
+        .env_remove("MAX_ATTEMPTS");
     cmd
 }
 

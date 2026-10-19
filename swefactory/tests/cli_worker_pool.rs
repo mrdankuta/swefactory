@@ -184,8 +184,11 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
         .env("GH_VIEWS_DIR", &h.views)
         .env("GH_LIST_JSON", "[]")
         .env_remove("FACTORY_SLOT")
+        // Hermetic budgets too: the attempt budget defaults to 2 and tests
+        // that need another budget set MAX_ATTEMPTS explicitly.
         .env_remove("MAX_CONCURRENT")
-        .env_remove("FACTORY_MAX_CONCURRENT");
+        .env_remove("FACTORY_MAX_CONCURRENT")
+        .env_remove("MAX_ATTEMPTS");
     cmd
 }
 
