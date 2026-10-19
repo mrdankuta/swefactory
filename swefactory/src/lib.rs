@@ -513,6 +513,24 @@ pub enum FactsAction {
         #[arg(long, value_name = "DELTA", default_value = "1")]
         by: String,
     },
+    /// Attach to one facts path: the current value plus revision first,
+    /// then one delivery per accepted write touching the path since the
+    /// cursor. Fresh attach (no --since) is a snapshot only, never a
+    /// replay; re-attach with --since <last-seen-revision> after a drop
+    /// replays exactly the missed deliveries with no duplicates. Past
+    /// the delivery bound the backlog is refused with a re-attach
+    /// instruction instead of buffering forever. Read-only: watching
+    /// changes nothing. The global --json flag selects machine output
+    /// carrying the same value-plus-revision facts.
+    Watch {
+        /// Slash-separated facts path (e.g. costs/total).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Cursor revision: replay deliveries past this revision only.
+        /// Defaults to the current revision (attach only, no replay).
+        #[arg(long, value_name = "N")]
+        since: Option<u64>,
+    },
 }
 
 #[derive(Serialize)]
@@ -10775,6 +10793,23 @@ fn cmd_facts_write(
         eprintln!("{e}");
         return 1;
     }
+    // Journal the committed write for `facts watch` (ticket #72): the
+    // document side of the later streams work. Appended only after the
+    // rename above, so the journal reflects committed state and refused
+    // writes append nothing. A failed append is loud (exit 1 naming
+    // both facts) rather than a silent gap in future deliveries.
+    if let Err(e) = append_facts_event(
+        &state,
+        new_revision,
+        &path,
+        op,
+        &stored.clone().unwrap_or(serde_json::Value::Null),
+    ) {
+        eprintln!(
+            "facts: {path} saved at revision {new_revision}, but the watch journal was not appended: {e}; watchers may miss this delivery."
+        );
+        return 1;
+    }
     match stored {
         Some(value) => {
             if json {
@@ -10840,6 +10875,45 @@ pub fn cmd_facts_delete(json: bool, path: &str, revision: u64) -> i32 {
 pub fn cmd_facts_increment(json: bool, path: &str, revision: u64, by: &str) -> i32 {
     cmd_facts_write(json, "increment", path, revision, Some(by))
 }
+/// Attach block for one facts path (ticket #72): the current value plus
+/// revision rendered exactly like `facts show <path>` minus the locality
+/// footer, so `show` and `watch` attach with identical facts. Callers add
+/// the footer (show: immediately; watch: after the deliveries).
+fn print_facts_path_attach(json: bool, doc: &FactsDocument, path: &str) {
+    match facts_lookup(&doc.facts, path) {
+        Some(value) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revision": doc.revision,
+                        "path": path,
+                        "value": value,
+                    })
+                );
+                return;
+            }
+            println!("facts {path} at revision {}:", doc.revision);
+            println!("{}", facts_pretty(value));
+        }
+        None => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revision": doc.revision,
+                        "path": path,
+                        "value": serde_json::Value::Null,
+                        "missing": true,
+                    })
+                );
+                return;
+            }
+            println!("facts {path} at revision {}: no value set.", doc.revision);
+        }
+    }
+}
+
 /// Read the facts document: whole or one path, human or machine.
 /// Read-only like `status`/`log`: observing changes nothing.
 pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
@@ -10877,43 +10951,314 @@ pub fn cmd_facts_show(json: bool, path_raw: Option<&str>) -> i32 {
             println!("{FACTS_LOCALITY_LINE}");
             0
         }
-        Some(p) => match facts_lookup(&doc.facts, &p) {
-            Some(value) => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "revision": doc.revision,
-                            "path": p,
-                            "value": value,
-                        })
-                    );
-                    return 0;
-                }
-                println!("facts {p} at revision {}:", doc.revision);
-                println!("{}", facts_pretty(value));
+        Some(p) => {
+            print_facts_path_attach(json, &doc, &p);
+            if !json {
                 println!("{FACTS_LOCALITY_LINE}");
-                0
             }
-            None => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "revision": doc.revision,
-                            "path": p,
-                            "value": serde_json::Value::Null,
-                            "missing": true,
-                        })
-                    );
-                    return 0;
-                }
-                println!("facts {p} at revision {}: no value set.", doc.revision);
-                println!("{FACTS_LOCALITY_LINE}");
-                0
-            }
-        },
+            0
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DOCUMENT SUBSCRIPTIONS (ticket #72, spec #64 follow-up)
+//
+// Facts that push, at CLI fidelity: `factory facts watch <path>` attaches
+// to one facts path (current value plus revision, exactly as
+// `facts show <path>` renders) then replays one delivery per accepted
+// write touching the path since the cursor. This is the document side of
+// the later streams work: the streams layer can poll this command per
+// scope, but no socket, daemon, or second store appears here.
+//
+// The replay source is an append-only journal beside the document
+// (`facts-events.jsonl`: one JSON object per accepted write with its
+// revision, path, op, and stored value), appended only after the write
+// commits, so refused writes leave no trace and concurrent writers never
+// lose each other's entries. A fresh attach (no --since) is a snapshot
+// only, never a replay — like streams reconnects, the middle is simply
+// missed and the next attach lands current. A cursor past the delivery
+// bound is refused with a re-attach instruction naming the current
+// revision as the way back, instead of buffering forever. Watching is
+// read-only: only fs::read on this path, and an absent document or
+// journal reads as empty with nothing created.
+// ---------------------------------------------------------------------------
+
+/// Journal filename for accepted facts writes (beside `facts.json`).
+const FACTS_EVENTS_FILENAME: &str = "facts-events.jsonl";
+
+/// Delivery bound for one watch replay: the most deliveries a single
+/// invocation prints. Past it the watcher is told to re-attach instead
+/// of buffered forever — every delivery already carries its revision, so
+/// the next attach lands current anyway. Mirrors STREAM_BUFFER_BOUND.
+const FACTS_WATCH_BUFFER_BOUND: usize = 16;
+
+fn facts_events_path(state: &std::path::Path) -> PathBuf {
+    state.join(FACTS_EVENTS_FILENAME)
+}
+
+/// One journaled accepted write: the revision it committed at, the path
+/// it touched, the op, and the stored value (null for delete, whose
+/// delivery renders as deleted).
+struct FactsDelivery {
+    revision: u64,
+    path: String,
+    op: String,
+    value: serde_json::Value,
+}
+
+/// Append one journal line after a committed write. Append-only (never
+/// read-modify-write) so concurrent writers cannot lose entries.
+fn append_facts_event(
+    state: &std::path::Path,
+    revision: u64,
+    path: &str,
+    op: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let line = serde_json::to_string(&serde_json::json!({
+        "revision": revision,
+        "path": path,
+        "op": op,
+        "value": value,
+    }))
+    .map_err(|e| format!("facts: cannot serialize watch journal entry: {e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(facts_events_path(state))
+        .map_err(|e| {
+            format!(
+                "facts: cannot append {}: {e}",
+                facts_events_path(state).display()
+            )
+        })?;
+    use std::io::Write as _;
+    writeln!(file, "{line}").map_err(|e| {
+        format!(
+            "facts: cannot append {}: {e}",
+            facts_events_path(state).display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Read-only journal load. An absent journal (or absent state dir) reads
+/// as zero entries with nothing created; an unreadable or corrupt file
+/// errors naming the journal — never silently skipped, which could hide
+/// missed deliveries.
+fn load_facts_events(state: &std::path::Path) -> Result<Vec<FactsDelivery>, String> {
+    let path = facts_events_path(state);
+    let text = match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("facts: cannot read {}: {e}", path.display())),
+        Ok(t) => t,
+    };
+    let mut out = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "facts: cannot parse {} (line {}): {e}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        let revision = entry
+            .get("revision")
+            .and_then(|r| r.as_u64())
+            .ok_or_else(|| {
+                format!(
+                    "facts: cannot parse {} (line {}): entry has no revision",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+        let event_path = entry.get("path").and_then(|p| p.as_str()).ok_or_else(|| {
+            format!(
+                "facts: cannot parse {} (line {}): entry has no path",
+                path.display(),
+                index + 1
+            )
+        })?;
+        let op = entry.get("op").and_then(|o| o.as_str()).ok_or_else(|| {
+            format!(
+                "facts: cannot parse {} (line {}): entry has no op",
+                path.display(),
+                index + 1
+            )
+        })?;
+        out.push(FactsDelivery {
+            revision,
+            path: event_path.to_string(),
+            op: op.to_string(),
+            value: entry
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        });
+    }
+    Ok(out)
+}
+
+/// Machine envelope for one watch replay: the attach facts plus the
+/// cursor, the deliveries, and (on refusal) the re-attach instruction.
+fn facts_watch_json(
+    doc: &FactsDocument,
+    path: &str,
+    since: u64,
+    pending: &[&FactsDelivery],
+    reattach: bool,
+) -> serde_json::Value {
+    let mut attach = match facts_lookup(&doc.facts, path) {
+        Some(value) => serde_json::json!({
+            "revision": doc.revision,
+            "path": path,
+            "value": value,
+        }),
+        None => serde_json::json!({
+            "revision": doc.revision,
+            "path": path,
+            "value": serde_json::Value::Null,
+            "missing": true,
+        }),
+    };
+    let deliveries: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|d| {
+            if d.op == "delete" {
+                serde_json::json!({
+                    "revision": d.revision,
+                    "op": d.op,
+                    "deleted": true,
+                })
+            } else {
+                serde_json::json!({
+                    "revision": d.revision,
+                    "op": d.op,
+                    "value": d.value,
+                })
+            }
+        })
+        .collect();
+    let obj = attach.as_object_mut().expect("watch attach is an object");
+    obj.insert("since".to_string(), serde_json::Value::from(since));
+    obj.insert(
+        "deliveries".to_string(),
+        serde_json::Value::from(deliveries),
+    );
+    obj.insert("reattach".to_string(), serde_json::Value::from(reattach));
+    if reattach {
+        obj.insert(
+            "reason".to_string(),
+            serde_json::Value::from(format!(
+                "watch on {path} fell behind ({} deliveries past revision {since} over the {bound}-delivery bound) — re-attach with `factory facts watch {path} --since {current}` to see current state",
+                pending.len(),
+                bound = FACTS_WATCH_BUFFER_BOUND,
+                current = doc.revision,
+            )),
+        );
+        obj.insert(
+            "bound".to_string(),
+            serde_json::Value::from(FACTS_WATCH_BUFFER_BOUND),
+        );
+        obj.insert(
+            "pending".to_string(),
+            serde_json::Value::from(pending.len()),
+        );
+    }
+    attach
+}
+
+/// Attach to one facts path with the current value plus revision first,
+/// then one delivery per accepted write touching the path since the
+/// cursor (--since, defaulting to the current revision: a fresh attach
+/// is a snapshot, never a replay). Read-only: watching changes nothing.
+pub fn cmd_facts_watch(json: bool, path_raw: &str, since_raw: Option<u64>) -> i32 {
+    let state = dispatch_state_dir();
+    let doc = match load_facts_document(&state) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let path = match validate_facts_path(path_raw) {
+        Ok(p) => p,
+        Err(e) => return refuse_bad_path(json, path_raw, &e),
+    };
+    let since = since_raw.unwrap_or(doc.revision);
+    if since > doc.revision {
+        eprintln!(
+            "facts: cannot watch {path} since revision {since}: current revision is {}. Reread the path and retry; nothing changed.",
+            doc.revision
+        );
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "path": path,
+                    "since": since,
+                    "current": doc.revision,
+                    "invalid": true,
+                })
+            );
+        }
+        return 1;
+    }
+    let events = match load_facts_events(&state) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let pending: Vec<&FactsDelivery> = events
+        .iter()
+        .filter(|e| e.path == path && e.revision > since)
+        .collect();
+    if pending.len() > FACTS_WATCH_BUFFER_BOUND {
+        // Slow watcher: the attach still lands current, then the
+        // re-attach instruction instead of the backlog — the server is
+        // never buffered without bound.
+        if json {
+            println!("{}", facts_watch_json(&doc, &path, since, &pending, true));
+            return 1;
+        }
+        print_facts_path_attach(false, &doc, &path);
+        eprintln!(
+            "facts: watch on {path} fell behind ({} deliveries past revision {since} over the {}-delivery bound) — re-attach with `factory facts watch {path} --since {}` to see current state; nothing changed.",
+            pending.len(),
+            FACTS_WATCH_BUFFER_BOUND,
+            doc.revision
+        );
+        println!("{FACTS_LOCALITY_LINE}");
+        return 1;
+    }
+    if json {
+        println!("{}", facts_watch_json(&doc, &path, since, &pending, false));
+        return 0;
+    }
+    print_facts_path_attach(false, &doc, &path);
+    for delivery in &pending {
+        if delivery.op == "delete" {
+            println!(
+                "facts {path} delivery at revision {} (delete): deleted.",
+                delivery.revision
+            );
+        } else {
+            println!(
+                "facts {path} delivery at revision {} ({}):",
+                delivery.revision, delivery.op
+            );
+            println!("{}", facts_pretty(&delivery.value));
+        }
+    }
+    println!("{FACTS_LOCALITY_LINE}");
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -13344,6 +13689,7 @@ pub fn run() -> i32 {
             FactsAction::Increment { path, revision, by } => {
                 cmd_facts_increment(cli.json, &path, revision, &by)
             }
+            FactsAction::Watch { path, since } => cmd_facts_watch(cli.json, &path, since),
         },
         Commands::Fork {
             ticket,
