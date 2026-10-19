@@ -11,6 +11,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+/// Process-env access for UI-server tests: FACTORY_STATE_DIR is global,
+/// so every test that points it at a scratch dir serializes here —
+/// including the direct-handler test further below.
+static UI_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "swefactory-pool-{}-{}-{}",
@@ -188,7 +193,9 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
         // that need another budget set MAX_ATTEMPTS explicitly.
         .env_remove("MAX_CONCURRENT")
         .env_remove("FACTORY_MAX_CONCURRENT")
-        .env_remove("MAX_ATTEMPTS");
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("TIMEOUT_IMPL")
+        .env_remove("TIMEOUT_REVIEW");
     cmd
 }
 
@@ -196,19 +203,13 @@ fn gh_log(h: &Harness) -> String {
     fs::read_to_string(&h.gh_log).unwrap()
 }
 
-/// Assert ordered subsequence: each needle appears in stdout in order.
-fn assert_ordered(stdout: &str, needles: &[&str]) {
-    let mut pos = 0;
-    for n in needles {
-        match stdout[pos..].find(n) {
-            Some(i) => pos += i + n.len(),
-            None => panic!("missing {n:?} in order; got:\n{stdout}"),
-        }
-    }
-}
-
-/// Serial default (concurrency 1): the pass reads exactly like today —
-/// same line sequence, no pool vocabulary, same ledger transitions.
+/// Serial default (concurrency 1): the pass reads exactly like the
+/// pre-pool pass — byte-identical full stdout (finding #5: ordered
+/// subsequence + banned vocab could not catch extra lines), same ledger
+/// transition. The two train lines name the auto-cut train, which embeds
+/// today's date: the branch is read back from the repo so the assertion
+/// stays exact without pinning the clock, while still proving both lines
+/// name the SAME train.
 #[test]
 fn serial_default_pass_reads_as_before() {
     let h = setup("serial-default");
@@ -228,16 +229,36 @@ fn serial_default_pass_reads_as_before() {
         .stdout
         .clone();
     let stdout = String::from_utf8(out).unwrap();
-    assert_ordered(
-        &stdout,
-        &[
-            "dispatch: #11 'Demo widget' (attempt 1)",
-            "implement: pi -p (slot T11-a1)",
-            "verify: check adapter",
-            "review: pi -p",
-            "ACCEPTED",
-            "dispatch: pass complete (1 attempted)",
-        ],
+    let trains: Vec<String> = std::process::Command::new("git")
+        .args([
+            "branch",
+            "--list",
+            "integration/*",
+            "--format=%(refname:short)",
+        ])
+        .current_dir(&h.repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter_map(|b| {
+            let s = String::from_utf8_lossy(b).trim().to_string();
+            (!s.is_empty()).then_some(s)
+        })
+        .collect();
+    assert_eq!(
+        trains.len(),
+        1,
+        "serial pass auto-cuts exactly one train: {trains:?}"
+    );
+    let train = &trains[0];
+    let expected = format!(
+        "dispatch: #11 'Demo widget' (attempt 1)\n  implement: pi -p (slot T11-a1, timeout 1800s)\n  verify: check adapter\n  review: pi -p (timeout 1200s)\n  auto-cut train {train} (no open train)\n  ACCEPTED + INTEGRATED into {train} (auto-cut) — #11\ndispatch: pass complete (1 attempted)\n"
+    );
+    assert_eq!(
+        stdout, expected,
+        "serial default must be byte-identical to the pre-pool pass"
     );
     for banned in [
         "concurrency",
@@ -732,8 +753,7 @@ fn concurrency_level_configurable_cli_and_ui() {
 fn ui_post_persists_concurrency_for_next_pass() {
     use axum::response::IntoResponse;
     use factory_lib::{dispatcher_concurrency_handler, resolve_max_concurrent, ConcurrencyForm};
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap();
+    let _guard = UI_ENV_LOCK.lock().unwrap();
     let saved_state = std::env::var("FACTORY_STATE_DIR").ok();
     let saved_max = std::env::var("MAX_CONCURRENT").ok();
     let saved_factory_max = std::env::var("FACTORY_MAX_CONCURRENT").ok();
@@ -772,6 +792,370 @@ fn ui_post_persists_concurrency_for_next_pass() {
         err.1
     );
     assert_eq!(resolve_max_concurrent(None, &state).unwrap(), 3);
+    unsafe {
+        if let Some(v) = saved_state {
+            std::env::set_var("FACTORY_STATE_DIR", v);
+        } else {
+            std::env::remove_var("FACTORY_STATE_DIR");
+        }
+        if let Some(v) = saved_max {
+            std::env::set_var("MAX_CONCURRENT", v);
+        }
+        if let Some(v) = saved_factory_max {
+            std::env::set_var("FACTORY_MAX_CONCURRENT", v);
+        }
+    }
+}
+
+/// Wave rows keep distinct ids and per-ticket integrity (finding #1):
+/// id, push, and index resolve under one guard, so concurrent workers can
+/// neither mint duplicate ids nor land in each other's rows.
+#[test]
+fn wave_rows_keep_distinct_ids_and_ticket_integrity() {
+    let h = setup("wave-integrity");
+    for (n, title) in [(11, "One"), (12, "Two")] {
+        write_view(&h, n, title, "Build it.", &["ticket", "ready"], "OPEN");
+    }
+    dispatch_cmd(&h, &["dispatch", "once", "--concurrency", "2"])
+        .env("GH_LIST_JSON", r#"[{"number":11},{"number":12}]"#)
+        .assert()
+        .success();
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(h.state.join("dispatch.json")).unwrap()).unwrap();
+    let attempts = ledger.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 2, "one row per ticket:\n{ledger}");
+    let mut ids: Vec<u64> = attempts
+        .iter()
+        .filter_map(|a| a.get("id").and_then(|v| v.as_u64()))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 2, "distinct row ids:\n{ledger}");
+    for a in attempts {
+        let ticket = a.get("ticket").and_then(|v| v.as_u64()).unwrap();
+        let attempt_no = a.get("attempt_no").and_then(|v| v.as_u64()).unwrap();
+        let branch = a.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+        let worktree = a.get("worktree").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            branch.starts_with(&format!("factory/T{ticket}-")),
+            "row carries its own ticket branch, got {branch}:\n{ledger}"
+        );
+        assert!(
+            worktree.contains(&format!("T{ticket}-a{attempt_no}")),
+            "row carries its own slot worktree, got {worktree}:\n{ledger}"
+        );
+        assert_eq!(
+            a.get("status").and_then(|v| v.as_str()),
+            Some("review_done"),
+            "both finish clean:\n{ledger}"
+        );
+    }
+}
+
+/// The pass flag beats the environment end to end (finding #2):
+/// `--concurrency 2` admits a 2-wide wave even with MAX_CONCURRENT=1.
+#[test]
+fn flag_beats_env_end_to_end() {
+    let h = setup("flag-beats-env");
+    for (n, title) in [(11, "One"), (12, "Two")] {
+        write_view(&h, n, title, "Build it.", &["ticket", "ready"], "OPEN");
+    }
+    let out = dispatch_cmd(&h, &["dispatch", "once", "--concurrency", "2"])
+        .env("MAX_CONCURRENT", "1")
+        .env("GH_LIST_JSON", r#"[{"number":11},{"number":12}]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains("dispatch: pass complete (2 attempted)"),
+        "flag admits the full wave, got:\n{stdout}"
+    );
+}
+
+/// Resume honors the pass level, not the environment (finding #2): with
+/// `--concurrency 2` and MAX_CONCURRENT=1, a checkpointed attempt resumes
+/// instead of deferring at the stale env gate — while its sibling stays
+/// live through a slow implement.
+#[test]
+fn resume_honors_pass_level_not_env() {
+    let h = setup("resume-level");
+    write_view(&h, 11, "Slow", "Build it.", &["ticket", "ready"], "OPEN");
+    write_view(&h, 12, "Quick", "Build it.", &["ticket", "ready"], "OPEN");
+    // #11's implement sleeps with its slot held; #12 resumes instantly.
+    let pi = write_exe(
+        h.repo.parent().unwrap(),
+        "pi-slow11",
+        &format!(
+            r#"#!/bin/sh
+echo "pi slot:${{FACTORY_SLOT:-unset}}" >> "{}"
+if [ "${{FACTORY_SLOT:-}}" = "T11-a1" ]; then sleep 5; fi
+echo "change from pi" >> change.txt
+echo "notes"
+echo "VERDICT: accept"
+"#,
+            h.pi_log.display(),
+        ),
+    );
+    fs::create_dir_all(h.state.join("logs")).unwrap();
+    let log_path = h.state.join("logs").join("T12-a1-impl.log");
+    fs::write(&log_path, "abandoned mid-implement\n").unwrap();
+    let ledger = serde_json::json!({"attempts": [{
+        "id": 1, "ticket": 12, "attempt_no": 1,
+        "base_commit": "", "head_commit": "", "branch": "factory/T12-demo",
+        "worktree": "", "status": "impl_interrupted", "exit_code": 0,
+        "log_path": log_path.to_string_lossy(), "started_at": "1",
+        "finished_at": "2", "train_branch": "", "phase": "implement", "resumed": 0,
+    }]});
+    fs::write(
+        h.state.join("dispatch.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    let out = dispatch_cmd(&h, &["dispatch", "once", "--concurrency", "2"])
+        .env("FACTORY_PI_BIN", &pi)
+        .env("MAX_CONCURRENT", "1")
+        .env("GH_LIST_JSON", r#"[{"number":11},{"number":12}]"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains("resumed from implement checkpoint"),
+        "checkpoint resumes, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("slot gate at capacity"),
+        "pass level admits over the stale env gate, got:\n{stdout}"
+    );
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(h.state.join("dispatch.json")).unwrap()).unwrap();
+    let attempts = after.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 2, "resume reuses its row:\n{after}");
+    let resumed: Vec<&serde_json::Value> = attempts
+        .iter()
+        .filter(|a| a.get("ticket").and_then(|v| v.as_u64()) == Some(12))
+        .collect();
+    assert_eq!(resumed.len(), 1, "no duplicate row:\n{after}");
+    assert_eq!(
+        resumed[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "checkpoint resume counted:\n{after}"
+    );
+    assert_eq!(
+        resumed[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "resumed attempt finishes:\n{after}"
+    );
+}
+
+/// A pre-existing live row competes fairly without overshoot (finding #4):
+/// the reaper converts it to a resumable checkpoint, every wave re-checks
+/// capacity (never admitting past max_concurrent), and the row resumes on
+/// its own record — never duplicated, never starved.
+#[test]
+fn live_row_competes_fairly_without_overshoot() {
+    let h = setup("live-row-cap");
+    for (n, title) in [(10, "Ten"), (11, "One"), (12, "Two")] {
+        write_view(&h, n, title, "Build it.", &["ticket", "ready"], "OPEN");
+    }
+    fs::create_dir_all(h.state.join("logs")).unwrap();
+    let log_path = h.state.join("logs").join("T10-a1-impl.log");
+    fs::write(&log_path, "abandoned mid-implement\n").unwrap();
+    let ledger = serde_json::json!({"attempts": [{
+        "id": 1, "ticket": 10, "attempt_no": 1,
+        "base_commit": "", "head_commit": "", "branch": "factory/T10-demo",
+        "worktree": "", "status": "impl_running", "exit_code": 0,
+        "log_path": log_path.to_string_lossy(), "started_at": "1",
+        "finished_at": "", "train_branch": "", "phase": "implement", "resumed": 0,
+    }]});
+    fs::write(
+        h.state.join("dispatch.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    let out = dispatch_cmd(&h, &["dispatch", "once", "--concurrency", "2"])
+        .env(
+            "GH_LIST_JSON",
+            r#"[{"number":10},{"number":11},{"number":12}]"#,
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        stdout.contains("waiting for a free slot") && stdout.contains("#12"),
+        "queue discipline names the deferred ticket, got:\n{stdout}"
+    );
+    for line in stdout.lines().filter(|l| l.contains("admitting #")) {
+        // Count only the admitted segment (before any waiting list).
+        let admitted_segment = line.split("admitting").nth(1).unwrap_or("");
+        let admitted_segment = admitted_segment.split(';').next().unwrap_or("");
+        let admitted = admitted_segment.matches('#').count();
+        assert!(
+            admitted <= 2,
+            "no wave admits past capacity, got {line:?}:\n{stdout}"
+        );
+    }
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(h.state.join("dispatch.json")).unwrap()).unwrap();
+    let attempts = after.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(attempts.len(), 3, "one row per ticket:\n{after}");
+    let mut ids: Vec<u64> = attempts
+        .iter()
+        .filter_map(|a| a.get("id").and_then(|v| v.as_u64()))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "distinct row ids:\n{after}");
+    let ten: Vec<&serde_json::Value> = attempts
+        .iter()
+        .filter(|a| a.get("ticket").and_then(|v| v.as_u64()) == Some(10))
+        .collect();
+    assert_eq!(ten.len(), 1, "ex-live row resumes on its record:\n{after}");
+    assert_eq!(
+        ten[0].get("resumed").and_then(|v| v.as_u64()),
+        Some(1),
+        "reaped row counted as resumed:\n{after}"
+    );
+    for a in attempts {
+        assert_eq!(
+            a.get("status").and_then(|v| v.as_str()),
+            Some("review_done"),
+            "every ticket finishes:\n{after}"
+        );
+    }
+}
+
+/// A daemon startup flag seeds the saved level once, then later passes
+/// re-resolve without it (finding #3): a UI write after startup takes
+/// effect on the very next pass instead of being shadowed.
+#[test]
+fn daemon_flag_seeds_saved_level_then_ui_wins() {
+    let h = setup("daemon-flag-once");
+    // STOP halts after the first pass; no tickets listed.
+    fs::create_dir_all(&h.state).unwrap();
+    fs::write(h.state.join("STOP"), "stopped\n").unwrap();
+    dispatch_cmd(
+        &h,
+        &[
+            "dispatch",
+            "daemon",
+            "--interval",
+            "0",
+            "--concurrency",
+            "2",
+        ],
+    )
+    .env("GH_LIST_JSON", r#"[]"#)
+    .assert()
+    .success();
+    assert_eq!(
+        fs::read_to_string(h.state.join("concurrency"))
+            .unwrap()
+            .trim(),
+        "2",
+        "startup flag persists as the saved level"
+    );
+    // The UI handler→file link is pinned by
+    // ui_post_persists_concurrency_for_next_pass; here the file→pass link:
+    // a saved 1 with no flag runs the serial path over three tickets.
+    fs::remove_file(h.state.join("STOP")).unwrap();
+    fs::write(h.state.join("concurrency"), "1\n").unwrap();
+    for (n, title) in [(11, "One"), (12, "Two"), (13, "Three")] {
+        write_view(&h, n, title, "Build it.", &["ticket", "ready"], "OPEN");
+    }
+    let out = dispatch_cmd(&h, &["dispatch", "once"])
+        .env(
+            "GH_LIST_JSON",
+            r#"[{"number":11},{"number":12},{"number":13}]"#,
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(out).unwrap();
+    assert!(
+        !stdout.contains("wave"),
+        "saved level 1 runs the serial path, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dispatch: pass complete (3 attempted)"),
+        "serial pass still drains the queue, got:\n{stdout}"
+    );
+}
+
+/// The concurrency route is registered end to end (finding #6): POSTing
+/// the form path from the fragment redirects, persists the level, and the
+/// fragment then reflects the new level — a typo'd path or method would
+/// 404 here while handler-direct tests stay green.
+#[test]
+fn router_serves_concurrency_post_and_fragment_reflects_level() {
+    use std::io::{Read, Write};
+    let _guard = UI_ENV_LOCK.lock().unwrap();
+    let saved_state = std::env::var("FACTORY_STATE_DIR").ok();
+    let saved_max = std::env::var("MAX_CONCURRENT").ok();
+    let saved_factory_max = std::env::var("FACTORY_MAX_CONCURRENT").ok();
+    let state = tmpdir("ui-router");
+    fs::create_dir_all(&state).unwrap();
+    // SAFETY: UI_ENV_LOCK held: no sibling test observes these values.
+    unsafe {
+        std::env::set_var("FACTORY_STATE_DIR", &state);
+        std::env::remove_var("MAX_CONCURRENT");
+        std::env::remove_var("FACTORY_MAX_CONCURRENT");
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, factory_lib::web_router()).await;
+        });
+        let post = tokio::task::spawn_blocking(move || {
+            let body = "level=2";
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                s,
+                "POST /dispatch/concurrency HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await
+        .unwrap();
+        assert!(
+            post.contains("303") || post.contains("See Other"),
+            "POST redirects through the registered route, got:\n{post}"
+        );
+        server.abort();
+    });
+    assert_eq!(
+        fs::read_to_string(state.join("concurrency"))
+            .unwrap()
+            .trim(),
+        "2",
+        "routed POST persists the level"
+    );
+    // The polling fragment now reflects the posted level.
+    let frag = factory_lib::dispatcher_fragment_html(&factory_lib::dispatcher_data());
+    assert!(
+        frag.contains("data-concurrency-level=\"2\""),
+        "fragment reflects the new level, got:\n{frag}"
+    );
     unsafe {
         if let Some(v) = saved_state {
             std::env::set_var("FACTORY_STATE_DIR", v);

@@ -351,8 +351,14 @@ fn dispatch_cmd(h: &Harness) -> Command {
         .env("PI_PROMPT_LOG", &h.prompt_log)
         .env("PI_TICKET", "9")
         .env("ADAPTER_FAIL", "1")
-        .env("MAX_ATTEMPTS", "5")
-        .env_remove("FACTORY_SLOT");
+        // Hermetic budgets first: scrub ambient service env so the
+        // explicit non-default below is the only signal (2 -> 5, not 3 -> 5).
+        .env_remove("FACTORY_SLOT")
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("MAX_CONCURRENT")
+        .env_remove("TIMEOUT_IMPL")
+        .env_remove("TIMEOUT_REVIEW")
+        .env("MAX_ATTEMPTS", "5");
     cmd
 }
 

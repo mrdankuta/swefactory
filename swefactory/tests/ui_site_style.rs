@@ -44,6 +44,7 @@ fn every_page_shell_carries_the_stylesheet() {
         body: "body".to_string(),
         labels: vec![],
         state: "open".to_string(),
+        transcript: None,
         attempts: vec![],
     };
     let pages = [
@@ -97,6 +98,7 @@ fn dynamic_titles_keep_their_data_and_no_css() {
         body: "body".to_string(),
         labels: vec![],
         state: "open".to_string(),
+        transcript: None,
         attempts: vec![],
     };
     let page = ticket_detail_page_html(&detail);

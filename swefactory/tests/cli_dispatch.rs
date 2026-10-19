@@ -199,7 +199,9 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
         // tests that need another budget set it explicitly.
         .env_remove("MAX_CONCURRENT")
         .env_remove("FACTORY_MAX_CONCURRENT")
-        .env_remove("MAX_ATTEMPTS");
+        .env_remove("MAX_ATTEMPTS")
+        .env_remove("TIMEOUT_IMPL")
+        .env_remove("TIMEOUT_REVIEW");
     cmd
 }
 

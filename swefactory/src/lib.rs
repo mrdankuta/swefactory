@@ -63,6 +63,14 @@ pub enum Commands {
         /// Show one fork by name or number instead of the attempt history.
         #[arg(long, value_name = "NAME|NUMBER")]
         fork: Option<String>,
+        /// Render the latest attempt's agent conversation (assistant turns,
+        /// thinking, tool calls, results) instead of the raw tool-output log.
+        /// Bounded to the newest 20 items (`--tail N` overrides, `0` means
+        /// full). Read-only: rendering reads session file bytes only and
+        /// never attaches to the live session — opening the live session
+        /// in another agent process stays forbidden.
+        #[arg(long)]
+        transcript: bool,
     },
     /// Fork a ticket attempt at a chosen log entry into a named experiment
     /// line (spec #65: fork creation + isolation in ticket #80, lineage +
@@ -286,6 +294,9 @@ pub enum Commands {
     /// refreshing in place over the same read-only seams `status` and
     /// `dispatch status` read. Polling is the transport; when streams are
     /// unavailable the pane says so calmly instead of erroring.
+    /// Timestamps render under one rule (ticket #96): epoch seconds and
+    /// pre-cutover UTC civil strings both read as `YYYY-MM-DD HH:MM:SS`
+    /// UTC; `--json` keeps the raw ledger strings.
     /// Read-only: watching changes nothing, closing changes nothing.
     /// Piped output (`| cat`) degrades to one static snapshot and exits.
     Watch {
@@ -371,6 +382,15 @@ pub enum DispatchAction {
         /// Survey only: no worktrees, subprocesses, or writes.
         #[arg(long)]
         dry_run: bool,
+        /// Bound for the implement wait in seconds (flag wins over
+        /// TIMEOUT_IMPL; bash parity default 1800). On expiry the worker
+        /// process tree is killed and the attempt resumes next pass.
+        #[arg(long, value_name = "SECS")]
+        timeout_impl: Option<u64>,
+        /// Bound for the review wait in seconds (flag wins over
+        /// TIMEOUT_REVIEW; bash parity default 1200). Same expiry path.
+        #[arg(long, value_name = "SECS")]
+        timeout_review: Option<u64>,
         /// Client-generated exactly-once key for this pass: a repeat with
         /// the same key replays the stored outcome with a replay marker
         /// instead of double-admitting. Keys are retained for 24 hours;
@@ -391,14 +411,27 @@ pub enum DispatchAction {
         #[arg(long, default_value_t = 300)]
         interval: u64,
         /// Live worker slots per pass (1-8, default 1): the same setting
-        /// the dispatcher UI carries. Read fresh every pass, so a change
-        /// applies without restarting the daemon.
+        /// the dispatcher UI carries. The flag sets the initial level
+        /// (persisted so the UI agrees); later passes re-resolve from the
+        /// environment and the saved setting, so a UI change applies
+        /// without restarting the daemon.
         #[arg(long)]
         concurrency: Option<usize>,
+        /// Bound for the implement wait in seconds (flag wins over
+        /// TIMEOUT_IMPL; bash parity default 1800).
+        #[arg(long, value_name = "SECS")]
+        timeout_impl: Option<u64>,
+        /// Bound for the review wait in seconds (flag wins over
+        /// TIMEOUT_REVIEW; bash parity default 1200).
+        #[arg(long, value_name = "SECS")]
+        timeout_review: Option<u64>,
     },
     /// Show attempts + worktrees + loop state. Human output renders an
     /// aligned-column table bounded to live attempts plus the most recent
-    /// finished attempts; `--all` opts into the full history. Read-only:
+    /// finished attempts; `--all` opts into the full history. Timestamps
+    /// render under one rule (ticket #96): epoch seconds and pre-cutover
+    /// UTC civil strings both read as `YYYY-MM-DD HH:MM:SS` UTC; `--json`
+    /// keeps the raw ledger strings. Read-only:
     /// observing changes nothing. Exit 0 whenever the ledger read
     /// succeeded (even when empty); nonzero only on unreadable state.
     /// The global --json flag selects machine output carrying every
@@ -1176,7 +1209,8 @@ pub struct TicketAttemptView {
     pub truncated: bool,
 }
 
-/// One ticket as the detail page sees it: body plus attempt history.
+/// One ticket as the detail page sees it: body plus attempt history plus
+/// the latest attempt's normalized agent conversation (ticket #93).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TicketDetail {
     pub number: u64,
@@ -1185,6 +1219,10 @@ pub struct TicketDetail {
     pub labels: Vec<String>,
     pub state: String,
     pub attempts: Vec<TicketAttemptView>,
+    /// Latest attempt's conversation pane (the same items
+    /// `factory log --transcript` renders). `None` when the ticket has no
+    /// attempts; `Some` with `session: None` when no session was recorded.
+    pub transcript: Option<TicketTranscriptPane>,
 }
 
 /// Calm sentence when the ticket has no attempts yet (Bea: ready, not broken).
@@ -1285,6 +1323,7 @@ pub fn ticket_detail(number: u64, tail: usize) -> Option<TicketDetail> {
         labels: issue.labels,
         state: issue.state,
         attempts: ticket_attempt_views(number, tail),
+        transcript: ticket_transcript_pane(number),
     })
 }
 
@@ -1317,14 +1356,26 @@ pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
         "labels": detail.labels,
         "state": detail.state,
         "attempts": attempts,
+        "transcript_pane": detail.transcript.as_ref().map(|p| serde_json::json!({
+            "ticket": p.ticket,
+            "attempt": p.attempt_no,
+            "slot": p.slot,
+            "session": p.session,
+            "items": p.items,
+            "total": p.total,
+            "truncated": p.truncated,
+            "partial": p.partial,
+        })),
     })
 }
 
 /// Fragment HTML for one ticket (the polling unit). Pure over the detail
 /// so tests assert markers without a server: `data-ticket` plus
 /// `data-ticket-body`, per-attempt `data-attempt` with `data-summary`
-/// before `data-transcript`, and `data-truncated` naming the bound when
-/// older lines were dropped.
+/// before `data-transcript`, `data-truncated` naming the bound when older
+/// lines were dropped, and the agent-conversation pane
+/// (`data-transcript-pane`) rendering the same normalized items
+/// `factory log --transcript` shows.
 pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
     let mut html = String::new();
     html.push_str(&format!(
@@ -1365,6 +1416,9 @@ pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
             html.push_str("</li>");
         }
         html.push_str("</ol>");
+    }
+    if let Some(pane) = detail.transcript.as_ref() {
+        html.push_str(&ticket_transcript_pane_html(pane));
     }
     html
 }
@@ -3369,7 +3423,7 @@ pub fn watch_snapshot() -> WatchSnapshot {
                     slot,
                     a.status,
                     attempt_phase(a),
-                    a.started_at
+                    format_stamp_human(&a.started_at)
                 )
             } else {
                 format!(
@@ -3377,8 +3431,8 @@ pub fn watch_snapshot() -> WatchSnapshot {
                     slot,
                     a.status,
                     attempt_phase(a),
-                    a.started_at,
-                    a.finished_at
+                    format_stamp_human(&a.started_at),
+                    format_stamp_human(&a.finished_at)
                 )
             }
         })
@@ -3999,6 +4053,10 @@ fn dispatcher_commit_state(data: &DispatcherData) -> serde_json::Value {
         "attempts": attempts,
         "tasks": tasks,
         "worktrees": data.worktrees,
+        // The pool level rides the commit feed (finding #6): a UI write
+        // that changes the level must be as audible as a STOP or a new
+        // attempt — otherwise the live pane stays silent on it.
+        "max_concurrent": data.max_concurrent,
     })
 }
 
@@ -4113,6 +4171,15 @@ fn summarize_dispatcher_change(old: &serde_json::Value, new: &serde_json::Value)
                 "dispatch loop resumed".to_string()
             },
         );
+    }
+    let old_level = old.get("max_concurrent").and_then(|v| v.as_u64());
+    let new_level = new.get("max_concurrent").and_then(|v| v.as_u64());
+    if old_level != new_level {
+        match (old_level, new_level) {
+            (Some(o), Some(n)) => out.push(format!("worker slots {o}\u{2192}{n}")),
+            (None, Some(n)) => out.push(format!("worker slots \u{2192}{n}")),
+            _ => {}
+        }
     }
     let mut before: std::collections::BTreeMap<String, (String, i64)> =
         std::collections::BTreeMap::new();
@@ -7502,6 +7569,59 @@ fn parse_epoch_secs(raw: &str) -> Option<i64> {
     parse_iso8601_epoch(s)
 }
 
+/// Inverse of `days_from_civil` (Hinnant's civil-from-days): days since
+/// the Unix epoch to (year, month, day). Pure date math, no timezone
+/// database: the loop renders UTC everywhere (see `format_stamp_human`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    (y, m, d)
+}
+
+/// One human rule for every timestamp the loop shows (ticket #96): epoch
+/// seconds (what `now_stamp` writes post-cutover) render as UTC civil
+/// `YYYY-MM-DD HH:MM:SS` — the exact shape the bash dispatcher wrote via
+/// SQLite `datetime('now')` (also UTC), so both eras read identically.
+/// Already-shaped strings pass through untouched; anything else passes
+/// through raw (a gap reads as the stored value, never an error).
+/// Machine output (`--json`) keeps the raw ledger strings untouched:
+/// every machine timestamp *field* stays byte-identical, only human
+/// prose (including the prose inside `watch --json` transitions) is
+/// formatted.
+fn format_stamp_human(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    match s.parse::<i64>() {
+        Ok(epoch) => {
+            let days = epoch.div_euclid(86_400);
+            let clock = epoch.rem_euclid(86_400);
+            let (y, m, d) = civil_from_days(days);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y,
+                m,
+                d,
+                clock / 3_600,
+                (clock % 3_600) / 60,
+                clock % 60
+            )
+        }
+        Err(_) => s.to_string(),
+    }
+}
+
 /// Reduce one `gh issue view --json number,createdAt,labels,comments`
 /// document to the signals the autonomy rule observes. Labels reuse the
 /// board's existing vocabulary (`blocked`, `needs-info`/`needs-you`);
@@ -7820,6 +7940,16 @@ struct DispatchAttempt {
     /// human and machine status/log row so an audit tells a resume apart.
     #[serde(default)]
     resumed: u64,
+    /// Bounded-wait expiry (ticket #94): `true` when the bound expired and
+    /// the worker tree was killed (row reads `{phase}_interrupted`,
+    /// resumable). `#[serde(default)]` keeps older ledgers parsing.
+    #[serde(default)]
+    timed_out: bool,
+    /// The bound value in seconds that expired (ticket #94): named in the
+    /// log and status output. 0 = no expiry. `#[serde(default)]` keeps
+    /// older ledgers parsing.
+    #[serde(default)]
+    timeout_secs: u64,
 }
 
 #[derive(Serialize, serde::Deserialize, Default)]
@@ -7887,6 +8017,19 @@ type SharedLedger = std::sync::Mutex<DispatchLedger>;
 
 fn lock_ledger(shared: &SharedLedger) -> std::sync::MutexGuard<'_, DispatchLedger> {
     shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Mint a ledger row atomically (ticket #92): the row id, the push, and
+/// the row index resolve under ONE held guard, so concurrent wave workers
+/// can neither mint duplicate ids nor compute each other's index.
+/// Both admission paths (spec-gate refusal, fresh attempt) mint here;
+/// callers pass `id: 0` and use the returned authoritative id.
+fn push_attempt_row(shared: &SharedLedger, mut attempt: DispatchAttempt) -> (u64, usize) {
+    let mut ledger = lock_ledger(shared);
+    let id = ledger.attempts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+    attempt.id = id;
+    ledger.attempts.push(attempt);
+    (id, ledger.attempts.len() - 1)
 }
 
 /// One link in a fork's lineage chain, oldest-first (ticket #81,
@@ -8318,6 +8461,48 @@ fn dispatch_max_attempts() -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2)
         .max(1)
+}
+
+/// Bash parity bounds (ticket #94): the bash dispatcher wrapped the
+/// implementer in `timeout $TIMEOUT_IMPL` (1800s) and the reviewer in
+/// `timeout $TIMEOUT_REVIEW` (1200s). The Rust pass bounds the same waits
+/// so a hung agent can never wedge the loop: on expiry the worker process
+/// tree is killed and the row becomes a resumable checkpoint via the
+/// existing interrupt/reaper path (never a stuck lease). Same bounds story
+/// as the concurrency level: env knob, clamped, flag wins when given.
+const DEFAULT_IMPLEMENT_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 1200;
+
+fn parse_timeout_env(name: &str, def: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(def)
+        .max(1)
+}
+
+fn env_implement_timeout_secs() -> u64 {
+    parse_timeout_env("TIMEOUT_IMPL", DEFAULT_IMPLEMENT_TIMEOUT_SECS)
+}
+
+fn env_review_timeout_secs() -> u64 {
+    parse_timeout_env("TIMEOUT_REVIEW", DEFAULT_REVIEW_TIMEOUT_SECS)
+}
+
+/// Effective implement bound: explicit flag wins, else the env knob.
+fn implement_timeout_secs(flag: Option<u64>) -> u64 {
+    flag.unwrap_or_else(env_implement_timeout_secs).max(1)
+}
+
+/// Effective review bound: explicit flag wins, else the env knob.
+fn review_timeout_secs(flag: Option<u64>) -> u64 {
+    flag.unwrap_or_else(env_review_timeout_secs).max(1)
+}
+
+/// One line naming both effective bounds, shared by dry-run and status so
+/// every surface states the same values in the same words.
+fn timeout_bounds_line(impl_secs: u64, review_secs: u64) -> String {
+    format!("timeouts: implement={impl_secs}s review={review_secs}s")
 }
 
 fn now_stamp() -> String {
@@ -8752,6 +8937,20 @@ fn gh_relabel(ticket: u64, remove: Option<&str>, add: &str) {
     }
 }
 
+fn append_log_append(log_path: &std::path::Path, text: &str) {
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
 fn append_log(log_path: &std::path::Path, text: &str) {
     let mut existing = std::fs::read_to_string(log_path).unwrap_or_default();
     existing.push_str(text);
@@ -8768,8 +8967,75 @@ fn log_event(log_path: &std::path::Path, attempt_id: u64, ticket: u64, phase: &s
     );
 }
 
+/// What a bounded phase wait observed (ticket #94): the worker finished
+/// on its own (success or failure), or the bound expired first and the
+/// worker process tree was killed. A timeout is never a failure verdict —
+/// the caller checkpoints it as interrupted (resumable), never *_failed.
+#[derive(Debug, PartialEq)]
+enum PhaseResult {
+    Success(String),
+    Failure(String),
+    TimedOut(String),
+}
+
+/// Pure deadline check so tests pin the bound math with virtual times
+/// (never wall-clock races): `true` once `now` reaches the deadline.
+fn phase_deadline_exceeded(
+    start: std::time::Instant,
+    now: std::time::Instant,
+    timeout: std::time::Duration,
+) -> bool {
+    now.duration_since(start) >= timeout
+}
+
+/// Kill the whole worker process tree, not just the direct child (ticket
+/// #94): the child runs in its own process group (pgid == child pid), so
+/// a negative-pgid kill reaches grandchildren (e.g. a `sleep` the runner
+/// backgrounded) that outliving the shell would otherwise abandon.
+#[cfg(unix)]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pgid = child.id() as i32;
+    // Group kill first (grandchildren), then the child itself as fallback.
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{pgid}")])
+        .status();
+    let _ = child.kill();
+}
+
+/// Non-unix fallback: only the direct child can be signalled.
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
 /// Run one phase (implement / verify / review) with slot + private TMPDIR
-/// isolation, appending all output to the attempt log.
+/// isolation, streaming running output live to the attempt log.
+/// `timeout` bounds the wait for implement/review (None = unbounded,
+/// used by verify): on expiry the worker process tree is killed, the
+/// bound value is named in the log, and `TimedOut` carries the partial
+/// output. Never wedges: every path returns, killed or finished.
+///
+/// Live streaming (ticket #95): the attempt log grows line-buffered as
+/// the worker produces output, so `tail -f` and the future watch pane
+/// show movement during long phases instead of one burst at completion.
+/// A `running` header is appended before spawn (so a killed mid-stream
+/// log is a byte-prefix of the completed shape: header + flushed lines),
+/// each stdout/stderr line is appended verbatim as it arrives under one
+/// shared append-mode lock (slot-owned file: no two phases share a log,
+/// no two writers share a file, lines never interleave mid-line), and
+/// only the exit/timeout footer is appended at the end — the worker
+/// output section is never duplicated. The `PhaseResult` return strings
+/// keep the historical grouped shape (stdout + "\\n" + stderr) so the
+/// verdict reader and timeout callers see identical inputs.
+/// Non-blank output lines arrive in per-stream order and match the old
+/// capture-then-append content; blank-line framing may differ by flush
+/// boundaries (line-buffered splits), which no transcript parser or the
+/// `VERDICT:` reader depends on.
+///
+/// Reuse of the #85 partial-output path: transcript-bearing SSE scopes
+/// (`dispatcher-live`, `ticket`) already re-read these same log files at
+/// `stream_partial_ms()` (500ms default), so live appends surface to
+/// viewers within that bound with no SSE code change.
 #[allow(clippy::too_many_arguments)]
 fn run_phase(
     program: &str,
@@ -8781,35 +9047,168 @@ fn run_phase(
     phase: &str,
     attempt_id: u64,
     ticket: u64,
-) -> (bool, String) {
+    timeout: Option<std::time::Duration>,
+) -> PhaseResult {
+    use std::io::{BufRead, Write};
+    // Live header first: the log visibly grows from phase start, and a
+    // mid-stream kill leaves header + flushed lines as a prefix of the
+    // completed shape (append-only from here: flushed bytes never move).
+    append_log_append(log, &format!("--- {phase} {slot} running ---\n"));
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
         .env("FACTORY_SLOT", slot)
-        .env("TMPDIR", tmpdir);
-    match cmd.output() {
-        Ok(o) => {
-            let code = o.status.code().unwrap_or(1);
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            append_log(
-                log,
-                &format!("--- {phase} {slot} (exit {code}) ---\n{combined}\n"),
-            );
-            log_event(log, attempt_id, ticket, phase, code);
-            (o.status.success(), combined)
-        }
+        .env("TMPDIR", tmpdir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
-            append_log(
+            append_log_append(
                 log,
                 &format!("--- {phase} failed to spawn {program}: {e} ---\n"),
             );
             log_event(log, attempt_id, ticket, phase, 1);
-            (false, String::new())
+            return PhaseResult::Failure(String::new());
         }
+    };
+    // Shared append-mode handle so the two pipe-drain threads serialize
+    // whole-line writes: per-file (slot-owned) and never mid-line mixed.
+    let live: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>> = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()
+        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+    // Drain both pipes on threads so a chatty worker can never block on a
+    // full pipe while the main thread polls the deadline. Each thread
+    // appends complete lines live (line-buffered) and collects its
+    // stream's raw bytes for the grouped return value.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let live_out = live.clone();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.take() {
+            let mut reader = std::io::BufReader::new(p);
+            loop {
+                let mut chunk = Vec::new();
+                match reader.read_until(b'\n', &mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        buf.extend_from_slice(&chunk);
+                        if let Some(live) = live_out.as_ref() {
+                            let text = String::from_utf8_lossy(&chunk).into_owned();
+                            let mut f = live.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = f.write_all(text.as_bytes());
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        buf
+    });
+    let live_err = live.clone();
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.take() {
+            let mut reader = std::io::BufReader::new(p);
+            loop {
+                let mut chunk = Vec::new();
+                match reader.read_until(b'\n', &mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        buf.extend_from_slice(&chunk);
+                        if let Some(live) = live_err.as_ref() {
+                            let text = String::from_utf8_lossy(&chunk).into_owned();
+                            let mut f = live.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = f.write_all(text.as_bytes());
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        buf
+    });
+    // A final partial line without trailing newline still counts as
+    // flushed output: the drain threads forward it at EOF as-is, and the
+    // footers below start on their own line via append_log_append's
+    // leading newline normalization is intentionally absent — footers
+    // are full lines, so a missing trailing newline only glues the
+    // footer marker to the partial line, which no parser depends on.
+    // (In practice workers newline-terminate; tests pin line content.)
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or(1);
+                let out = out_handle.join().unwrap_or_default();
+                let err = err_handle.join().unwrap_or_default();
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err)
+                );
+                // Output already streamed live: footer only, never
+                // duplicated, so the completed log is running-header +
+                // live lines + exit footer + event.
+                append_log_append(log, &format!("--- {phase} {slot} (exit {code}) ---\n"));
+                log_event(log, attempt_id, ticket, phase, code);
+                if status.success() {
+                    return PhaseResult::Success(combined);
+                }
+                return PhaseResult::Failure(combined);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                append_log_append(log, &format!("--- {phase} wait failed: {e} ---\n"));
+                log_event(log, attempt_id, ticket, phase, 1);
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                let out = out_handle.join().unwrap_or_default();
+                let err = err_handle.join().unwrap_or_default();
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err)
+                );
+                return PhaseResult::Failure(combined);
+            }
+        }
+        if let Some(limit) = timeout {
+            if phase_deadline_exceeded(start, std::time::Instant::now(), limit) {
+                let secs = limit.as_secs();
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                let out = out_handle.join().unwrap_or_default();
+                let err = err_handle.join().unwrap_or_default();
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err)
+                );
+                // Partial output already flushed live stays in order;
+                // only the timeout marker is appended (no duplication).
+                append_log_append(
+                    log,
+                    &format!(
+                        "--- {phase} {slot} timed out after {secs}s (phase timeout {secs}s exceeded) — worker process tree killed, resumable ---\n"
+                    ),
+                );
+                log_event(log, attempt_id, ticket, phase, 124);
+                return PhaseResult::TimedOut(combined);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -9263,6 +9662,48 @@ fn interrupt_attempt(
     TicketOutcome::Done
 }
 
+/// Settle a bounded-wait expiry (ticket #94): the worker tree is already
+/// dead (killed by the wait), so the row becomes a resumable checkpoint via
+/// the same path as any interruption — never failed, never a stuck running
+/// lease. The bound value is named in the log line, the ticket comment,
+/// and stdout, and recorded on the row (`timed_out` + `timeout_secs`) so
+/// status output names it in both modes. The next pass resumes from the
+/// checkpoint through the existing reaper/resume path.
+#[allow(clippy::too_many_arguments)]
+fn expire_attempt(
+    state: &std::path::Path,
+    shared: &SharedLedger,
+    idx: usize,
+    log_path: &std::path::Path,
+    worktree: &std::path::Path,
+    ticket: u64,
+    phase: &str,
+    timeout_secs: u64,
+) -> TicketOutcome {
+    let attempt_no = lock_ledger(shared).attempts[idx].attempt_no;
+    let slot = format!("T{ticket}-a{attempt_no}");
+    append_log(
+        log_path,
+        &format!("expired: {phase} timed out after {timeout_secs}s (phase timeout {timeout_secs}s exceeded, worker killed) — resumable\n"),
+    );
+    {
+        let mut ledger = lock_ledger(shared);
+        ledger.attempts[idx].status = format!("{phase}_interrupted");
+        ledger.attempts[idx].finished_at = now_stamp();
+        ledger.attempts[idx].timed_out = true;
+        ledger.attempts[idx].timeout_secs = timeout_secs;
+    }
+    if let Err(e) = save_shared_ledger(state, shared) {
+        eprintln!("dispatch: {e}");
+    }
+    println!("  {phase} timed out after {timeout_secs}s (slot {slot}, worker killed) — resumable next pass");
+    gh_comment(
+        ticket,
+        &format!("DISPATCH: attempt {attempt_no} timed out during {phase} after {timeout_secs}s (phase timeout {timeout_secs}s exceeded, worker killed) — the next pass resumes from the checkpoint."),
+    );
+    remove_worktree(worktree);
+    TicketOutcome::Done
+}
 /// Phase context for one attempt run (ticket #61, spec #59): everything a
 /// pass needs to (re)run phases, whether the attempt is fresh or resumed
 /// from its checkpoint.
@@ -9280,6 +9721,9 @@ struct PhaseCtx {
     tmpdir: PathBuf,
     open_train_branch: String,
     max_attempts: u64,
+    /// Effective bounded-wait values (ticket #94): implement/review secs.
+    implement_timeout_secs: u64,
+    review_timeout_secs: u64,
 }
 
 /// Run attempt phases from `start_phase` onward (ticket #61, spec #59).
@@ -9308,6 +9752,8 @@ fn run_attempt_phases(
     let log_path = ctx.log_path.as_path();
     let wt = ctx.wt.as_path();
     let tmpdir = ctx.tmpdir.as_path();
+    let implement_timeout = std::time::Duration::from_secs(ctx.implement_timeout_secs);
+    let review_timeout = std::time::Duration::from_secs(ctx.review_timeout_secs);
     let from = ATTEMPT_PHASES
         .iter()
         .position(|p| *p == start_phase)
@@ -9338,8 +9784,11 @@ fn run_attempt_phases(
         if simulated_kill_phase("implement") {
             return interrupt_attempt(state, shared, idx, log_path, wt, ticket, "implement");
         }
-        println!("  implement: pi -p (slot {slot})");
-        let (ok, _) = run_phase(
+        println!(
+            "  implement: pi -p (slot {slot}, timeout {}s)",
+            ctx.implement_timeout_secs
+        );
+        let implement_outcome = run_phase(
             &pi_bin(),
             &["-p", &prompt],
             wt,
@@ -9349,13 +9798,29 @@ fn run_attempt_phases(
             "implement",
             id,
             ticket,
+            Some(implement_timeout),
         );
-        if !ok {
-            println!("  implement failed — will retry next pass");
-            gh_comment(ticket, &format!("DISPATCH: implementer failed (attempt {attempt_no}/{max_attempts}). Log kept in dispatcher state."));
-            finish_attempt(state, shared, idx, "impl_failed", 1);
-            remove_worktree(wt);
-            return TicketOutcome::Done;
+        match implement_outcome {
+            PhaseResult::TimedOut(_) => {
+                return expire_attempt(
+                    state,
+                    shared,
+                    idx,
+                    log_path,
+                    wt,
+                    ticket,
+                    "implement",
+                    ctx.implement_timeout_secs,
+                );
+            }
+            PhaseResult::Failure(_) => {
+                println!("  implement failed — will retry next pass");
+                gh_comment(ticket, &format!("DISPATCH: implementer failed (attempt {attempt_no}/{max_attempts}). Log kept in dispatcher state."));
+                finish_attempt(state, shared, idx, "impl_failed", 1);
+                remove_worktree(wt);
+                return TicketOutcome::Done;
+            }
+            PhaseResult::Success(_) => {}
         }
     }
     if from <= 2 {
@@ -9384,7 +9849,9 @@ fn run_attempt_phases(
         if simulated_kill_phase("verify") {
             return interrupt_attempt(state, shared, idx, log_path, wt, ticket, "verify");
         }
-        let (vok, _) = run_phase(
+        // Verify keeps its own contract (check adapter exit code); only
+        // implement/review carry bounded waits (ticket #94).
+        let verify_outcome = run_phase(
             &adapter.to_string_lossy(),
             &[],
             wt,
@@ -9394,8 +9861,9 @@ fn run_attempt_phases(
             "verify",
             id,
             ticket,
+            None,
         );
-        if !vok {
+        if !matches!(verify_outcome, PhaseResult::Success(_)) {
             println!("  checks FAILED — routing back");
             let log_text = std::fs::read_to_string(log_path).unwrap_or_default();
             gh_comment(ticket, &format!("DISPATCH: factory-check failed (attempt {attempt_no}/{max_attempts}). Tail:\n```\n{}\n```", last_lines(&log_text, 30)));
@@ -9527,8 +9995,8 @@ fn run_attempt_phases(
         remove_worktree(&rwt);
         return interrupt_attempt(state, shared, idx, log_path, wt, ticket, "review");
     }
-    println!("  review: pi -p");
-    let (_, rout) = run_phase(
+    println!("  review: pi -p (timeout {}s)", ctx.review_timeout_secs);
+    let review_outcome = run_phase(
         &pi_bin(),
         &["-p", &review_brief],
         &rwt,
@@ -9538,7 +10006,24 @@ fn run_attempt_phases(
         "review",
         id,
         ticket,
+        Some(review_timeout),
     );
+    let rout = match review_outcome {
+        PhaseResult::TimedOut(_) => {
+            remove_worktree(&rwt);
+            return expire_attempt(
+                state,
+                shared,
+                idx,
+                log_path,
+                wt,
+                ticket,
+                "review",
+                ctx.review_timeout_secs,
+            );
+        }
+        PhaseResult::Success(out) | PhaseResult::Failure(out) => out,
+    };
     let _ = std::fs::remove_file(rwt.join(".factory-review-brief.md"));
     let verdict = parse_verdict(&rout);
     if report_path.is_file() {
@@ -9658,6 +10143,19 @@ fn run_attempt_phases(
 /// still wait for the next attempt boundary — only already-delivered
 /// answers are replayed into the resumed brief, so a restart never loses
 /// them and never redelivers anything new.
+#[allow(clippy::too_many_arguments)]
+/// Per-pass admission + bound knobs (ticket #92): the resolved concurrency
+/// level travels with the attempt budget and phase timeouts as one value,
+/// so inner admission gates can never re-resolve a different level —
+/// finding #2 is structural, not conventional.
+#[derive(Clone, Copy)]
+struct PassTuning {
+    max_attempts: u64,
+    max_concurrent: usize,
+    timeout_impl: Option<u64>,
+    timeout_review: Option<u64>,
+}
+
 fn resume_ticket_attempt(
     state: &std::path::Path,
     shared: &SharedLedger,
@@ -9665,7 +10163,12 @@ fn resume_ticket_attempt(
     idx: usize,
     view: &serde_json::Value,
     dry_run: bool,
+    tuning: PassTuning,
 ) -> TicketOutcome {
+    let max_concurrent = tuning.max_concurrent;
+    let timeout_impl = tuning.timeout_impl;
+    let timeout_review = tuning.timeout_review;
+    let max_attempts = tuning.max_attempts;
     let attempt_no = lock_ledger(shared).attempts[idx].attempt_no;
     let phase = attempt_phase(&lock_ledger(shared).attempts[idx]).to_string();
     let slot = format!("T{ticket}-a{attempt_no}");
@@ -9676,7 +10179,7 @@ fn resume_ticket_attempt(
     // temporaries in a condition live for the whole statement, which
     // would self-deadlock the non-reentrant ledger mutex.
     let live_now = dispatch_active(&lock_ledger(shared));
-    if live_now >= dispatch_max_concurrent() {
+    if live_now >= max_concurrent {
         println!("dispatch: #{ticket} resume deferred — slot gate at capacity");
         return TicketOutcome::Skipped("slot gate at capacity".to_string());
     }
@@ -9793,7 +10296,9 @@ fn resume_ticket_attempt(
         wt,
         tmpdir,
         open_train_branch: live_train,
-        max_attempts: dispatch_max_attempts(),
+        max_attempts,
+        implement_timeout_secs: implement_timeout_secs(timeout_impl),
+        review_timeout_secs: review_timeout_secs(timeout_review),
     };
     run_attempt_phases(state, shared, idx, &ctx, &phase, &brief)
 }
@@ -9803,9 +10308,12 @@ fn cmd_dispatch_ticket(
     state: &std::path::Path,
     shared: &SharedLedger,
     ticket: u64,
-    max_attempts: u64,
     dry_run: bool,
+    tuning: PassTuning,
 ) -> TicketOutcome {
+    let max_attempts = tuning.max_attempts;
+    let timeout_impl = tuning.timeout_impl;
+    let timeout_review = tuning.timeout_review;
     let view_text = match dgh(&[
         "issue",
         "view",
@@ -9849,7 +10357,7 @@ fn cmd_dispatch_ticket(
     // inside before anything is admitted.
     let resumable = newest_resumable_index(&lock_ledger(shared), ticket);
     if let Some(r_idx) = resumable {
-        return resume_ticket_attempt(state, shared, ticket, r_idx, &view, dry_run);
+        return resume_ticket_attempt(state, shared, ticket, r_idx, &view, dry_run, tuning);
     }
     let past = lock_ledger(shared)
         .attempts
@@ -9930,7 +10438,10 @@ fn cmd_dispatch_ticket(
     let log_path = state
         .join("logs")
         .join(format!("T{ticket}-a{attempt_no}-impl.log"));
-    let id = lock_ledger(shared)
+    // Cosmetic id for the worktree-add failure log line only (no row is
+    // pushed on that path): the authoritative row id always comes from
+    // `push_attempt_row` below, which mints id+push+index atomically.
+    let log_only_id = lock_ledger(shared)
         .attempts
         .iter()
         .map(|a| a.id)
@@ -9945,23 +10456,28 @@ fn cmd_dispatch_ticket(
         if let Err(e) = dispatch_verify_spec(s) {
             println!("dispatch: #{ticket} spec #{s} freeze mismatch — needs re-freeze");
             append_log(&log_path, &format!("spec gate refused: {e}\n"));
-            lock_ledger(shared).attempts.push(DispatchAttempt {
-                id,
-                ticket,
-                attempt_no,
-                base_commit: String::new(),
-                head_commit: String::new(),
-                branch: String::new(),
-                worktree: String::new(),
-                status: "impl_failed".to_string(),
-                exit_code: 1,
-                log_path: log_path.to_string_lossy().into_owned(),
-                started_at: now_stamp(),
-                finished_at: now_stamp(),
-                train_branch: open_train_branch.clone(),
-                phase: "unknown".to_string(),
-                resumed: 0,
-            });
+            let (id, _) = push_attempt_row(
+                shared,
+                DispatchAttempt {
+                    id: 0,
+                    ticket,
+                    attempt_no,
+                    base_commit: String::new(),
+                    head_commit: String::new(),
+                    branch: String::new(),
+                    worktree: String::new(),
+                    status: "impl_failed".to_string(),
+                    exit_code: 1,
+                    log_path: log_path.to_string_lossy().into_owned(),
+                    started_at: now_stamp(),
+                    finished_at: now_stamp(),
+                    train_branch: open_train_branch.clone(),
+                    phase: "unknown".to_string(),
+                    resumed: 0,
+                    timed_out: false,
+                    timeout_secs: 0,
+                },
+            );
             log_event(&log_path, id, ticket, "spec-gate", 1);
             gh_comment(ticket, &format!("DISPATCH: linked spec #{s} body no longer matches its SPEC-APPROVED hash. Human must re-freeze before this ticket runs."));
             return TicketOutcome::Done;
@@ -10009,14 +10525,14 @@ fn cmd_dispatch_ticket(
         let msg = format!("dispatch: #{ticket} {e}");
         println!("{msg}");
         append_log(&log_path, &format!("{msg}\n"));
-        log_event(&log_path, id, ticket, "worktree-add", 1);
+        log_event(&log_path, log_only_id, ticket, "worktree-add", 1);
         return TicketOutcome::Skipped(format!("worktree: {e}"));
     }
     let wt_s = wt.to_string_lossy().to_string();
-    {
-        let mut ledger = lock_ledger(shared);
-        ledger.attempts.push(DispatchAttempt {
-            id,
+    let (id, idx) = push_attempt_row(
+        shared,
+        DispatchAttempt {
+            id: 0,
             ticket,
             attempt_no,
             base_commit: base.clone(),
@@ -10031,9 +10547,10 @@ fn cmd_dispatch_ticket(
             train_branch: open_train_branch.clone(),
             phase: "plan".to_string(),
             resumed: 0,
-        });
-    }
-    let idx = lock_ledger(shared).attempts.len() - 1;
+            timed_out: false,
+            timeout_secs: 0,
+        },
+    );
     // Plan checkpoint: committed before any side-effecting work begins.
     // On failure the row was never activated on disk (this checkpoint is
     // its first persist — ticket #75), so drop it in memory and release
@@ -10105,6 +10622,8 @@ fn cmd_dispatch_ticket(
         tmpdir,
         open_train_branch: open_train_branch.clone(),
         max_attempts,
+        implement_timeout_secs: implement_timeout_secs(timeout_impl),
+        review_timeout_secs: review_timeout_secs(timeout_review),
     };
     run_attempt_phases(state, shared, idx, &ctx, "implement", &brief)
 }
@@ -10278,6 +10797,8 @@ pub fn cmd_dispatch_once(
     dry_run: bool,
     idempotency_key: Option<&str>,
     concurrency: Option<usize>,
+    timeout_impl: Option<u64>,
+    timeout_review: Option<u64>,
 ) -> i32 {
     let state = dispatch_state_dir();
     for sub in ["logs", "worktrees", "tmp"] {
@@ -10321,6 +10842,24 @@ pub fn cmd_dispatch_once(
         }
     };
     let max_attempts = dispatch_max_attempts();
+    // One bundle for the whole pass (ticket #92): every admission gate
+    // and phase bound reads these values, never a re-resolved copy.
+    let tuning = PassTuning {
+        max_attempts,
+        max_concurrent,
+        timeout_impl,
+        timeout_review,
+    };
+    // Effective bounded-wait values (ticket #94): flags win over env.
+    // Dry-run announces them; every pass states them the same way.
+    let impl_secs = implement_timeout_secs(timeout_impl);
+    let review_secs = review_timeout_secs(timeout_review);
+    if dry_run {
+        println!(
+            "dry-run: {} (no writes)",
+            timeout_bounds_line(impl_secs, review_secs)
+        );
+    }
     if dispatch_active(&ledger) >= max_concurrent {
         println!(
             "dispatch: {} active, at capacity — exiting",
@@ -10444,7 +10983,7 @@ pub fn cmd_dispatch_once(
             if ticket == 0 {
                 continue;
             }
-            match cmd_dispatch_ticket(&state, &shared, ticket, max_attempts, true) {
+            match cmd_dispatch_ticket(&state, &shared, ticket, true, tuning) {
                 TicketOutcome::DryRunAdmit { resume } => {
                     decisions.push((ticket, PlanDecision::Admit { resume }));
                 }
@@ -10478,7 +11017,7 @@ pub fn cmd_dispatch_once(
             if ticket == 0 {
                 continue;
             }
-            match cmd_dispatch_ticket(&state, &shared, ticket, max_attempts, false) {
+            match cmd_dispatch_ticket(&state, &shared, ticket, false, tuning) {
                 TicketOutcome::Done => {
                     attempted += 1;
                     if let Err(e) = save_shared_ledger(&state, &shared) {
@@ -10496,6 +11035,10 @@ pub fn cmd_dispatch_once(
         // next pass's reaper converts its row into a resumable
         // checkpoint. STOP between waves halts admission; the joined
         // wave already finished its phases.
+        // Wave admission respects live rows, not just the survey list
+        // (finding #4): already-active tickets never consume a wave slot,
+        // and every wave re-checks capacity first — a concurrent pass
+        // sharing the slots can no longer push a wave past max_concurrent.
         let tickets: Vec<u64> = list
             .iter()
             .map(|item| {
@@ -10505,8 +11048,13 @@ pub fn cmd_dispatch_once(
                     .unwrap_or(0)
             })
             .filter(|t| *t != 0)
+            .filter(|t| {
+                !lock_ledger(&shared).attempts.iter().any(|a| {
+                    a.ticket == *t && (a.status == "impl_running" || a.status == "review_running")
+                })
+            })
             .collect();
-        let waves = tickets.len().div_ceil(max_concurrent);
+        let waves = tickets.len().div_ceil(max_concurrent.max(1));
         let mut rest = tickets.as_slice();
         let mut wave = 0usize;
         while !rest.is_empty() {
@@ -10514,7 +11062,14 @@ pub fn cmd_dispatch_once(
                 println!("{STOP_HALT_LINE}");
                 break;
             }
-            let n = max_concurrent.min(rest.len());
+            // Re-check capacity at every wave start: live rows from a
+            // concurrent pass (or a wave that admitted resumes) count.
+            let live = dispatch_active(&lock_ledger(&shared));
+            if live >= max_concurrent {
+                println!("dispatch: capacity reached");
+                break;
+            }
+            let n = (max_concurrent - live).min(rest.len());
             let (now, later) = rest.split_at(n);
             if waves > 1 {
                 let waiting = if later.is_empty() {
@@ -10533,9 +11088,8 @@ pub fn cmd_dispatch_once(
             std::thread::scope(|s| {
                 let mut handles = Vec::new();
                 for t in now {
-                    handles.push(
-                        s.spawn(|| cmd_dispatch_ticket(&state, &shared, *t, max_attempts, false)),
-                    );
+                    handles
+                        .push(s.spawn(|| cmd_dispatch_ticket(&state, &shared, *t, false, tuning)));
                 }
                 for (ticket, handle) in now.iter().zip(handles) {
                     match handle.join() {
@@ -10616,20 +11170,39 @@ pub fn cmd_dispatch_once(
     0
 }
 
-pub fn cmd_dispatch_daemon(json: bool, interval: u64, concurrency: Option<usize>) -> i32 {
+pub fn cmd_dispatch_daemon(
+    json: bool,
+    interval: u64,
+    concurrency: Option<usize>,
+    timeout_impl: Option<u64>,
+    timeout_review: Option<u64>,
+) -> i32 {
     let state = dispatch_state_dir();
     println!("dispatch daemon every {interval}s (STOP with: factory dispatch stop)");
     if json {
         println!(r#"{{"daemon":true,"interval":{interval}}}"#);
     }
+    // The startup --concurrency flag is consumed once (see below).
+    let mut first_pass = true;
     loop {
         // Each pass is exactly `dispatch once`: same ledger, same logs,
-        // same worker slots (re-resolved every pass, so a UI or flag
-        // change applies without restarting the daemon). The lock is
+        // same worker slots (re-resolved every pass, so a UI change
+        // applies without restarting the daemon). The startup --concurrency
+        // flag sets the initial level only (persisted on the first pass so
+        // the UI agrees); it never shadows later UI writes. The lock is
         // per-pass (acquired and released inside `cmd_dispatch_once`), so
         // concurrent `once` processes share slots with the daemon exactly
         // as they do today.
-        let code = cmd_dispatch_once(json, false, None, concurrency);
+        if first_pass {
+            if let Some(n) = concurrency {
+                if let Err(e) = set_concurrency_level(&state, &n.to_string()) {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            }
+            first_pass = false;
+        }
+        let code = cmd_dispatch_once(json, false, None, None, timeout_impl, timeout_review);
         if code != 0 {
             // Transient failure: report and retry next interval instead of
             // killing autonomous operation (bash `set -e` would abort here;
@@ -10822,11 +11395,11 @@ pub fn cmd_status(json: bool) -> i32 {
             match a.status.as_str() {
                 "impl_running" => println!(
                     "Ticket {} attempt {} is being implemented (slot {}, started {}).{}",
-                    a.ticket, a.attempt_no, slot, a.started_at, suffix
+                    a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
                 ),
                 "review_running" => println!(
                     "Ticket {} attempt {} is being reviewed (slot {}, started {}).{}",
-                    a.ticket, a.attempt_no, slot, a.started_at, suffix
+                    a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
                 ),
                 s if is_interrupted_status(s) => println!(
                     "Ticket {} attempt {} interrupted during {} (slot {}, started {}, resumable).{}",
@@ -10834,19 +11407,19 @@ pub fn cmd_status(json: bool) -> i32 {
                     a.attempt_no,
                     attempt_phase(a),
                     slot,
-                    a.started_at,
+                    format_stamp_human(&a.started_at),
                     suffix
                 ),
                 other => {
                     if a.finished_at.is_empty() {
                         println!(
                             "Ticket {} attempt {} finished: {other} (slot {}, started {}).{}",
-                            a.ticket, a.attempt_no, slot, a.started_at, suffix
+                            a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), suffix
                         );
                     } else {
                         println!(
                             "Ticket {} attempt {} finished: {other} (slot {}, started {}, finished {}).{}",
-                            a.ticket, a.attempt_no, slot, a.started_at, a.finished_at, suffix
+                            a.ticket, a.attempt_no, slot, format_stamp_human(&a.started_at), format_stamp_human(&a.finished_at), suffix
                         );
                     }
                 }
@@ -10887,12 +11460,19 @@ pub fn cmd_status(json: bool) -> i32 {
             if a.finished_at.is_empty() {
                 println!(
                     "  T{}-a{} {} (started {}).",
-                    a.ticket, a.attempt_no, a.status, a.started_at
+                    a.ticket,
+                    a.attempt_no,
+                    a.status,
+                    format_stamp_human(&a.started_at)
                 );
             } else {
                 println!(
                     "  T{}-a{} {} (started {}, finished {}).",
-                    a.ticket, a.attempt_no, a.status, a.started_at, a.finished_at
+                    a.ticket,
+                    a.attempt_no,
+                    a.status,
+                    format_stamp_human(&a.started_at),
+                    format_stamp_human(&a.finished_at)
                 );
             }
         }
@@ -10923,11 +11503,17 @@ fn log_summary(a: &DispatchAttempt) -> String {
     let base = match a.status.as_str() {
         "impl_running" => format!(
             "Ticket {} attempt {} is being implemented (slot {}, started {}).",
-            a.ticket, a.attempt_no, slot, a.started_at
+            a.ticket,
+            a.attempt_no,
+            slot,
+            format_stamp_human(&a.started_at)
         ),
         "review_running" => format!(
             "Ticket {} attempt {} is being reviewed (slot {}, started {}).",
-            a.ticket, a.attempt_no, slot, a.started_at
+            a.ticket,
+            a.attempt_no,
+            slot,
+            format_stamp_human(&a.started_at)
         ),
         "impl_done" => format!(
             "Ticket {} attempt {} finished implement, awaiting review (slot {}).",
@@ -10995,6 +11581,484 @@ fn log_tail(text: &str, tail: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     (lines[lines.len() - tail..].join("\n") + "\n", true)
+}
+
+// ---------------------------------------------------------------------------
+// TRANSCRIPT (ticket #93): normalized agent conversation
+//
+// The attempt log shows tool output (what happened); the agent session
+// file shows the conversation (what was said and decided): the user brief,
+// assistant turns, thinking, tool calls, results. This section reduces one
+// session file to typed items — one reducer every surface renders — so the
+// CLI and the UI never parse jsonl twice. Unknown entry types are skipped
+// by design (a live file may hold flush markers, not conversation); corrupt
+// lines yield partial items plus a named gap, never an error. Reads are
+// file reads only: rendering never touches a live run, and a missing
+// session reads calmly (an attempt may predate its session).
+// ---------------------------------------------------------------------------
+
+/// Default transcript items shown (`--tail 0` means full). Items are
+/// denser than log lines, so this is smaller than LOG_DEFAULT_TAIL.
+pub const TRANSCRIPT_DEFAULT_TAIL: usize = 20;
+/// Per-item text cap: full turns survive, runaway tool output does not.
+const TRANSCRIPT_ITEM_CAP: usize = 4000;
+/// Override for the agent sessions root in tests
+/// (`$HOME/.pi/agent/sessions` in production).
+const PI_SESSIONS_DIR_ENV: &str = "FACTORY_PI_SESSIONS_DIR";
+
+/// One normalized transcript row: the user brief, assistant prose, thinking,
+/// one tool call (name + key arguments), or one tool result. `name` carries
+/// the tool name for calls/results, else empty.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct TranscriptItem {
+    pub kind: String,
+    #[serde(default)]
+    pub name: String,
+    pub text: String,
+}
+
+/// Char-boundary-safe clip with an ellipsis marker when cut.
+fn transcript_clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(n).collect();
+    format!("{cut}[\u{2026}]")
+}
+
+fn transcript_text_block(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|b| match b {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(m) => {
+                    m.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Reduce one session file to items plus the count of skipped lines
+/// (blank lines are ignored, unparsable ones are counted — a live file may
+/// be mid-flush). Never fails: corrupt input yields partial items, never
+/// an error. THE shared normalization: both the CLI renderer and the UI
+/// pane below consume these items, so no surface parses jsonl twice.
+pub fn session_transcript_items(text: &str) -> (Vec<TranscriptItem>, usize) {
+    let mut items = Vec::new();
+    let mut skipped = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        if entry.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let message = entry.get("message");
+        let role = message
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        match role {
+            "user" => {
+                let text = message
+                    .map(|m| transcript_text_block(&m["content"]))
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    items.push(TranscriptItem {
+                        kind: "user".to_string(),
+                        name: String::new(),
+                        text: transcript_clip(&text, TRANSCRIPT_ITEM_CAP),
+                    });
+                }
+            }
+            "assistant" => {
+                let empty = Vec::new();
+                let blocks = message
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .unwrap_or(&empty);
+                for block in blocks {
+                    let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match btype {
+                        "thinking" => {
+                            let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                            if !text.trim().is_empty() {
+                                items.push(TranscriptItem {
+                                    kind: "thinking".to_string(),
+                                    name: String::new(),
+                                    text: transcript_clip(text.trim(), 300),
+                                });
+                            }
+                        }
+                        "text" => {
+                            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            if !text.trim().is_empty() {
+                                items.push(TranscriptItem {
+                                    kind: "assistant".to_string(),
+                                    name: String::new(),
+                                    text: transcript_clip(text.trim(), TRANSCRIPT_ITEM_CAP),
+                                });
+                            }
+                        }
+                        "toolCall" => {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let args = block
+                                .get("arguments")
+                                .map(|a| {
+                                    serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string())
+                                })
+                                .unwrap_or_else(|| "{}".to_string());
+                            items.push(TranscriptItem {
+                                kind: "tool_call".to_string(),
+                                name: name.to_string(),
+                                text: transcript_clip(&args, 200),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "toolResult" => {
+                let name = message
+                    .and_then(|m| m.get("toolName"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let empty = Vec::new();
+                let content = message
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .unwrap_or(&empty);
+                let text: Vec<String> = content
+                    .iter()
+                    .filter_map(|b| {
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .filter(|t| !t.trim().is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                if !text.is_empty() {
+                    items.push(TranscriptItem {
+                        kind: "tool_result".to_string(),
+                        name: name.to_string(),
+                        text: transcript_clip(&text.join("\n"), 600),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (items, skipped)
+}
+
+/// Agent sessions root: override-first for tests, home-based in
+/// production. Missing/unset home reads as no sessions (calm).
+fn pi_sessions_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(PI_SESSIONS_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return PathBuf::from(".pi/agent/sessions");
+    }
+    PathBuf::from(home).join(".pi/agent/sessions")
+}
+
+/// Latest session file whose recorded cwd matches the attempt worktree:
+/// session dirs are keyed by worktree path, but the key encoding is the
+/// agent's business, so match on the recorded `cwd` of each dir's newest
+/// file instead of reconstructing the key. Read-only; `None` when
+/// nothing matches (attempt predates its session, or none was kept).
+pub fn resolve_attempt_session(state: &std::path::Path, worktree: &str) -> Option<PathBuf> {
+    let root = pi_sessions_dir();
+    let dirs = std::fs::read_dir(&root).ok()?;
+    let mut best: Option<(String, PathBuf)> = None;
+    for dir in dirs.flatten() {
+        if !dir.path().is_dir() {
+            continue;
+        }
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if files.is_empty() {
+            continue;
+        }
+        files.sort();
+        let file = files.last().cloned()?;
+        let head = std::fs::read_to_string(&file).ok()?;
+        let first = head.lines().find(|l| !l.trim().is_empty())?;
+        let entry: serde_json::Value = serde_json::from_str(first).ok()?;
+        let cwd = entry.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+        let matches = cwd == worktree
+            || Path::new(&cwd) == state.join(worktree)
+            || cwd == state.join(worktree).to_string_lossy();
+        if !matches {
+            continue;
+        }
+        let key = file.file_name()?.to_string_lossy().into_owned();
+        if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+            best = Some((key, file));
+        }
+    }
+    best.map(|(_, file)| file)
+}
+
+/// Human transcript: one readable block per item, oldest first.
+/// `total` is the full item count so a bounded view states its window
+/// honestly instead of understating it.
+fn render_transcript_human(
+    ticket: u64,
+    attempt_no: u64,
+    slot: &str,
+    items: &[TranscriptItem],
+    total: usize,
+) -> String {
+    let mut out = format!(
+        "Transcript for ticket {ticket} attempt {attempt_no} (slot {slot}, {total} turns):\n",
+    );
+    for item in items {
+        match item.kind.as_str() {
+            "user" => out.push_str(&format!("\n[user]\n{}\n", item.text)),
+            "assistant" => out.push_str(&format!("\n[agent]\n{}\n", item.text)),
+            "thinking" => out.push_str(&format!("\n[thinking]\n{}\n", item.text)),
+            "tool_call" => out.push_str(&format!("\n[tool {}({})]\n", item.name, item.text)),
+            "tool_result" => out.push_str(&format!("\n[result {}]\n{}\n", item.name, item.text)),
+            _ => out.push_str(&format!("\n[{}]\n{}\n", item.kind, item.text)),
+        }
+    }
+    out
+}
+
+/// `--transcript` read path for `log`: latest attempt's session file
+/// reduced to items, bounded to the newest `tail` items (`0` = full).
+/// An observer like every log path: missing sessions and partial files
+/// read calmly with exit 0, never an error shape.
+fn cmd_log_transcript(ticket: u64, attempt: &DispatchAttempt, tail: usize, json: bool) -> i32 {
+    let state = dispatch_state_dir();
+    let slot = format!("T{ticket}-a{}", attempt.attempt_no);
+    let Some(file) = resolve_attempt_session(&state, &attempt.worktree) else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"ticket": ticket, "attempt": attempt.attempt_no, "slot": slot, "session": null, "items": []})
+            );
+        } else {
+            println!(
+                "Ticket {ticket} attempt {} has no recorded session yet.",
+                attempt.attempt_no
+            );
+        }
+        return 0;
+    };
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let (items, skipped) = session_transcript_items(&text);
+    let total = items.len();
+    let (shown, truncated) = if tail == 0 || items.len() <= tail {
+        (items, false)
+    } else {
+        (items[items.len() - tail..].to_vec(), true)
+    };
+    if json {
+        let mut doc = serde_json::json!({
+            "ticket": ticket,
+            "attempt": attempt.attempt_no,
+            "slot": slot,
+            "session": file.display().to_string(),
+            "items": shown,
+            "truncated": truncated,
+        });
+        if skipped > 0 {
+            doc["partial"] = serde_json::json!(format!(
+                "session file partially unreadable ({skipped} lines skipped)"
+            ));
+        }
+        println!("{doc}");
+        return 0;
+    }
+    print!(
+        "{}",
+        render_transcript_human(ticket, attempt.attempt_no, &slot, &shown, total)
+    );
+    if truncated {
+        println!("\n(showing newest {tail} of {total} items; --tail 0 for full)");
+    }
+    if skipped > 0 {
+        println!("(session file partially unreadable: {skipped} lines skipped)");
+    }
+    0
+}
+
+/// One ticket's agent-conversation pane as the UI sees it: the latest
+/// attempt's normalized items (the same items `factory log --transcript`
+/// renders, through the same `session_transcript_items` reducer), bounded
+/// to the newest TRANSCRIPT_DEFAULT_TAIL items. `session` is `None` when
+/// no session file was recorded yet — a calm empty pane, never an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketTranscriptPane {
+    pub ticket: u64,
+    pub attempt_no: u64,
+    pub slot: String,
+    pub session: Option<String>,
+    pub items: Vec<TranscriptItem>,
+    pub total: usize,
+    pub truncated: bool,
+    pub partial: usize,
+}
+
+/// Read-only pane assembly: latest attempt (same newest-first order as
+/// `cmd_log`), session file resolved worktree-keyed, items reduced once.
+/// Missing/unreadable ledger reads as no pane (`None`); a missing session
+/// reads as a pane with `session: None`. File reads only — rendering
+/// never disturbs a live run.
+pub fn ticket_transcript_pane(ticket: u64) -> Option<TicketTranscriptPane> {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let mut entries: Vec<&DispatchAttempt> = ledger
+        .attempts
+        .iter()
+        .filter(|a| a.ticket == ticket)
+        .collect();
+    entries.sort_by(|a, b| b.attempt_no.cmp(&a.attempt_no).then(b.id.cmp(&a.id)));
+    let latest = entries.first()?;
+    let slot = format!("T{ticket}-a{}", latest.attempt_no);
+    let Some(file) = resolve_attempt_session(&state, &latest.worktree) else {
+        return Some(TicketTranscriptPane {
+            ticket,
+            attempt_no: latest.attempt_no,
+            slot,
+            session: None,
+            items: Vec::new(),
+            total: 0,
+            truncated: false,
+            partial: 0,
+        });
+    };
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let (items, skipped) = session_transcript_items(&text);
+    let total = items.len();
+    let (shown, truncated) = if items.len() <= TRANSCRIPT_DEFAULT_TAIL {
+        (items, false)
+    } else {
+        (
+            items[items.len() - TRANSCRIPT_DEFAULT_TAIL..].to_vec(),
+            true,
+        )
+    };
+    Some(TicketTranscriptPane {
+        ticket,
+        attempt_no: latest.attempt_no,
+        slot,
+        session: Some(file.display().to_string()),
+        items: shown,
+        total,
+        truncated,
+        partial: skipped,
+    })
+}
+
+/// Calm sentence when the attempt has no recorded session yet (UI twin of
+/// the CLI's missing-session line: ready, not broken).
+pub fn transcript_no_session_sentence(ticket: u64, attempt_no: u64, slot: &str) -> String {
+    format!("Ticket {ticket} attempt {attempt_no} (slot {slot}) has no recorded session yet.")
+}
+
+/// Pane HTML for one transcript (the polling unit rides inside the ticket
+/// fragment, so it refreshes with the other fragments). Pure over the pane
+/// so tests assert markers without a server: `data-transcript-pane` with
+/// per-item `data-transcript-item` carrying the item kind, tool names in
+/// `data-tool-name`, item text in `data-transcript-text`, plus
+/// `data-transcript-gap` when corrupt lines were skipped and
+/// `data-transcript-truncated` naming the bound.
+pub fn ticket_transcript_pane_html(pane: &TicketTranscriptPane) -> String {
+    let mut html = String::new();
+    html.push_str(&format!(
+        "<section data-transcript-pane data-slot=\"{}\"><h2>Agent conversation (slot {})</h2>",
+        escape_html(&pane.slot),
+        escape_html(&pane.slot),
+    ));
+    let Some(session) = pane.session.as_deref() else {
+        html.push_str(&format!(
+            "<p data-no-transcript-session>{}</p>",
+            escape_html(&transcript_no_session_sentence(
+                pane.ticket,
+                pane.attempt_no,
+                &pane.slot
+            )),
+        ));
+        html.push_str("</section>");
+        return html;
+    };
+    html.push_str(&format!(
+        "<p data-transcript-source>Recorded session: <code>{}</code>. Matches <code>factory log {} --transcript</code>.</p>",
+        escape_html(session),
+        pane.ticket,
+    ));
+    if pane.items.is_empty() {
+        html.push_str("<p data-transcript-empty>(no conversation recorded yet)</p>");
+    } else {
+        html.push_str("<div data-transcript-items>");
+        for item in &pane.items {
+            let kind_label = match item.kind.as_str() {
+                "user" => "user",
+                "assistant" => "agent",
+                "thinking" => "thinking",
+                "tool_call" => "tool call",
+                "tool_result" => "result",
+                other => other,
+            };
+            html.push_str(&format!(
+                "<article data-transcript-item=\"{}\"><p data-transcript-kind>{}</p>",
+                escape_html(&item.kind),
+                kind_label,
+            ));
+            if (item.kind == "tool_call" || item.kind == "tool_result") && !item.name.is_empty() {
+                html.push_str(&format!(
+                    "<p data-tool-name>{}</p>",
+                    escape_html(&item.name),
+                ));
+            }
+            html.push_str(&format!(
+                "<p data-transcript-text>{}</p></article>",
+                escape_html(&item.text),
+            ));
+        }
+        html.push_str("</div>");
+    }
+    if pane.truncated {
+        html.push_str(&format!(
+            "<p data-transcript-truncated>Showing the newest {} of {} items \u{2014} older items are hidden. Full conversation: <code>factory log {} --transcript --tail 0</code>.</p>",
+            pane.items.len(),
+            pane.total,
+            pane.ticket,
+        ));
+    }
+    if pane.partial > 0 {
+        html.push_str(&format!(
+            "<p data-transcript-gap>Session file partially unreadable: {} lines skipped \u{2014} showing the items that parsed.</p>",
+            pane.partial,
+        ));
+    }
+    html.push_str("</section>");
+    html
 }
 
 // ---------------------------------------------------------------------------
@@ -11347,7 +12411,11 @@ fn resume_fork_line(
     }
     // Slot gate: a resume is admitted exactly like fresh work — never
     // past capacity. Shared with attempts: the gate applies across all
-    // lines of a ticket.
+    // lines of a ticket. Standalone command (no pass), so the level is
+    // resolved fresh here (env/file/default): there is no pass-resolved
+    // flag to thread (contrast resume_ticket_attempt, which takes the
+    // pass's level). A `fork --resume --concurrency` flag is out of
+    // contract.
     if dispatch_active(ledger) >= dispatch_max_concurrent() {
         eprintln!("fork: '{name}' resume deferred — slot gate at capacity");
         return 1;
@@ -11804,7 +12872,13 @@ pub fn cmd_fork(
     0
 }
 
-pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool) -> i32 {
+pub fn cmd_log(
+    ticket_raw: &str,
+    tail: usize,
+    fork_sel: Option<&str>,
+    transcript: bool,
+    json: bool,
+) -> i32 {
     let ticket = match parse_issue_number(ticket_raw) {
         Ok(n) => n,
         Err(e) => {
@@ -11820,6 +12894,39 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
             return 1;
         }
     };
+    // Transcript read path: the latest attempt's conversation, not the log.
+    // --fork selects a different history view, so the combination is refused
+    // plainly rather than guessed at.
+    if transcript {
+        if fork_sel.is_some() {
+            eprintln!("log: --transcript with --fork is not supported yet");
+            return 1;
+        }
+        let mut latest: Vec<&DispatchAttempt> = ledger
+            .attempts
+            .iter()
+            .filter(|a| a.ticket == ticket)
+            .collect();
+        latest.sort_by(|a, b| b.attempt_no.cmp(&a.attempt_no).then(b.id.cmp(&a.id)));
+        match latest.first() {
+            None => {
+                if json {
+                    println!("{}", serde_json::json!({"ticket": ticket, "attempts": []}));
+                } else {
+                    println!("Ticket {ticket}: no attempts yet.");
+                }
+                return 0;
+            }
+            Some(a) => {
+                let tail_items = if tail == LOG_DEFAULT_TAIL {
+                    TRANSCRIPT_DEFAULT_TAIL
+                } else {
+                    tail
+                };
+                return cmd_log_transcript(ticket, a, tail_items, json);
+            }
+        }
+    }
     // Fork read path: addressable by name or number in daily commands.
     if let Some(sel) = fork_sel {
         let Some(f) = resolve_fork(&ledger, ticket, sel) else {
@@ -11945,9 +13052,13 @@ pub fn cmd_log(ticket_raw: &str, tail: usize, fork_sel: Option<&str>, json: bool
         let finished = row.get("finished").and_then(|v| v.as_str()).unwrap_or("");
         let transcript = row.get("transcript").and_then(|v| v.as_str()).unwrap_or("");
         let span = if finished.is_empty() {
-            format!("started {started}")
+            format!("started {}", format_stamp_human(started))
         } else {
-            format!("started {started}, finished {finished}")
+            format!(
+                "started {}, finished {}",
+                format_stamp_human(started),
+                format_stamp_human(finished)
+            )
         };
         let head_words = if head.is_empty() {
             "head (none yet)".to_string()
@@ -14038,7 +15149,7 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
             .collect();
         println!(
             "{}",
-            serde_json::json!({"attempts": attempts, "decision_memos": memos, "owned_tasks": ledger.owned_tasks, "abort_log": ledger.abort_log, "worktrees": wt_lines, "stopped": stopped, "spend": spend_rows(&ledger).iter().map(spend_json).collect::<Vec<_>>()})
+            serde_json::json!({"attempts": attempts, "decision_memos": memos, "owned_tasks": ledger.owned_tasks, "abort_log": ledger.abort_log, "worktrees": wt_lines, "stopped": stopped, "timeouts": {"implement": implement_timeout_secs(None), "review": review_timeout_secs(None)}, "spend": spend_rows(&ledger).iter().map(spend_json).collect::<Vec<_>>()})
         );
     } else {
         // Human contract (ticket #90): an aligned-column table over live
@@ -14046,6 +15157,12 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
         // into the full history), then a totals line carrying the loop
         // state. Internal ledger ids stay in `--json`; humans read slots.
         println!("== dispatch attempts ==");
+        // Bounded waits (ticket #94): the effective bounds ride every
+        // human status so an expiry's value is named where operators look.
+        println!(
+            "{}",
+            timeout_bounds_line(implement_timeout_secs(None), review_timeout_secs(None))
+        );
         if ledger.attempts.is_empty() {
             println!("(none)");
         } else {
@@ -14090,7 +15207,7 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
                         a.status.clone(),
                         attempt_phase(a).to_string(),
                         format!("T{}-a{}", a.ticket, a.attempt_no),
-                        a.started_at.clone(),
+                        format_stamp_human(&a.started_at),
                     ]
                 })
                 .collect();
@@ -14111,6 +15228,11 @@ pub fn cmd_dispatch_status(json: bool, all: bool) -> i32 {
                 let mut extras = String::new();
                 if is_resumable(a) {
                     extras.push_str(" resumable");
+                }
+                // Bounded-wait expiry (ticket #94): name the bound value
+                // on the row so the expiry reads in status, both modes.
+                if a.timed_out {
+                    extras.push_str(&format!(" expired (timeout {}s)", a.timeout_secs));
                 }
                 if a.resumed > 0 {
                     extras.push_str(&format!(" resumed={}", a.resumed));
@@ -14368,6 +15490,8 @@ fn cutover_attempt(row: &sqlite::Row) -> Result<DispatchAttempt, String> {
         train_branch: row.maybe_text("train_branch")?,
         phase: String::new(),
         resumed: 0,
+        timed_out: false,
+        timeout_secs: 0,
     })
 }
 
@@ -16176,7 +17300,12 @@ pub fn run() -> i32 {
             0
         }
         Commands::Status => cmd_status(cli.json),
-        Commands::Log { ticket, tail, fork } => cmd_log(&ticket, tail, fork.as_deref(), cli.json),
+        Commands::Log {
+            ticket,
+            tail,
+            fork,
+            transcript,
+        } => cmd_log(&ticket, tail, fork.as_deref(), transcript, cli.json),
         Commands::Facts { action } => match action {
             FactsAction::Show { path, at } => cmd_facts_show(cli.json, path.as_deref(), at),
             FactsAction::History { path, limit } => cmd_facts_history(cli.json, &path, limit),
@@ -16280,11 +17409,28 @@ pub fn run() -> i32 {
                 dry_run,
                 idempotency_key,
                 concurrency,
-            } => cmd_dispatch_once(cli.json, dry_run, idempotency_key.as_deref(), concurrency),
+                timeout_impl,
+                timeout_review,
+            } => cmd_dispatch_once(
+                cli.json,
+                dry_run,
+                idempotency_key.as_deref(),
+                concurrency,
+                timeout_impl,
+                timeout_review,
+            ),
             DispatchAction::Daemon {
                 interval,
                 concurrency,
-            } => cmd_dispatch_daemon(cli.json, interval, concurrency),
+                timeout_impl,
+                timeout_review,
+            } => cmd_dispatch_daemon(
+                cli.json,
+                interval,
+                concurrency,
+                timeout_impl,
+                timeout_review,
+            ),
             DispatchAction::Status { all } => cmd_dispatch_status(cli.json, all),
             DispatchAction::Graph { ticket } => cmd_dispatch_graph(cli.json, ticket.as_deref()),
             DispatchAction::Wait {
@@ -17933,5 +19079,89 @@ mod worker_pool_tests {
         let pending = spend_human_line(&rows[1]);
         assert!(pending.contains("minutes pending"), "{pending}");
         assert!(!pending.contains("0.00"), "never zero-filled: {pending}");
+    }
+
+    /// Finding #6: the pool level rides the commit feed, so a UI write
+    /// that changes it is as audible as a STOP or a new attempt.
+    fn commit_data(level: usize) -> super::DispatcherData {
+        super::DispatcherData {
+            attempts: vec![],
+            stopped: false,
+            worktrees: vec![],
+            max_concurrent: level,
+            concurrency_source: "test".to_string(),
+            tasks: vec![],
+        }
+    }
+
+    #[test]
+    fn commit_state_carries_the_pool_level() {
+        let state = super::dispatcher_commit_state(&commit_data(3));
+        assert_eq!(
+            state.get("max_concurrent").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn commit_summary_announces_level_changes_only() {
+        let before = super::dispatcher_commit_state(&commit_data(1));
+        let after = super::dispatcher_commit_state(&commit_data(3));
+        let lines = super::summarize_dispatcher_change(&before, &after);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("worker slots") && l.contains('1') && l.contains('3')),
+            "level change audible, got: {lines:?}"
+        );
+        let same = super::summarize_dispatcher_change(&before, &before);
+        assert!(
+            same.iter().all(|l| !l.contains("worker slots")),
+            "steady level stays silent, got: {same:?}"
+        );
+    }
+}
+
+// --- bounded waits, TDD green (ticket #94) --------------------------------
+// The bound math is pure over virtual instants: no sleeping, no wall-clock
+// races. The integration tests in `tests/cli_phase_timeouts.rs` pin the
+// kill/checkpoint/resume/naming behavior against a sleeping fake runner.
+#[cfg(test)]
+mod phase_timeout_tests {
+    use super::phase_deadline_exceeded;
+
+    fn bound(secs: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn start_is_never_expired() {
+        let t0 = std::time::Instant::now();
+        assert!(!phase_deadline_exceeded(t0, t0, bound(1800)));
+    }
+
+    #[test]
+    fn just_before_the_bound_is_not_expired() {
+        let t0 = std::time::Instant::now();
+        assert!(!phase_deadline_exceeded(t0, t0 + bound(1799), bound(1800)));
+    }
+
+    #[test]
+    fn exactly_at_the_bound_is_expired() {
+        let t0 = std::time::Instant::now();
+        assert!(phase_deadline_exceeded(t0, t0 + bound(1800), bound(1800)));
+    }
+
+    #[test]
+    fn past_the_bound_is_expired() {
+        let t0 = std::time::Instant::now();
+        assert!(phase_deadline_exceeded(t0, t0 + bound(1801), bound(1800)));
+    }
+
+    #[test]
+    fn tiny_test_bounds_expire_on_the_same_rule() {
+        let t0 = std::time::Instant::now();
+        assert!(!phase_deadline_exceeded(t0, t0, bound(1)));
+        assert!(phase_deadline_exceeded(t0, t0 + bound(1), bound(1)));
     }
 }

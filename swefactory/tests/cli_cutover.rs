@@ -98,7 +98,7 @@ fn import_maps_fixture_rows_and_archives_untouched() {
             "started_at": "2026-09-01 10:00:00",
             "finished_at": "2026-09-01 10:07:31",
             "train_branch": "integration/20260901-train",
-            "phase": "", "resumed": 0,
+            "phase": "", "resumed": 0, "timed_out": false, "timeout_secs": 0,
         })
     );
     assert_eq!(
@@ -115,7 +115,7 @@ fn import_maps_fixture_rows_and_archives_untouched() {
             "started_at": "2026-09-02 11:00:00",
             "finished_at": "2026-09-02 11:09:02",
             "train_branch": "",
-            "phase": "", "resumed": 0,
+            "phase": "", "resumed": 0, "timed_out": false, "timeout_secs": 0,
         })
     );
     // Sparse bash rows (NULL commits, NULL exit, NULL train) read as the
@@ -134,7 +134,7 @@ fn import_maps_fixture_rows_and_archives_untouched() {
             "started_at": "2026-09-03 12:00:00",
             "finished_at": "",
             "train_branch": "",
-            "phase": "", "resumed": 0,
+            "phase": "", "resumed": 0, "timed_out": false, "timeout_secs": 0,
         })
     );
 
