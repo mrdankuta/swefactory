@@ -91,6 +91,7 @@ echo "pi cwd=$(pwd) slot:${FACTORY_SLOT:-unset}" >> "$PI_LOG"
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: ${PI_VERDICT:-accept}"
+echo "<verdict>{\"decision\":\"${PI_VERDICT:-accept}\"}</verdict>"
 "#,
     )
 }

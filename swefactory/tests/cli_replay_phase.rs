@@ -92,6 +92,7 @@ echo "pi cwd=$(pwd) slot:${FACTORY_SLOT:-unset}" >> "$PI_LOG"
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: ${PI_VERDICT:-accept}"
+echo "<verdict>{\"decision\":\"${PI_VERDICT:-accept}\"}</verdict>"
 "#,
     )
 }
@@ -495,6 +496,7 @@ echo "change from pi" >> change.txt
 i=1; while [ $i -le 100 ]; do echo "implement line $i"; i=$((i+1)); done
 echo "notes"
 echo "VERDICT: ${PI_VERDICT:-accept}"
+echo "<verdict>{\"decision\":\"${PI_VERDICT:-accept}\"}</verdict>"
 "#,
     )
 }

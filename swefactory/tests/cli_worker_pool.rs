@@ -94,6 +94,7 @@ echo "pi cwd=$(pwd) slot:${FACTORY_SLOT:-unset} tmpdir:${TMPDIR:-unset}" >> "$PI
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: ${PI_VERDICT:-accept}"
+echo "<verdict>{\"decision\":\"${PI_VERDICT:-accept}\"}</verdict>"
 "#,
     )
 }
@@ -302,6 +303,7 @@ case "$(pwd)" in *review-*) ;; *) touch "{}/started-${{FACTORY_SLOT:-unset}}"; s
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: changes_requested"
+echo '<verdict>{{"decision":"changes_requested"}}</verdict>'
 "#,
             h.pi_log.display(),
             markers.display(),
@@ -632,6 +634,7 @@ touch "{}/STOP"
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: changes_requested"
+echo '<verdict>{{"decision":"changes_requested"}}</verdict>'
 "#,
             h.pi_log.display(),
             state_env.display(),
@@ -895,6 +898,7 @@ if [ "${{FACTORY_SLOT:-}}" = "T11-a1" ]; then sleep 5; fi
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: accept"
+echo '<verdict>{{"decision":"accept"}}</verdict>'
 "#,
             h.pi_log.display(),
         ),

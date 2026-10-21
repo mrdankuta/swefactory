@@ -1334,11 +1334,15 @@ pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
         .attempts
         .iter()
         .map(|a| {
+            // Machine verdict (ticket #105): same tag-first decision as
+            // the human transcript. Null when no verdict recorded yet.
+            let verdict = verdict_of_transcript(&a.transcript);
             serde_json::json!({
                 "attempt": a.attempt_no,
                 "slot": format!("T{}-a{}", detail.number, a.attempt_no),
                 "status": a.status,
                 "summary": a.summary,
+                "verdict": verdict,
                 "base": a.base,
                 "head": a.head,
                 "started": a.started,
@@ -2858,7 +2862,7 @@ pub fn train_review_data() -> TrainReviewData {
         let branch = ticket_branch_for_merge(&ledger, ticket, &train.branch).unwrap_or_default();
         let verdict = train_member_attempt(&ledger, ticket, &train.branch)
             .map(|a| log_read_transcript(&state, &a))
-            .and_then(|t| parse_verdict(&t));
+            .and_then(|t| verdict_of_transcript(&t));
         let verdict_text = train_verdict_text(verdict.as_deref());
         let (diff_stat, diff_truncated) = train_member_diff(&train.base_commit, &branch);
         members.push(TrainMemberView {
@@ -7711,7 +7715,7 @@ fn reconcile_history_for(ticket: u64, base: &str) -> OutcomeHistoryInput {
             attempt_no: a.attempt_no,
             started_epoch_secs: parse_epoch_secs(&a.started_at),
             finished_epoch_secs: parse_epoch_secs(&a.finished_at),
-            review_accepted: parse_verdict(&log_read_transcript(&state, a)).as_deref()
+            review_accepted: verdict_of_transcript(&log_read_transcript(&state, a)).as_deref()
                 == Some("accept"),
         })
         .collect();
@@ -9328,6 +9332,114 @@ fn parse_verdict(text: &str) -> Option<String> {
     verdict
 }
 
+// --- typed reviewer verdicts (ticket #105, spec #103 slice 1) -------------
+//
+// The reviewer's decision is a machine-checked fact, not prose to squint
+// at. The reviewer ends stdout with the familiar human `VERDICT:` line
+// plus a `<verdict>{"decision": ...}</verdict>` tag; the tag is
+// authoritative, the line stays for readability. Extraction is
+// last-match-wins (a reviewer that drafts then corrects itself is judged
+// on its final word); a fenced tag body is unwrapped so fence or no fence
+// reads the same. A missing tag or an invalid payload is a typed failure
+// carrying ticket, attempt, and report path — never a silent misread.
+// `parse_verdict` above stays untouched: transcripts keep rendering the
+// human line byte-identical, and pre-tag transcripts still read through
+// `verdict_of_transcript`'s legacy fallback.
+//
+/// Why the tag parse can fail: absent entirely, or present but unusable.
+/// Ticket/attempt/report travel in the rendered message, not here, so this
+/// stays pure and unit-pinnable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VerdictTagError {
+    Missing,
+    Invalid { raw: String, reason: String },
+}
+
+/// Extract the authoritative review decision from stdout: the LAST
+/// `<verdict>...</verdict>` tag's `decision` (`accept` |
+/// `changes_requested`). Pure. Fence or no fence, same verdict.
+///
+/// # Examples
+/// ```
+/// use factory_lib::{parse_verdict_tag, VerdictTagError};
+/// assert_eq!(
+///     parse_verdict_tag("notes\nVERDICT: accept\n<verdict>{\"decision\":\"accept\"}</verdict>\n"),
+///     Ok("accept".to_string())
+/// );
+/// assert_eq!(parse_verdict_tag("VERDICT: accept\n"), Err(VerdictTagError::Missing));
+/// ```
+pub fn parse_verdict_tag(text: &str) -> Result<String, VerdictTagError> {
+    // Last-match-wins: scan every non-overlapping tag pair, keep the last.
+    let mut last: Option<&str> = None;
+    let mut rest = text;
+    while let Some(open) = rest.find("<verdict>") {
+        let after = &rest[open + "<verdict>".len()..];
+        let Some(close) = after.find("</verdict>") else {
+            break;
+        };
+        last = Some(&after[..close]);
+        rest = &after[close + "</verdict>".len()..];
+    }
+    let Some(body) = last else {
+        return Err(VerdictTagError::Missing);
+    };
+    let mut inner = body.trim().to_string();
+    // Fenced body: drop the opening fence line (``` or ```json) and the
+    // closing fence line so fence or no fence reads the same.
+    if inner.starts_with("```") {
+        let mut lines: Vec<&str> = inner.lines().collect();
+        lines.remove(0);
+        if lines
+            .last()
+            .is_some_and(|l| l.trim_start().starts_with("```"))
+        {
+            lines.pop();
+        }
+        inner = lines.join("\n").trim().to_string();
+    }
+    let raw = body.to_string();
+    let invalid = |reason: &str| VerdictTagError::Invalid {
+        raw: raw.clone(),
+        reason: reason.to_string(),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&inner).map_err(|e| invalid(&format!("bad JSON: {e}")))?;
+    let decision = value
+        .get("decision")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| invalid("missing `decision` string"))?;
+    match decision {
+        "accept" | "changes_requested" => Ok(decision.to_string()),
+        other => Err(invalid(&format!("unknown decision {other:?}"))),
+    }
+}
+
+/// Loud typed failure for a missing/unusable verdict tag: names the ticket,
+/// the attempt, and the report path; invalid payloads attach the raw
+/// matched text. Pure, so status/log/train render the identical sentence.
+pub fn verdict_error_message(
+    ticket: u64,
+    attempt: u64,
+    report: &str,
+    err: &VerdictTagError,
+) -> String {
+    match err {
+        VerdictTagError::Missing => format!(
+            "DISPATCH: review step failed for ticket #{ticket} attempt {attempt}: missing `<verdict>` tag (report: {report}). The reviewer must end with a `VERDICT:` line plus a `<verdict>{{\"decision\": ...}}</verdict>` tag; silent reviewers never read as accepted."
+        ),
+        VerdictTagError::Invalid { raw, reason } => format!(
+            "DISPATCH: review step failed for ticket #{ticket} attempt {attempt}: invalid `<verdict>` payload ({reason}) (report: {report}). Matched text: {raw}"
+        ),
+    }
+}
+
+/// Display-time verdict for one transcript: the tag when present and valid,
+/// else the legacy `VERDICT:` line (pre-tag transcripts keep reading as
+/// before). Powers every human + machine surface identically.
+pub fn verdict_of_transcript(text: &str) -> Option<String> {
+    parse_verdict_tag(text).ok().or_else(|| parse_verdict(text))
+}
+
 enum TicketOutcome {
     Done,
     /// Admission refused: the human-readable reason (e.g. "not ready",
@@ -9963,7 +10075,7 @@ fn run_attempt_phases(
     let report_path = state
         .join("logs")
         .join(format!("T{ticket}-a{attempt_no}-report.md"));
-    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with: VERDICT: accept|changes_requested\n\n", report_path.display());
+    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with the human line `VERDICT: accept|changes_requested` and then the authoritative typed tag on its own: `<verdict>{{\"decision\":\"accept\"|\"changes_requested\"}}</verdict>` (JSON; a fenced code block inside the tag is fine). A missing or malformed tag fails the review step.\n\n", report_path.display());
     let review_prompt = PathBuf::from(".pi/prompts/review.md");
     if review_prompt.is_file() {
         if let Ok(suffix) = std::fs::read_to_string(&review_prompt) {
@@ -10014,7 +10126,27 @@ fn run_attempt_phases(
         PhaseResult::Success(out) | PhaseResult::Failure(out) => out,
     };
     let _ = std::fs::remove_file(rwt.join(".factory-review-brief.md"));
-    let verdict = parse_verdict(&rout);
+    // Typed verdict (ticket #105): the `<verdict>` tag is authoritative.
+    // A missing or malformed tag fails loudly — never a silent accept.
+    let report_s = report_path.display().to_string();
+    let verdict = match parse_verdict_tag(&rout) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            let msg = verdict_error_message(ticket, attempt_no, &report_s, &e);
+            if report_path.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&report_path) {
+                    gh_comment(ticket, &text);
+                }
+            }
+            gh_comment(ticket, &msg);
+            println!("  {msg} — routing back to ready");
+            gh_relabel(ticket, Some("review"), "ready");
+            remove_worktree(&rwt);
+            remove_worktree(wt);
+            finish_attempt(state, shared, idx, "review_failed", 0);
+            return TicketOutcome::Done;
+        }
+    };
     if report_path.is_file() {
         if let Ok(text) = std::fs::read_to_string(&report_path) {
             gh_comment(ticket, &text);
@@ -11251,16 +11383,21 @@ pub fn cmd_status(json: bool) -> i32 {
 
     // Per-attempt facts: exactly what the dispatcher tracks, with the slot
     // derived the same way the dispatcher derives it (T<ticket>-a<attempt>).
+    // `verdict` (ticket #105) carries the same tag-first decision the human
+    // transcript shows, so machines and Bea read one fact. Null when no
+    // verdict was recorded yet.
     let attempts: Vec<serde_json::Value> = ledger
         .attempts
         .iter()
         .map(|a| {
+            let verdict = verdict_of_transcript(&log_read_transcript(&state, a));
             serde_json::json!({
                 "ticket": a.ticket,
                 "attempt": a.attempt_no,
                 "slot": format!("T{}-a{}", a.ticket, a.attempt_no),
                 "status": a.status,
                 "phase": attempt_phase(a),
+                "verdict": verdict,
                 "resumable": is_resumable(a),
                 "resumed": a.resumed,
                 "idle_background": attempt_idle_background(&ledger, a.ticket, a.attempt_no),
@@ -12975,6 +13112,9 @@ pub fn cmd_log(
             .iter()
             .map(|m| memo_json(m))
             .collect();
+        // Machine verdict (ticket #105): the same tag-first decision the
+        // human transcript shows. Null when no verdict recorded yet.
+        let verdict = verdict_of_transcript(&full);
         rows.push(serde_json::json!({
             "ticket": a.ticket,
             "attempt": a.attempt_no,
@@ -12982,6 +13122,7 @@ pub fn cmd_log(
             "status": a.status,
             "summary": log_summary(a),
             "phase": attempt_phase(a),
+            "verdict": verdict,
             "resumable": is_resumable(a),
             "resumed": a.resumed,
             "idle_background": attempt_idle_background(&ledger, a.ticket, a.attempt_no),
@@ -16398,7 +16539,7 @@ pub fn cmd_dispatch_selftest(json: bool) -> i32 {
     let fake_pi = tmp.join("fake-pi.sh");
     let _ = std::fs::write(
         &fake_pi,
-        "#!/bin/sh\necho \"PI-DISPATCH: cwd=$(pwd)\" >> \"$PI_DISPATCH_LOG\"\necho \"change from hermetic implementer\" >> change.txt\necho \"notes\"\necho \"VERDICT: accept\"\n",
+        "#!/bin/sh\necho \"PI-DISPATCH: cwd=$(pwd)\" >> \"$PI_DISPATCH_LOG\"\necho \"change from hermetic implementer\" >> change.txt\necho \"notes\"\necho \"VERDICT: accept\"\necho '<verdict>{\"decision\":\"accept\"}</verdict>'\n",
     );
     let fake_adapter = tmp.join("fake-adapter.sh");
     let _ = std::fs::write(
@@ -19292,5 +19433,127 @@ mod phase_timeout_tests {
         let t0 = std::time::Instant::now();
         assert!(!phase_deadline_exceeded(t0, t0, bound(1)));
         assert!(phase_deadline_exceeded(t0, t0 + bound(1), bound(1)));
+    }
+}
+
+// --- typed reviewer verdicts, TDD green (ticket #105, spec #103 slice 1) --
+// The tag parse is pure over stdout text: valid decisions, last-wins,
+// missing/invalid failures, fence equivalence, and the loud typed message.
+#[cfg(test)]
+mod verdict_tag_tests {
+    use super::{parse_verdict_tag, verdict_error_message, verdict_of_transcript, VerdictTagError};
+
+    #[test]
+    fn valid_tag_records_accept() {
+        let out = "findings\nVERDICT: accept\n<verdict>{\"decision\":\"accept\"}</verdict>\n";
+        assert_eq!(parse_verdict_tag(out), Ok("accept".to_string()));
+    }
+
+    #[test]
+    fn valid_tag_records_changes_requested() {
+        let out =
+            "findings\nVERDICT: changes_requested\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\n";
+        assert_eq!(parse_verdict_tag(out), Ok("changes_requested".to_string()));
+    }
+
+    #[test]
+    fn last_tag_wins() {
+        let out = "<verdict>{\"decision\":\"accept\"}</verdict>\ndraft corrected\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\n";
+        assert_eq!(parse_verdict_tag(out), Ok("changes_requested".to_string()));
+    }
+
+    #[test]
+    fn missing_tag_is_missing() {
+        assert_eq!(
+            parse_verdict_tag("findings\nVERDICT: accept\n"),
+            Err(VerdictTagError::Missing)
+        );
+        assert_eq!(parse_verdict_tag(""), Err(VerdictTagError::Missing));
+        // Unclosed tag is not a tag.
+        assert_eq!(
+            parse_verdict_tag("<verdict>{\"decision\":\"accept\"}\n"),
+            Err(VerdictTagError::Missing)
+        );
+    }
+
+    #[test]
+    fn bad_json_is_invalid_with_raw_text() {
+        let out = "<verdict>{not json</verdict>";
+        match parse_verdict_tag(out) {
+            Err(VerdictTagError::Invalid { raw, reason }) => {
+                assert_eq!(raw, "{not json");
+                assert!(reason.contains("bad JSON"), "{reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_decision_is_invalid_with_raw_text() {
+        let out = "<verdict>{\"decision\":\"maybe\"}</verdict>";
+        match parse_verdict_tag(out) {
+            Err(VerdictTagError::Invalid { raw, reason }) => {
+                assert_eq!(raw, "{\"decision\":\"maybe\"}");
+                assert!(reason.contains("unknown decision"), "{reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_decision_field_is_invalid() {
+        match parse_verdict_tag("<verdict>{\"foo\":1}</verdict>") {
+            Err(VerdictTagError::Invalid { reason, .. }) => {
+                assert!(reason.contains("decision"), "{reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fenced_body_reads_same_as_bare() {
+        let bare = "<verdict>{\"decision\":\"accept\"}</verdict>";
+        let fenced = "<verdict>\n```json\n{\"decision\":\"accept\"}\n```\n</verdict>";
+        let plain_fence = "<verdict>\n```\n{\"decision\":\"accept\"}\n```\n</verdict>";
+        assert_eq!(parse_verdict_tag(bare), Ok("accept".to_string()));
+        assert_eq!(parse_verdict_tag(fenced), parse_verdict_tag(bare));
+        assert_eq!(parse_verdict_tag(plain_fence), parse_verdict_tag(bare));
+    }
+
+    #[test]
+    fn error_message_names_ticket_attempt_and_report() {
+        let missing = verdict_error_message(105, 2, "/tmp/R", &VerdictTagError::Missing);
+        assert!(missing.contains("#105"), "{missing}");
+        assert!(missing.contains("attempt 2"), "{missing}");
+        assert!(missing.contains("/tmp/R"), "{missing}");
+        let invalid = verdict_error_message(
+            105,
+            2,
+            "/tmp/R",
+            &VerdictTagError::Invalid {
+                raw: "{oops".to_string(),
+                reason: "bad JSON".to_string(),
+            },
+        );
+        assert!(invalid.contains("#105"), "{invalid}");
+        assert!(invalid.contains("attempt 2"), "{invalid}");
+        assert!(invalid.contains("/tmp/R"), "{invalid}");
+        assert!(invalid.contains("{oops"), "{invalid}");
+    }
+
+    #[test]
+    fn transcript_prefers_tag_falls_back_to_legacy_line() {
+        // Tag present: authoritative even when the human line disagrees.
+        let mixed = "VERDICT: accept\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\n";
+        assert_eq!(
+            verdict_of_transcript(mixed),
+            Some("changes_requested".to_string())
+        );
+        // Pre-tag transcript: legacy line still reads.
+        assert_eq!(
+            verdict_of_transcript("notes\nVERDICT: accept\n"),
+            Some("accept".to_string())
+        );
+        assert_eq!(verdict_of_transcript("nothing here\n"), None);
     }
 }
