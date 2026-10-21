@@ -7857,13 +7857,25 @@ pub fn cmd_start(ticket: &str, worktree_override: Option<&PathBuf>, json: bool) 
         return 1;
     }
     // Parity with bash: when the build prompt exists, compose .factory-prompt.md.
+    // The template interpolates through PromptArgs (ticket #106); the brief
+    // body stays verbatim. Head and freeze are unknown before dispatch, so
+    // referencing them here fails fast naming the key.
     let build_prompt = PathBuf::from(".pi/prompts/build.md");
     if build_prompt.is_file() {
         if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
-            let _ = std::fs::write(
-                worktree.join(".factory-prompt.md"),
-                format!("{prefix}{brief}"),
-            );
+            let start_args = PromptArgs::new(Some(base.clone()), None, None);
+            match compose_prompt_template(&prefix, &start_args) {
+                Ok(composed) => {
+                    let _ = std::fs::write(
+                        worktree.join(".factory-prompt.md"),
+                        format!("{composed}{brief}"),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("factory start: prompt template: {e}");
+                    return 1;
+                }
+            }
         }
     }
     if json {
@@ -9530,6 +9542,210 @@ pub fn pending_answers(
 /// an upstream issue — never invent a new format here.
 pub const ANSWER_ROUTING_RULE: &str = "Routing rule (pinned): Bea's replies arrive as structured `Answer[id]` issue comments. The loop snapshots them when composing this brief — anything posted mid-attempt waits for the next attempt (atomic boundary). Each answer is delivered once (single-use): consume it from this brief and never ask for it again. If this rule cannot be followed with the current tooling, stop and report instead of inventing a new format.";
 
+// --- PromptArgs (ticket #106, spec #103 slice 3) --------------------------
+//
+// Prompt briefs declare the values they interpolate instead of silently
+// stringing them together. The composer knows exactly three keys:
+// `{{BASE_COMMIT}}`, `{{HEAD_COMMIT}}`, `{{SPEC_FREEZE}}` (later keys extend
+// `PROMPT_ARG_NAMES`). Referencing an undeclared key — an unknown name, or
+// a known name with no value declared for this phase — fails composition
+// with an error naming the key. A declared-but-unused value warns (naming
+// the key) while composition proceeds, so prompt drift surfaces instead of
+// rendering silently. Templates without placeholders render byte-identical.
+// The scanner only treats `{{KEY}}` (trimmed, non-empty, `[A-Za-z0-9_]+`)
+// as a reference; malformed or unterminated braces pass through literally,
+// so legacy prose and ticket bodies never misfire. Substitution is
+// host-side string replacement only: values are never executed, and
+// sandbox-side `!command` expansion is explicitly not built.
+
+/// The three placeholder names the brief composer knows, in canonical order.
+pub const PROMPT_ARG_NAMES: [&str; 3] = ["BASE_COMMIT", "HEAD_COMMIT", "SPEC_FREEZE"];
+
+/// Declared values for brief composition (ticket #106). `None` means the
+/// value is not declared for this phase — referencing its placeholder
+/// then fails composition naming the key.
+#[derive(Debug, Default, Clone)]
+pub struct PromptArgs {
+    pub base_commit: Option<String>,
+    pub head_commit: Option<String>,
+    pub spec_freeze: Option<String>,
+}
+
+impl PromptArgs {
+    pub fn new(
+        base_commit: Option<String>,
+        head_commit: Option<String>,
+        spec_freeze: Option<String>,
+    ) -> Self {
+        Self {
+            base_commit,
+            head_commit,
+            spec_freeze,
+        }
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        match name {
+            "BASE_COMMIT" => self.base_commit.as_deref(),
+            "HEAD_COMMIT" => self.head_commit.as_deref(),
+            "SPEC_FREEZE" => self.spec_freeze.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn is_declared(&self, name: &str) -> bool {
+        self.value(name).is_some()
+    }
+}
+
+/// A composed brief: the substituted text plus one warning per declared
+/// value the template never used. Warnings never block composition.
+#[derive(Debug, Clone)]
+pub struct ComposedBrief {
+    pub text: String,
+    pub warnings: Vec<String>,
+}
+
+/// Extract distinct `{{KEY}}` placeholder names in first-appearance order.
+/// Only trimmed, non-empty, `[A-Za-z0-9_]+` interiors count; anything else
+/// (malformed, unterminated, shell-looking) is literal prose.
+fn prompt_refs(template: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if &bytes[i..i + 2] != b"{{" {
+            i += 1;
+            continue;
+        }
+        let rest = &template[i + 2..];
+        let Some(end) = rest.find("}}") else {
+            break;
+        };
+        let inner = rest[..end].trim();
+        if !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            if !refs.iter().any(|r| r == inner) {
+                refs.push(inner.to_string());
+            }
+            i += 2 + end + 2;
+        } else {
+            // Not a placeholder: emit `{{` literally and keep scanning so
+            // a key nested after junk still resolves.
+            i += 2;
+        }
+    }
+    refs
+}
+
+/// Compose a prompt template against declared values (ticket #106).
+///
+/// - Each `{{KEY}}` must be a known name with a declared value, else
+///   `Err` naming the key.
+/// - Each declared value the template never references yields one warning
+///   naming the key — but only when the template uses at least one
+///   placeholder, so legacy keyless briefs render (and run) exactly as
+///   today. Composition always proceeds on warnings.
+/// - Pure string substitution: nothing is executed, ever.
+pub fn compose_brief(template: &str, args: &PromptArgs) -> Result<ComposedBrief, String> {
+    let refs = prompt_refs(template);
+    for key in &refs {
+        if !PROMPT_ARG_NAMES.contains(&key.as_str()) {
+            return Err(format!(
+                "brief references undeclared prompt arg {{{{{key}}}}} (known args: {})",
+                PROMPT_ARG_NAMES.join(", ")
+            ));
+        }
+        if !args.is_declared(key) {
+            return Err(format!(
+                "brief references {{{{{key}}}}} with no value declared for this phase"
+            ));
+        }
+    }
+    // Single substitution pass. `{{` / `}}` are ASCII so every split point
+    // is a char boundary and non-ASCII prose copies through untouched.
+    // Padded shapes (`{{ KEY }}`) resolve like the bare form.
+    let mut text = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"{{" {
+            let rest = &template[i + 2..];
+            match rest.find("}}") {
+                Some(end) => {
+                    let inner = rest[..end].trim();
+                    let is_ref = !inner.is_empty()
+                        && inner
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                    if is_ref {
+                        // Validated above: known name with a declared value.
+                        let value = args.value(inner).expect("checked declared above");
+                        text.push_str(value);
+                        i += 2 + end + 2;
+                    } else {
+                        // Not a placeholder: emit `{{` literally and keep
+                        // scanning, mirroring `prompt_refs` so nesting
+                        // resolves identically in both passes.
+                        text.push_str("{{");
+                        i += 2;
+                    }
+                }
+                None => {
+                    text.push_str(&template[i..]);
+                    break;
+                }
+            }
+        } else {
+            // ASCII `{{` check above guarantees `i` is a char boundary;
+            // advance one full char to stay boundary-safe on multibyte text.
+            let ch = template[i..].chars().next().expect("non-empty tail");
+            text.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let mut warnings = Vec::new();
+    if !refs.is_empty() {
+        for name in PROMPT_ARG_NAMES {
+            if args.is_declared(name) && !refs.iter().any(|r| r == name) {
+                warnings.push(format!(
+                    "brief declares prompt arg {{{{{name}}}}} but never uses it"
+                ));
+            }
+        }
+    }
+    Ok(ComposedBrief { text, warnings })
+}
+
+/// Latest SPEC-APPROVED hash across already-fetched issue comment bodies, if
+/// any (ticket #106): last-match-wins, mirroring `fetch_approved`, but with
+/// no extra `gh` call so brief composition stays host-side and hermetic.
+fn approved_freeze(comment_bodies: &[String]) -> Option<String> {
+    let mut approved = None;
+    for body in comment_bodies {
+        if let Some(hash) = extract_approved_hash(body) {
+            approved = Some(hash);
+        }
+    }
+    approved
+}
+
+/// Compose a prompt-template file through PromptArgs (ticket #106): the
+/// template interpolates, the brief body stays verbatim (callers append it
+/// after). Warnings print to stderr and composition proceeds; errors return
+/// naming the undeclared key for the caller to fail loudly.
+fn compose_prompt_template(template: &str, args: &PromptArgs) -> Result<String, String> {
+    compose_brief(template, args).map(|composed| {
+        for warning in &composed.warnings {
+            eprintln!("factory prompt: warning: {warning}");
+        }
+        composed.text
+    })
+}
+
 /// The brief section a worker reads: her answers verbatim, then the
 /// pinned rule. Pure over inputs so transcripts, stored briefs, and tests
 /// agree byte-for-byte.
@@ -9713,6 +9929,10 @@ struct PhaseCtx {
     /// Effective bounded-wait values (ticket #94): implement/review secs.
     implement_timeout_secs: u64,
     review_timeout_secs: u64,
+    /// SPEC-APPROVED freeze hash for `{{SPEC_FREEZE}}` (ticket #106):
+    /// `None` when the ticket links no frozen spec — referencing the
+    /// placeholder then fails composition naming the key.
+    spec_freeze: Option<String>,
 }
 
 /// Run attempt phases from `start_phase` onward (ticket #61, spec #59).
@@ -9751,7 +9971,23 @@ fn run_attempt_phases(
     let build_prompt = PathBuf::from(".pi/prompts/build.md");
     if build_prompt.is_file() {
         if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
-            let _ = std::fs::write(wt.join(".factory-prompt.md"), format!("{prefix}{brief}"));
+            // PromptArgs (ticket #106): the template interpolates, the
+            // brief body stays verbatim. A bad template settles the attempt
+            // loudly instead of running the worker on a silently raw prompt.
+            let build_args = PromptArgs::new(Some(ctx.base.clone()), None, ctx.spec_freeze.clone());
+            match compose_prompt_template(&prefix, &build_args) {
+                Ok(composed) => {
+                    let _ =
+                        std::fs::write(wt.join(".factory-prompt.md"), format!("{composed}{brief}"));
+                }
+                Err(e) => {
+                    eprintln!("dispatch: prompt template: {e}");
+                    gh_comment(ticket, &format!("DISPATCH: prompt template error (attempt {attempt_no}/{max_attempts}): {e}"));
+                    finish_attempt(state, shared, idx, "impl_failed", 1);
+                    remove_worktree(wt);
+                    return TicketOutcome::Done;
+                }
+            }
         }
     }
     let prompt = std::fs::read_to_string(wt.join(".factory-prompt.md"))
@@ -9964,10 +10200,31 @@ fn run_attempt_phases(
         .join("logs")
         .join(format!("T{ticket}-a{attempt_no}-report.md"));
     let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with: VERDICT: accept|changes_requested\n\n", report_path.display());
+    // PromptArgs (ticket #106): the review template interpolates base, head,
+    // and freeze; the brief header above stays verbatim.
     let review_prompt = PathBuf::from(".pi/prompts/review.md");
     if review_prompt.is_file() {
         if let Ok(suffix) = std::fs::read_to_string(&review_prompt) {
-            review_brief.push_str(&suffix);
+            let review_args = PromptArgs::new(
+                Some(base.to_string()),
+                Some(head.clone()),
+                ctx.spec_freeze.clone(),
+            );
+            match compose_prompt_template(&suffix, &review_args) {
+                Ok(composed) => review_brief.push_str(&composed),
+                Err(e) => {
+                    eprintln!("dispatch: review prompt template: {e}");
+                    gh_relabel(ticket, Some("review"), "ready");
+                    gh_comment(
+                        ticket,
+                        &format!("DISPATCH: review prompt template error: {e}"),
+                    );
+                    finish_attempt(state, shared, idx, "review_failed", 1);
+                    remove_worktree(&rwt);
+                    remove_worktree(wt);
+                    return TicketOutcome::Done;
+                }
+            }
         }
     }
     let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
@@ -10288,6 +10545,7 @@ fn resume_ticket_attempt(
         max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
         review_timeout_secs: review_timeout_secs(timeout_review),
+        spec_freeze: approved_freeze(&comment_bodies),
     };
     run_attempt_phases(state, shared, idx, &ctx, &phase, &brief)
 }
@@ -10568,18 +10826,19 @@ fn cmd_dispatch_ticket(
     // (`ANSWER_ROUTING_RULE`), because the worker is a shell-out
     // subprocess that reads only the brief.
     let mut brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {branch} (base {base})\n\n{body}\n");
+    let comment_bodies: Vec<String> = view
+        .get("comments")
+        .and_then(|c| c.as_array())
+        .map(|comments| {
+            comments
+                .iter()
+                .filter_map(|c| c.get("body").and_then(|b| b.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec_freeze = approved_freeze(&comment_bodies);
     {
-        let comment_bodies: Vec<String> = view
-            .get("comments")
-            .and_then(|c| c.as_array())
-            .map(|comments| {
-                comments
-                    .iter()
-                    .filter_map(|c| c.get("body").and_then(|b| b.as_str()))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
         let (found, _) = collect_answers(&comment_bodies);
         let pending = pending_answers(&found, &lock_ledger(shared).delivered_answers, ticket);
         if !pending.is_empty() {
@@ -10613,6 +10872,7 @@ fn cmd_dispatch_ticket(
         max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
         review_timeout_secs: review_timeout_secs(timeout_review),
+        spec_freeze,
     };
     run_attempt_phases(state, shared, idx, &ctx, "implement", &brief)
 }
