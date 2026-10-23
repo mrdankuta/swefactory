@@ -79,6 +79,12 @@ Present the two reports under `## Standards` and `## Spec` headings, verbatim or
 
 End with a one-line summary: total findings per axis, and the worst issue _within each axis_ (if any). Don't pick a single winner across axes: that's the reranking the separation exists to prevent.
 
+Then end with the terminal verdict block, on its own lines: the human
+line `VERDICT: accept` (or `VERDICT: changes_requested`) followed by the
+authoritative typed tag `<verdict>{"decision":"accept"}</verdict>`
+(or `"changes_requested"`; a fenced code block inside the tag is fine).
+Always emit both — a missing or malformed tag fails the review step.
+
 ## Why two axes
 
 A change can pass one axis and fail the other:

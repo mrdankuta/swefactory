@@ -107,6 +107,7 @@ echo "pi cwd=$(pwd) slot:${FACTORY_SLOT:-unset}" >> "$PI_LOG"
 echo "change from pi" >> change.txt
 echo "impl-output-line"
 echo "VERDICT: accept"
+echo '<verdict>{"decision":"accept"}</verdict>'
 "#,
     )
 }
@@ -124,6 +125,7 @@ case "$(basename "$(pwd)")" in
 review-*)
   echo "review-output-line"
   echo "VERDICT: accept"
+  echo '<verdict>{"decision":"accept"}</verdict>'
   ;;
 *)
   echo "drip-1"
@@ -136,6 +138,7 @@ review-*)
   echo "drip-5"
   echo "change from pi" >> change.txt
   echo "VERDICT: accept"
+  echo '<verdict>{"decision":"accept"}</verdict>'
   ;;
 esac
 "#,

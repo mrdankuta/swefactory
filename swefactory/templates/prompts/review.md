@@ -63,5 +63,10 @@ pane (recipe: the Orchestrator steps below). Never review your own diff in-sessi
   (accept | changes_requested with concrete fixes + re-review scope)
   plus findings by severity with file refs. Reviewer starts pi with a
   unique session id (`review-<ticket>-<yyyymmdd>`).
+  End the reply with the human line `VERDICT: accept` (or
+  `VERDICT: changes_requested`) and then the authoritative typed tag on
+  its own: `<verdict>{"decision":"accept"}</verdict>` (or
+  `"changes_requested"`; a fenced code block inside the tag is fine).
+  A missing or malformed tag fails the review step, so always emit both.
   End the reply with the terminal signal line, e.g.
   `FACTORY:READY_FOR_REVIEW`, so the orchestrator can wait on it.
