@@ -95,6 +95,7 @@ echo "pi cwd=$(pwd) slot:${FACTORY_SLOT:-unset} tmpdir:${TMPDIR:-unset}" >> "$PI
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: ${PI_VERDICT:-accept}"
+echo "<verdict>{\"decision\":\"${PI_VERDICT:-accept}\"}</verdict>"
 "#,
     )
 }
@@ -777,6 +778,219 @@ fn dispatch_routes_changes_requested_back_to_ready() {
         .unwrap_or_default();
     assert!(leftover.is_empty(), "review worktree cleaned: {leftover:?}");
     assert_never_touches_dev_or_lands(&git_log(&h), &gh);
+}
+
+// ---------------------------------------------------------------------------
+// TYPED REVIEWER VERDICTS (ticket #105, spec #103 slice 1): the reviewer
+// ends with the human `VERDICT:` line plus a `<verdict>{...}</verdict>`
+// tag; the tag is authoritative, a missing/malformed tag fails loudly.
+// ---------------------------------------------------------------------------
+
+/// Reviewer with a caller-controlled body: review worktrees print
+/// `$REVIEW_BODY`, implement worktrees behave like the default fake.
+fn write_review_body_pi(dir: &Path) -> PathBuf {
+    write_exe(
+        dir,
+        "pi-review-body",
+        r#"#!/bin/sh
+case "$(basename "$(pwd)")" in
+review-*)
+  printf '%s\n' "$REVIEW_BODY"
+  ;;
+*)
+  echo "change from pi" >> change.txt
+  echo "notes"
+  ;;
+esac
+"#,
+    )
+}
+
+fn run_review_body(h: &Harness, ticket: u64, body: &str) {
+    write_view(
+        h,
+        ticket,
+        "Demo widget",
+        "Build it.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let pi = write_review_body_pi(h.repo.parent().unwrap());
+    let mut cmd = dispatch_cmd(h, &["dispatch", "once"]);
+    cmd.env("GH_LIST_JSON", format!(r#"[{{"number":{ticket}}}]"#))
+        .env("FACTORY_PI_BIN", &pi)
+        .env("REVIEW_BODY", body);
+    cmd.assert().success();
+}
+
+fn ledger_attempt(h: &Harness) -> serde_json::Value {
+    let ledger: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(h.state.join("dispatch.json")).unwrap()).unwrap();
+    ledger.get("attempts").and_then(|v| v.as_array()).unwrap()[0].clone()
+}
+
+#[test]
+fn typed_verdict_accept_records_decision_and_human_line() {
+    let h = setup("typed-accept");
+    run_review_body(
+        &h,
+        11,
+        "looks good\nVERDICT: accept\n<verdict>{\"decision\":\"accept\"}</verdict>",
+    );
+    let a = ledger_attempt(&h);
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{a}"
+    );
+    // Human VERDICT: line renders in the stored transcript byte-identical.
+    let review_log = fs::read_to_string(h.state.join("logs").join("T11-a1-review.log")).unwrap();
+    assert!(
+        review_log.contains("VERDICT: accept"),
+        "human line must survive:\n{review_log}"
+    );
+    assert!(
+        review_log.contains("<verdict>{\"decision\":\"accept\"}</verdict>"),
+        "tag must survive:\n{review_log}"
+    );
+    // Machine output carries the same verdict fact as the human transcript.
+    let mut log = dispatch_cmd(&h, &["log", "11", "--json"]);
+    let assert = log.assert().success();
+    let logged: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&assert.get_output().stdout)).unwrap();
+    assert_eq!(
+        logged["attempts"][0]["verdict"],
+        serde_json::json!("accept"),
+        "log --json:\n{logged}"
+    );
+    assert!(
+        logged["attempts"][0]["transcript"]
+            .as_str()
+            .unwrap()
+            .contains("VERDICT: accept"),
+        "same transcript in machine output"
+    );
+    let mut status = dispatch_cmd(&h, &["status", "--json"]);
+    let assert = status.assert().success();
+    let st: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&assert.get_output().stdout)).unwrap();
+    assert_eq!(
+        st["attempts"][0]["verdict"],
+        serde_json::json!("accept"),
+        "status --json:\n{st}"
+    );
+    let gh = gh_log(&h);
+    assert!(gh.contains("integrated"), "accept path integrates:\n{gh}");
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh);
+}
+
+#[test]
+fn typed_verdict_last_tag_wins() {
+    // Draft-then-correct: final word is changes_requested.
+    let h = setup("typed-last-wins");
+    run_review_body(
+        &h,
+        11,
+        "draft\n<verdict>{\"decision\":\"accept\"}</verdict>\ncorrected\nVERDICT: changes_requested\n<verdict>{\"decision\":\"changes_requested\"}</verdict>",
+    );
+    let a = ledger_attempt(&h);
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_failed"),
+        "last tag decides:\n{a}"
+    );
+    assert!(
+        gh_log(&h).contains("ready"),
+        "changes_requested routes back to ready"
+    );
+    // And the mirror: final word accept still accepts.
+    let h2 = setup("typed-last-wins-accept");
+    run_review_body(
+        &h2,
+        12,
+        "harsh draft\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\nreconsidered\nVERDICT: accept\n<verdict>{\"decision\":\"accept\"}</verdict>",
+    );
+    let a2 = ledger_attempt(&h2);
+    assert_eq!(
+        a2.get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "last tag decides:\n{a2}"
+    );
+}
+
+#[test]
+fn typed_verdict_missing_tag_fails_loudly() {
+    let h = setup("typed-missing");
+    run_review_body(&h, 11, "thorough review, no tag\nVERDICT: accept\n");
+    let a = ledger_attempt(&h);
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_failed"),
+        "missing tag must fail, never accept:\n{a}"
+    );
+    let gh = gh_log(&h);
+    assert!(gh.contains("missing"), "typed error posted:\n{gh}");
+    assert!(gh.contains("#11"), "ticket named:\n{gh}");
+    assert!(gh.contains("attempt 1"), "attempt named:\n{gh}");
+    assert!(gh.contains("T11-a1-report.md"), "report path named:\n{gh}");
+    assert!(gh.contains("ready"), "routes back to ready:\n{gh}");
+    assert!(
+        !gh.lines().any(|l| l.trim() == "integrated")
+            && !gh.lines().any(|l| l.trim() == "accepted"),
+        "silent reviewers never read as accepted:\n{gh}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh);
+}
+
+#[test]
+fn typed_verdict_invalid_payload_fails_with_raw_text() {
+    for (name, body, raw) in [
+        ("bad-json", "<verdict>{not json</verdict>", "{not json"),
+        (
+            "unknown-decision",
+            "VERDICT: accept\n<verdict>{\"decision\":\"maybe\"}</verdict>",
+            "{\"decision\":\"maybe\"}",
+        ),
+    ] {
+        let h = setup(name);
+        run_review_body(&h, 11, body);
+        let a = ledger_attempt(&h);
+        assert_eq!(
+            a.get("status").and_then(|v| v.as_str()),
+            Some("review_failed"),
+            "{name}: invalid payload must fail, never accept:\n{a}"
+        );
+        let gh = gh_log(&h);
+        assert!(gh.contains("invalid"), "{name}: typed error posted:\n{gh}");
+        assert!(gh.contains("#11"), "{name}: ticket named:\n{gh}");
+        assert!(gh.contains("attempt 1"), "{name}: attempt named:\n{gh}");
+        assert!(
+            gh.contains("T11-a1-report.md"),
+            "{name}: report path named:\n{gh}"
+        );
+        assert!(gh.contains(raw), "{name}: raw text attached:\n{gh}");
+        assert!(
+            !gh.contains("integrated"),
+            "{name}: never integrated:\n{gh}"
+        );
+    }
+}
+
+#[test]
+fn typed_verdict_fenced_body_accepted() {
+    let h = setup("typed-fenced");
+    run_review_body(
+        &h,
+        11,
+        "looks good\nVERDICT: accept\n<verdict>\n```json\n{\"decision\":\"accept\"}\n```\n</verdict>",
+    );
+    let a = ledger_attempt(&h);
+    assert_eq!(
+        a.get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "fence or no fence, same verdict:\n{a}"
+    );
+    assert!(gh_log(&h).contains("integrated"));
 }
 
 #[test]

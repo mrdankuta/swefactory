@@ -263,6 +263,7 @@ fi
 echo "change from pi" >> change.txt
 echo "notes"
 echo "VERDICT: accept"
+echo '<verdict>{"decision":"accept"}</verdict>'
 "#,
     )
 }

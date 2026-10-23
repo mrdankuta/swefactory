@@ -1334,11 +1334,15 @@ pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
         .attempts
         .iter()
         .map(|a| {
+            // Machine verdict (ticket #105): same tag-first decision as
+            // the human transcript. Null when no verdict recorded yet.
+            let verdict = verdict_of_transcript(&a.transcript);
             serde_json::json!({
                 "attempt": a.attempt_no,
                 "slot": format!("T{}-a{}", detail.number, a.attempt_no),
                 "status": a.status,
                 "summary": a.summary,
+                "verdict": verdict,
                 "base": a.base,
                 "head": a.head,
                 "started": a.started,
@@ -2858,7 +2862,7 @@ pub fn train_review_data() -> TrainReviewData {
         let branch = ticket_branch_for_merge(&ledger, ticket, &train.branch).unwrap_or_default();
         let verdict = train_member_attempt(&ledger, ticket, &train.branch)
             .map(|a| log_read_transcript(&state, &a))
-            .and_then(|t| parse_verdict(&t));
+            .and_then(|t| verdict_of_transcript(&t));
         let verdict_text = train_verdict_text(verdict.as_deref());
         let (diff_stat, diff_truncated) = train_member_diff(&train.base_commit, &branch);
         members.push(TrainMemberView {
@@ -7711,7 +7715,7 @@ fn reconcile_history_for(ticket: u64, base: &str) -> OutcomeHistoryInput {
             attempt_no: a.attempt_no,
             started_epoch_secs: parse_epoch_secs(&a.started_at),
             finished_epoch_secs: parse_epoch_secs(&a.finished_at),
-            review_accepted: parse_verdict(&log_read_transcript(&state, a)).as_deref()
+            review_accepted: verdict_of_transcript(&log_read_transcript(&state, a)).as_deref()
                 == Some("accept"),
         })
         .collect();
@@ -7857,13 +7861,25 @@ pub fn cmd_start(ticket: &str, worktree_override: Option<&PathBuf>, json: bool) 
         return 1;
     }
     // Parity with bash: when the build prompt exists, compose .factory-prompt.md.
+    // The template interpolates through PromptArgs (ticket #106); the brief
+    // body stays verbatim. Head and freeze are unknown before dispatch, so
+    // referencing them here fails fast naming the key.
     let build_prompt = PathBuf::from(".pi/prompts/build.md");
     if build_prompt.is_file() {
         if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
-            let _ = std::fs::write(
-                worktree.join(".factory-prompt.md"),
-                format!("{prefix}{brief}"),
-            );
+            let start_args = PromptArgs::new(Some(base.clone()), None, None);
+            match compose_prompt_template(&prefix, &start_args) {
+                Ok(composed) => {
+                    let _ = std::fs::write(
+                        worktree.join(".factory-prompt.md"),
+                        format!("{composed}{brief}"),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("factory start: prompt template: {e}");
+                    return 1;
+                }
+            }
         }
     }
     if json {
@@ -9328,6 +9344,114 @@ fn parse_verdict(text: &str) -> Option<String> {
     verdict
 }
 
+// --- typed reviewer verdicts (ticket #105, spec #103 slice 1) -------------
+//
+// The reviewer's decision is a machine-checked fact, not prose to squint
+// at. The reviewer ends stdout with the familiar human `VERDICT:` line
+// plus a `<verdict>{"decision": ...}</verdict>` tag; the tag is
+// authoritative, the line stays for readability. Extraction is
+// last-match-wins (a reviewer that drafts then corrects itself is judged
+// on its final word); a fenced tag body is unwrapped so fence or no fence
+// reads the same. A missing tag or an invalid payload is a typed failure
+// carrying ticket, attempt, and report path — never a silent misread.
+// `parse_verdict` above stays untouched: transcripts keep rendering the
+// human line byte-identical, and pre-tag transcripts still read through
+// `verdict_of_transcript`'s legacy fallback.
+//
+/// Why the tag parse can fail: absent entirely, or present but unusable.
+/// Ticket/attempt/report travel in the rendered message, not here, so this
+/// stays pure and unit-pinnable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VerdictTagError {
+    Missing,
+    Invalid { raw: String, reason: String },
+}
+
+/// Extract the authoritative review decision from stdout: the LAST
+/// `<verdict>...</verdict>` tag's `decision` (`accept` |
+/// `changes_requested`). Pure. Fence or no fence, same verdict.
+///
+/// # Examples
+/// ```
+/// use factory_lib::{parse_verdict_tag, VerdictTagError};
+/// assert_eq!(
+///     parse_verdict_tag("notes\nVERDICT: accept\n<verdict>{\"decision\":\"accept\"}</verdict>\n"),
+///     Ok("accept".to_string())
+/// );
+/// assert_eq!(parse_verdict_tag("VERDICT: accept\n"), Err(VerdictTagError::Missing));
+/// ```
+pub fn parse_verdict_tag(text: &str) -> Result<String, VerdictTagError> {
+    // Last-match-wins: scan every non-overlapping tag pair, keep the last.
+    let mut last: Option<&str> = None;
+    let mut rest = text;
+    while let Some(open) = rest.find("<verdict>") {
+        let after = &rest[open + "<verdict>".len()..];
+        let Some(close) = after.find("</verdict>") else {
+            break;
+        };
+        last = Some(&after[..close]);
+        rest = &after[close + "</verdict>".len()..];
+    }
+    let Some(body) = last else {
+        return Err(VerdictTagError::Missing);
+    };
+    let mut inner = body.trim().to_string();
+    // Fenced body: drop the opening fence line (``` or ```json) and the
+    // closing fence line so fence or no fence reads the same.
+    if inner.starts_with("```") {
+        let mut lines: Vec<&str> = inner.lines().collect();
+        lines.remove(0);
+        if lines
+            .last()
+            .is_some_and(|l| l.trim_start().starts_with("```"))
+        {
+            lines.pop();
+        }
+        inner = lines.join("\n").trim().to_string();
+    }
+    let raw = body.to_string();
+    let invalid = |reason: &str| VerdictTagError::Invalid {
+        raw: raw.clone(),
+        reason: reason.to_string(),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&inner).map_err(|e| invalid(&format!("bad JSON: {e}")))?;
+    let decision = value
+        .get("decision")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| invalid("missing `decision` string"))?;
+    match decision {
+        "accept" | "changes_requested" => Ok(decision.to_string()),
+        other => Err(invalid(&format!("unknown decision {other:?}"))),
+    }
+}
+
+/// Loud typed failure for a missing/unusable verdict tag: names the ticket,
+/// the attempt, and the report path; invalid payloads attach the raw
+/// matched text. Pure, so status/log/train render the identical sentence.
+pub fn verdict_error_message(
+    ticket: u64,
+    attempt: u64,
+    report: &str,
+    err: &VerdictTagError,
+) -> String {
+    match err {
+        VerdictTagError::Missing => format!(
+            "DISPATCH: review step failed for ticket #{ticket} attempt {attempt}: missing `<verdict>` tag (report: {report}). The reviewer must end with a `VERDICT:` line plus a `<verdict>{{\"decision\": ...}}</verdict>` tag; silent reviewers never read as accepted."
+        ),
+        VerdictTagError::Invalid { raw, reason } => format!(
+            "DISPATCH: review step failed for ticket #{ticket} attempt {attempt}: invalid `<verdict>` payload ({reason}) (report: {report}). Matched text: {raw}"
+        ),
+    }
+}
+
+/// Display-time verdict for one transcript: the tag when present and valid,
+/// else the legacy `VERDICT:` line (pre-tag transcripts keep reading as
+/// before). Powers every human + machine surface identically.
+pub fn verdict_of_transcript(text: &str) -> Option<String> {
+    parse_verdict_tag(text).ok().or_else(|| parse_verdict(text))
+}
+
 enum TicketOutcome {
     Done,
     /// Admission refused: the human-readable reason (e.g. "not ready",
@@ -9530,6 +9654,210 @@ pub fn pending_answers(
 /// an upstream issue — never invent a new format here.
 pub const ANSWER_ROUTING_RULE: &str = "Routing rule (pinned): Bea's replies arrive as structured `Answer[id]` issue comments. The loop snapshots them when composing this brief — anything posted mid-attempt waits for the next attempt (atomic boundary). Each answer is delivered once (single-use): consume it from this brief and never ask for it again. If this rule cannot be followed with the current tooling, stop and report instead of inventing a new format.";
 
+// --- PromptArgs (ticket #106, spec #103 slice 3) --------------------------
+//
+// Prompt briefs declare the values they interpolate instead of silently
+// stringing them together. The composer knows exactly three keys:
+// `{{BASE_COMMIT}}`, `{{HEAD_COMMIT}}`, `{{SPEC_FREEZE}}` (later keys extend
+// `PROMPT_ARG_NAMES`). Referencing an undeclared key — an unknown name, or
+// a known name with no value declared for this phase — fails composition
+// with an error naming the key. A declared-but-unused value warns (naming
+// the key) while composition proceeds, so prompt drift surfaces instead of
+// rendering silently. Templates without placeholders render byte-identical.
+// The scanner only treats `{{KEY}}` (trimmed, non-empty, `[A-Za-z0-9_]+`)
+// as a reference; malformed or unterminated braces pass through literally,
+// so legacy prose and ticket bodies never misfire. Substitution is
+// host-side string replacement only: values are never executed, and
+// sandbox-side `!command` expansion is explicitly not built.
+
+/// The three placeholder names the brief composer knows, in canonical order.
+pub const PROMPT_ARG_NAMES: [&str; 3] = ["BASE_COMMIT", "HEAD_COMMIT", "SPEC_FREEZE"];
+
+/// Declared values for brief composition (ticket #106). `None` means the
+/// value is not declared for this phase — referencing its placeholder
+/// then fails composition naming the key.
+#[derive(Debug, Default, Clone)]
+pub struct PromptArgs {
+    pub base_commit: Option<String>,
+    pub head_commit: Option<String>,
+    pub spec_freeze: Option<String>,
+}
+
+impl PromptArgs {
+    pub fn new(
+        base_commit: Option<String>,
+        head_commit: Option<String>,
+        spec_freeze: Option<String>,
+    ) -> Self {
+        Self {
+            base_commit,
+            head_commit,
+            spec_freeze,
+        }
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        match name {
+            "BASE_COMMIT" => self.base_commit.as_deref(),
+            "HEAD_COMMIT" => self.head_commit.as_deref(),
+            "SPEC_FREEZE" => self.spec_freeze.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn is_declared(&self, name: &str) -> bool {
+        self.value(name).is_some()
+    }
+}
+
+/// A composed brief: the substituted text plus one warning per declared
+/// value the template never used. Warnings never block composition.
+#[derive(Debug, Clone)]
+pub struct ComposedBrief {
+    pub text: String,
+    pub warnings: Vec<String>,
+}
+
+/// Extract distinct `{{KEY}}` placeholder names in first-appearance order.
+/// Only trimmed, non-empty, `[A-Za-z0-9_]+` interiors count; anything else
+/// (malformed, unterminated, shell-looking) is literal prose.
+fn prompt_refs(template: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if &bytes[i..i + 2] != b"{{" {
+            i += 1;
+            continue;
+        }
+        let rest = &template[i + 2..];
+        let Some(end) = rest.find("}}") else {
+            break;
+        };
+        let inner = rest[..end].trim();
+        if !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            if !refs.iter().any(|r| r == inner) {
+                refs.push(inner.to_string());
+            }
+            i += 2 + end + 2;
+        } else {
+            // Not a placeholder: emit `{{` literally and keep scanning so
+            // a key nested after junk still resolves.
+            i += 2;
+        }
+    }
+    refs
+}
+
+/// Compose a prompt template against declared values (ticket #106).
+///
+/// - Each `{{KEY}}` must be a known name with a declared value, else
+///   `Err` naming the key.
+/// - Each declared value the template never references yields one warning
+///   naming the key — but only when the template uses at least one
+///   placeholder, so legacy keyless briefs render (and run) exactly as
+///   today. Composition always proceeds on warnings.
+/// - Pure string substitution: nothing is executed, ever.
+pub fn compose_brief(template: &str, args: &PromptArgs) -> Result<ComposedBrief, String> {
+    let refs = prompt_refs(template);
+    for key in &refs {
+        if !PROMPT_ARG_NAMES.contains(&key.as_str()) {
+            return Err(format!(
+                "brief references undeclared prompt arg {{{{{key}}}}} (known args: {})",
+                PROMPT_ARG_NAMES.join(", ")
+            ));
+        }
+        if !args.is_declared(key) {
+            return Err(format!(
+                "brief references {{{{{key}}}}} with no value declared for this phase"
+            ));
+        }
+    }
+    // Single substitution pass. `{{` / `}}` are ASCII so every split point
+    // is a char boundary and non-ASCII prose copies through untouched.
+    // Padded shapes (`{{ KEY }}`) resolve like the bare form.
+    let mut text = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"{{" {
+            let rest = &template[i + 2..];
+            match rest.find("}}") {
+                Some(end) => {
+                    let inner = rest[..end].trim();
+                    let is_ref = !inner.is_empty()
+                        && inner
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                    if is_ref {
+                        // Validated above: known name with a declared value.
+                        let value = args.value(inner).expect("checked declared above");
+                        text.push_str(value);
+                        i += 2 + end + 2;
+                    } else {
+                        // Not a placeholder: emit `{{` literally and keep
+                        // scanning, mirroring `prompt_refs` so nesting
+                        // resolves identically in both passes.
+                        text.push_str("{{");
+                        i += 2;
+                    }
+                }
+                None => {
+                    text.push_str(&template[i..]);
+                    break;
+                }
+            }
+        } else {
+            // ASCII `{{` check above guarantees `i` is a char boundary;
+            // advance one full char to stay boundary-safe on multibyte text.
+            let ch = template[i..].chars().next().expect("non-empty tail");
+            text.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let mut warnings = Vec::new();
+    if !refs.is_empty() {
+        for name in PROMPT_ARG_NAMES {
+            if args.is_declared(name) && !refs.iter().any(|r| r == name) {
+                warnings.push(format!(
+                    "brief declares prompt arg {{{{{name}}}}} but never uses it"
+                ));
+            }
+        }
+    }
+    Ok(ComposedBrief { text, warnings })
+}
+
+/// Latest SPEC-APPROVED hash across already-fetched issue comment bodies, if
+/// any (ticket #106): last-match-wins, mirroring `fetch_approved`, but with
+/// no extra `gh` call so brief composition stays host-side and hermetic.
+fn approved_freeze(comment_bodies: &[String]) -> Option<String> {
+    let mut approved = None;
+    for body in comment_bodies {
+        if let Some(hash) = extract_approved_hash(body) {
+            approved = Some(hash);
+        }
+    }
+    approved
+}
+
+/// Compose a prompt-template file through PromptArgs (ticket #106): the
+/// template interpolates, the brief body stays verbatim (callers append it
+/// after). Warnings print to stderr and composition proceeds; errors return
+/// naming the undeclared key for the caller to fail loudly.
+fn compose_prompt_template(template: &str, args: &PromptArgs) -> Result<String, String> {
+    compose_brief(template, args).map(|composed| {
+        for warning in &composed.warnings {
+            eprintln!("factory prompt: warning: {warning}");
+        }
+        composed.text
+    })
+}
+
 /// The brief section a worker reads: her answers verbatim, then the
 /// pinned rule. Pure over inputs so transcripts, stored briefs, and tests
 /// agree byte-for-byte.
@@ -9713,6 +10041,10 @@ struct PhaseCtx {
     /// Effective bounded-wait values (ticket #94): implement/review secs.
     implement_timeout_secs: u64,
     review_timeout_secs: u64,
+    /// SPEC-APPROVED freeze hash for `{{SPEC_FREEZE}}` (ticket #106):
+    /// `None` when the ticket links no frozen spec — referencing the
+    /// placeholder then fails composition naming the key.
+    spec_freeze: Option<String>,
 }
 
 /// Run attempt phases from `start_phase` onward (ticket #61, spec #59).
@@ -9751,7 +10083,23 @@ fn run_attempt_phases(
     let build_prompt = PathBuf::from(".pi/prompts/build.md");
     if build_prompt.is_file() {
         if let Ok(prefix) = std::fs::read_to_string(&build_prompt) {
-            let _ = std::fs::write(wt.join(".factory-prompt.md"), format!("{prefix}{brief}"));
+            // PromptArgs (ticket #106): the template interpolates, the
+            // brief body stays verbatim. A bad template settles the attempt
+            // loudly instead of running the worker on a silently raw prompt.
+            let build_args = PromptArgs::new(Some(ctx.base.clone()), None, ctx.spec_freeze.clone());
+            match compose_prompt_template(&prefix, &build_args) {
+                Ok(composed) => {
+                    let _ =
+                        std::fs::write(wt.join(".factory-prompt.md"), format!("{composed}{brief}"));
+                }
+                Err(e) => {
+                    eprintln!("dispatch: prompt template: {e}");
+                    gh_comment(ticket, &format!("DISPATCH: prompt template error (attempt {attempt_no}/{max_attempts}): {e}"));
+                    finish_attempt(state, shared, idx, "impl_failed", 1);
+                    remove_worktree(wt);
+                    return TicketOutcome::Done;
+                }
+            }
         }
     }
     let prompt = std::fs::read_to_string(wt.join(".factory-prompt.md"))
@@ -9963,11 +10311,32 @@ fn run_attempt_phases(
     let report_path = state
         .join("logs")
         .join(format!("T{ticket}-a{attempt_no}-report.md"));
-    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with: VERDICT: accept|changes_requested\n\n", report_path.display());
+    let mut review_brief = format!("Repo worktree: {rwt_s}\nBASE_COMMIT: {base}\nHEAD_COMMIT: {head}\nTicket issue: #{ticket}. Spec issue: #{spec_label} (verify freeze before starting).\nWrite the FULL report to {}. End stdout with the human line `VERDICT: accept|changes_requested` and then the authoritative typed tag on its own: `<verdict>{{\"decision\":\"accept\"|\"changes_requested\"}}</verdict>` (JSON; a fenced code block inside the tag is fine). A missing or malformed tag fails the review step.\n\n", report_path.display());
+    // PromptArgs (ticket #106): the review template suffix below interpolates
+    // base, head, and freeze; the tag instruction in the header above stays verbatim.
     let review_prompt = PathBuf::from(".pi/prompts/review.md");
     if review_prompt.is_file() {
         if let Ok(suffix) = std::fs::read_to_string(&review_prompt) {
-            review_brief.push_str(&suffix);
+            let review_args = PromptArgs::new(
+                Some(base.to_string()),
+                Some(head.clone()),
+                ctx.spec_freeze.clone(),
+            );
+            match compose_prompt_template(&suffix, &review_args) {
+                Ok(composed) => review_brief.push_str(&composed),
+                Err(e) => {
+                    eprintln!("dispatch: review prompt template: {e}");
+                    gh_relabel(ticket, Some("review"), "ready");
+                    gh_comment(
+                        ticket,
+                        &format!("DISPATCH: review prompt template error: {e}"),
+                    );
+                    finish_attempt(state, shared, idx, "review_failed", 1);
+                    remove_worktree(&rwt);
+                    remove_worktree(wt);
+                    return TicketOutcome::Done;
+                }
+            }
         }
     }
     let _ = std::fs::write(rwt.join(".factory-review-brief.md"), &review_brief);
@@ -10014,7 +10383,27 @@ fn run_attempt_phases(
         PhaseResult::Success(out) | PhaseResult::Failure(out) => out,
     };
     let _ = std::fs::remove_file(rwt.join(".factory-review-brief.md"));
-    let verdict = parse_verdict(&rout);
+    // Typed verdict (ticket #105): the `<verdict>` tag is authoritative.
+    // A missing or malformed tag fails loudly — never a silent accept.
+    let report_s = report_path.display().to_string();
+    let verdict = match parse_verdict_tag(&rout) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            let msg = verdict_error_message(ticket, attempt_no, &report_s, &e);
+            if report_path.is_file() {
+                if let Ok(text) = std::fs::read_to_string(&report_path) {
+                    gh_comment(ticket, &text);
+                }
+            }
+            gh_comment(ticket, &msg);
+            println!("  {msg} — routing back to ready");
+            gh_relabel(ticket, Some("review"), "ready");
+            remove_worktree(&rwt);
+            remove_worktree(wt);
+            finish_attempt(state, shared, idx, "review_failed", 0);
+            return TicketOutcome::Done;
+        }
+    };
     if report_path.is_file() {
         if let Ok(text) = std::fs::read_to_string(&report_path) {
             gh_comment(ticket, &text);
@@ -10288,6 +10677,7 @@ fn resume_ticket_attempt(
         max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
         review_timeout_secs: review_timeout_secs(timeout_review),
+        spec_freeze: approved_freeze(&comment_bodies),
     };
     run_attempt_phases(state, shared, idx, &ctx, &phase, &brief)
 }
@@ -10568,18 +10958,19 @@ fn cmd_dispatch_ticket(
     // (`ANSWER_ROUTING_RULE`), because the worker is a shell-out
     // subprocess that reads only the brief.
     let mut brief = format!("Ticket issue: #{ticket}\nSpec issue: #{spec_label}\nBranch: {branch} (base {base})\n\n{body}\n");
+    let comment_bodies: Vec<String> = view
+        .get("comments")
+        .and_then(|c| c.as_array())
+        .map(|comments| {
+            comments
+                .iter()
+                .filter_map(|c| c.get("body").and_then(|b| b.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec_freeze = approved_freeze(&comment_bodies);
     {
-        let comment_bodies: Vec<String> = view
-            .get("comments")
-            .and_then(|c| c.as_array())
-            .map(|comments| {
-                comments
-                    .iter()
-                    .filter_map(|c| c.get("body").and_then(|b| b.as_str()))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
         let (found, _) = collect_answers(&comment_bodies);
         let pending = pending_answers(&found, &lock_ledger(shared).delivered_answers, ticket);
         if !pending.is_empty() {
@@ -10613,6 +11004,7 @@ fn cmd_dispatch_ticket(
         max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
         review_timeout_secs: review_timeout_secs(timeout_review),
+        spec_freeze,
     };
     run_attempt_phases(state, shared, idx, &ctx, "implement", &brief)
 }
@@ -11251,16 +11643,21 @@ pub fn cmd_status(json: bool) -> i32 {
 
     // Per-attempt facts: exactly what the dispatcher tracks, with the slot
     // derived the same way the dispatcher derives it (T<ticket>-a<attempt>).
+    // `verdict` (ticket #105) carries the same tag-first decision the human
+    // transcript shows, so machines and Bea read one fact. Null when no
+    // verdict was recorded yet.
     let attempts: Vec<serde_json::Value> = ledger
         .attempts
         .iter()
         .map(|a| {
+            let verdict = verdict_of_transcript(&log_read_transcript(&state, a));
             serde_json::json!({
                 "ticket": a.ticket,
                 "attempt": a.attempt_no,
                 "slot": format!("T{}-a{}", a.ticket, a.attempt_no),
                 "status": a.status,
                 "phase": attempt_phase(a),
+                "verdict": verdict,
                 "resumable": is_resumable(a),
                 "resumed": a.resumed,
                 "idle_background": attempt_idle_background(&ledger, a.ticket, a.attempt_no),
@@ -12975,6 +13372,9 @@ pub fn cmd_log(
             .iter()
             .map(|m| memo_json(m))
             .collect();
+        // Machine verdict (ticket #105): the same tag-first decision the
+        // human transcript shows. Null when no verdict recorded yet.
+        let verdict = verdict_of_transcript(&full);
         rows.push(serde_json::json!({
             "ticket": a.ticket,
             "attempt": a.attempt_no,
@@ -12982,6 +13382,7 @@ pub fn cmd_log(
             "status": a.status,
             "summary": log_summary(a),
             "phase": attempt_phase(a),
+            "verdict": verdict,
             "resumable": is_resumable(a),
             "resumed": a.resumed,
             "idle_background": attempt_idle_background(&ledger, a.ticket, a.attempt_no),
@@ -16398,7 +16799,7 @@ pub fn cmd_dispatch_selftest(json: bool) -> i32 {
     let fake_pi = tmp.join("fake-pi.sh");
     let _ = std::fs::write(
         &fake_pi,
-        "#!/bin/sh\necho \"PI-DISPATCH: cwd=$(pwd)\" >> \"$PI_DISPATCH_LOG\"\necho \"change from hermetic implementer\" >> change.txt\necho \"notes\"\necho \"VERDICT: accept\"\n",
+        "#!/bin/sh\necho \"PI-DISPATCH: cwd=$(pwd)\" >> \"$PI_DISPATCH_LOG\"\necho \"change from hermetic implementer\" >> change.txt\necho \"notes\"\necho \"VERDICT: accept\"\necho '<verdict>{\"decision\":\"accept\"}</verdict>'\n",
     );
     let fake_adapter = tmp.join("fake-adapter.sh");
     let _ = std::fs::write(
@@ -19292,5 +19693,127 @@ mod phase_timeout_tests {
         let t0 = std::time::Instant::now();
         assert!(!phase_deadline_exceeded(t0, t0, bound(1)));
         assert!(phase_deadline_exceeded(t0, t0 + bound(1), bound(1)));
+    }
+}
+
+// --- typed reviewer verdicts, TDD green (ticket #105, spec #103 slice 1) --
+// The tag parse is pure over stdout text: valid decisions, last-wins,
+// missing/invalid failures, fence equivalence, and the loud typed message.
+#[cfg(test)]
+mod verdict_tag_tests {
+    use super::{parse_verdict_tag, verdict_error_message, verdict_of_transcript, VerdictTagError};
+
+    #[test]
+    fn valid_tag_records_accept() {
+        let out = "findings\nVERDICT: accept\n<verdict>{\"decision\":\"accept\"}</verdict>\n";
+        assert_eq!(parse_verdict_tag(out), Ok("accept".to_string()));
+    }
+
+    #[test]
+    fn valid_tag_records_changes_requested() {
+        let out =
+            "findings\nVERDICT: changes_requested\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\n";
+        assert_eq!(parse_verdict_tag(out), Ok("changes_requested".to_string()));
+    }
+
+    #[test]
+    fn last_tag_wins() {
+        let out = "<verdict>{\"decision\":\"accept\"}</verdict>\ndraft corrected\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\n";
+        assert_eq!(parse_verdict_tag(out), Ok("changes_requested".to_string()));
+    }
+
+    #[test]
+    fn missing_tag_is_missing() {
+        assert_eq!(
+            parse_verdict_tag("findings\nVERDICT: accept\n"),
+            Err(VerdictTagError::Missing)
+        );
+        assert_eq!(parse_verdict_tag(""), Err(VerdictTagError::Missing));
+        // Unclosed tag is not a tag.
+        assert_eq!(
+            parse_verdict_tag("<verdict>{\"decision\":\"accept\"}\n"),
+            Err(VerdictTagError::Missing)
+        );
+    }
+
+    #[test]
+    fn bad_json_is_invalid_with_raw_text() {
+        let out = "<verdict>{not json</verdict>";
+        match parse_verdict_tag(out) {
+            Err(VerdictTagError::Invalid { raw, reason }) => {
+                assert_eq!(raw, "{not json");
+                assert!(reason.contains("bad JSON"), "{reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_decision_is_invalid_with_raw_text() {
+        let out = "<verdict>{\"decision\":\"maybe\"}</verdict>";
+        match parse_verdict_tag(out) {
+            Err(VerdictTagError::Invalid { raw, reason }) => {
+                assert_eq!(raw, "{\"decision\":\"maybe\"}");
+                assert!(reason.contains("unknown decision"), "{reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_decision_field_is_invalid() {
+        match parse_verdict_tag("<verdict>{\"foo\":1}</verdict>") {
+            Err(VerdictTagError::Invalid { reason, .. }) => {
+                assert!(reason.contains("decision"), "{reason}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fenced_body_reads_same_as_bare() {
+        let bare = "<verdict>{\"decision\":\"accept\"}</verdict>";
+        let fenced = "<verdict>\n```json\n{\"decision\":\"accept\"}\n```\n</verdict>";
+        let plain_fence = "<verdict>\n```\n{\"decision\":\"accept\"}\n```\n</verdict>";
+        assert_eq!(parse_verdict_tag(bare), Ok("accept".to_string()));
+        assert_eq!(parse_verdict_tag(fenced), parse_verdict_tag(bare));
+        assert_eq!(parse_verdict_tag(plain_fence), parse_verdict_tag(bare));
+    }
+
+    #[test]
+    fn error_message_names_ticket_attempt_and_report() {
+        let missing = verdict_error_message(105, 2, "/tmp/R", &VerdictTagError::Missing);
+        assert!(missing.contains("#105"), "{missing}");
+        assert!(missing.contains("attempt 2"), "{missing}");
+        assert!(missing.contains("/tmp/R"), "{missing}");
+        let invalid = verdict_error_message(
+            105,
+            2,
+            "/tmp/R",
+            &VerdictTagError::Invalid {
+                raw: "{oops".to_string(),
+                reason: "bad JSON".to_string(),
+            },
+        );
+        assert!(invalid.contains("#105"), "{invalid}");
+        assert!(invalid.contains("attempt 2"), "{invalid}");
+        assert!(invalid.contains("/tmp/R"), "{invalid}");
+        assert!(invalid.contains("{oops"), "{invalid}");
+    }
+
+    #[test]
+    fn transcript_prefers_tag_falls_back_to_legacy_line() {
+        // Tag present: authoritative even when the human line disagrees.
+        let mixed = "VERDICT: accept\n<verdict>{\"decision\":\"changes_requested\"}</verdict>\n";
+        assert_eq!(
+            verdict_of_transcript(mixed),
+            Some("changes_requested".to_string())
+        );
+        // Pre-tag transcript: legacy line still reads.
+        assert_eq!(
+            verdict_of_transcript("notes\nVERDICT: accept\n"),
+            Some("accept".to_string())
+        );
+        assert_eq!(verdict_of_transcript("nothing here\n"), None);
     }
 }
