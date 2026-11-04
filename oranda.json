@@ -1,0 +1,33 @@
+{
+  "$schema": "https://github.com/axodotdev/oranda/releases/latest/download/oranda-config-schema.json",
+  "project": {
+    "name": "factory",
+    "description": "swefactory — the software factory as a product (single static binary)",
+    "repository": "https://github.com/mrdankuta/swefactory",
+    "homepage": "https://mrdankuta.github.io/swefactory/",
+    "readme_path": "swefactory/README.md"
+  },
+  "build": {
+    "path_prefix": "swefactory"
+  },
+  "styles": {
+    "theme": "axodark"
+  },
+  "components": {
+    "artifacts": {
+      "cargo_dist": true,
+      "package_managers": {
+        "preferred": {
+          "shell": "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mrdankuta/swefactory/releases/latest/download/factory-installer.sh | sh"
+        },
+        "additional": {
+          "powershell": "irm https://github.com/mrdankuta/swefactory/releases/latest/download/factory-installer.ps1 | iex",
+          "homebrew": "brew install https://github.com/mrdankuta/swefactory/releases/latest/download/factory.rb"
+        }
+      }
+    },
+    "changelog": false,
+    "mdbook": false,
+    "funding": false
+  }
+}
