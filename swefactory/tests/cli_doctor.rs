@@ -72,6 +72,11 @@ if [ "$FIXTURE_RUSTC" = "fail" ]; then echo "no rustc" >&2; exit 1; fi
 echo "rustc 9.9.9-test"; exit 0
 "#;
 
+const FAKE_HC: &str = r#"
+if [ "$FIXTURE_HC" = "fail" ]; then echo "no hc" >&2; exit 1; fi
+echo "hc 9.9.9-test"; exit 0
+"#;
+
 struct Sandbox {
     dir: PathBuf,
     bin: PathBuf,
@@ -90,6 +95,7 @@ impl Sandbox {
         let pi = write_script(&bin, "pi", FAKE_PI);
         write_script(&bin, "cargo", FAKE_CARGO);
         write_script(&bin, "rustc", FAKE_RUSTC);
+        write_script(&bin, "hc", FAKE_HC);
         let _ = (gh, git, pi);
         let state = dir.join("state");
         fs::create_dir_all(&state).unwrap();
@@ -126,6 +132,10 @@ impl Sandbox {
         cmd.env(
             "FACTORY_PI_BIN",
             self.bin.join("pi").to_string_lossy().to_string(),
+        );
+        cmd.env(
+            "FACTORY_HC_BIN",
+            self.bin.join("hc").to_string_lossy().to_string(),
         );
         cmd.env(
             "FACTORY_CHECK_ADAPTER",
@@ -172,6 +182,7 @@ const EXPECTED_NAMES: &[&str] = &[
     "adapter-executable",
     "toolchain",
     "model-runner",
+    "agent-runtime",
 ];
 
 #[test]
@@ -324,6 +335,40 @@ fn doctor_unreachable_runner_fails() {
         Sandbox::text(&out).contains("model-runner"),
         "must name model-runner, got:\n{}",
         Sandbox::text(&out)
+    );
+}
+
+#[test]
+fn doctor_missing_agent_runtime_fails_naming_fix() {
+    let sb = Sandbox::healthy("no-hc");
+    let mut cmd = sb.cmd(false);
+    cmd.env("FACTORY_HC_BIN", "/nonexistent/hc-fixture");
+    let out = cmd.output().unwrap();
+
+    assert!(!out.status.success());
+    let text = Sandbox::text(&out);
+    assert!(
+        text.contains("agent-runtime"),
+        "must name agent-runtime, got:\n{text}"
+    );
+    assert!(
+        text.contains("herdr.dev/core") || text.contains("FACTORY_HC_BIN"),
+        "must name the fix, got:\n{text}"
+    );
+}
+
+#[test]
+fn doctor_agent_runtime_reports_session() {
+    let sb = Sandbox::healthy("hc-session");
+    let mut cmd = sb.cmd(false);
+    cmd.env("HC_SESSION", "ticket-123");
+    let out = cmd.output().unwrap();
+
+    assert!(out.status.success());
+    let text = Sandbox::text(&out);
+    assert!(
+        text.contains("ticket-123"),
+        "must report the hc session, got:\n{text}"
     );
 }
 

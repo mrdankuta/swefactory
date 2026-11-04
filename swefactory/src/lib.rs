@@ -6541,6 +6541,7 @@ const DOCTOR_ORDER: &[&str] = &[
     "adapter-executable",
     "toolchain",
     "model-runner",
+    "agent-runtime",
 ];
 
 #[derive(Serialize, Clone)]
@@ -6956,6 +6957,32 @@ pub fn doctor_checks() -> Vec<DoctorCheck> {
         ),
     });
 
+    // agent-runtime: the hc sidecar must answer. Reports the version and
+    // the session this process would use, so a daemon/UI/CLI session
+    // mismatch is visible instead of silent (different sessions see
+    // different terminal worlds). Read-only: `hc --version` only.
+    let hc_version = probe_stdout(&hc_bin(), &["--version"]);
+    let hc_session = std::env::var("HC_SESSION").unwrap_or_else(|_| "(default)".to_string());
+    checks.push(match hc_version {
+        Some(v) => doctor_pass(
+            "agent-runtime",
+            format!(
+                "Agent runtime answers ({}; session {}).",
+                v.split('\n').next().unwrap_or(&hc_bin()),
+                hc_session
+            ),
+        ),
+        None => doctor_fail(
+            "agent-runtime",
+            format!(
+                "Agent runtime `{}` not found or not responding — persistent-terminal dispatch is unavailable.",
+                hc_bin()
+            ),
+            "Install herdr-core (https://herdr.dev/core) on PATH as `hc` (or point FACTORY_HC_BIN at it); agree on one HC_SESSION for daemon, UI, and CLI — then re-run: factory doctor"
+                .to_string(),
+        ),
+    });
+
     debug_assert_eq!(
         checks.iter().map(|c| c.name).collect::<Vec<_>>(),
         DOCTOR_ORDER,
@@ -6964,6 +6991,14 @@ pub fn doctor_checks() -> Vec<DoctorCheck> {
     checks
 }
 
+/// Sidecar contract (ticket #123): herdr-core (`hc`) owns terminal
+/// liveness — persistent terminals, delegation, waits, remote machines.
+/// The factory owns audit and product decisions — the dispatch ledger,
+/// spec freeze hashes, train membership, land. Doctor only probes that
+/// the sidecar answers and reports which session this process would use
+/// (`HC_SESSION`, else the core default): daemon, UI server, and CLI
+/// must agree on it or they see different terminal worlds.
+///
 /// Exit 0 iff every check passes, else 1 — the green/red answer.
 /// With `fix`, safe local repairs apply first and both the human report
 /// and JSON list them under `fixed:` / `fixed`.
@@ -8359,6 +8394,13 @@ fn attempt_background_running(ledger: &DispatchLedger, ticket: u64, attempt: u64
 /// Overridable via FACTORY_PI_BIN for hermetic tests.
 fn pi_bin() -> String {
     std::env::var("FACTORY_PI_BIN").unwrap_or_else(|_| "pi".to_string())
+}
+
+/// Agent-runtime seam: herdr-core's `hc` CLI (sidecar: core owns terminal
+/// liveness, the dispatch ledger owns audit). Shell out only, never an API
+/// client. Overridable via FACTORY_HC_BIN for hermetic tests.
+fn hc_bin() -> String {
+    std::env::var("FACTORY_HC_BIN").unwrap_or_else(|_| "hc".to_string())
 }
 
 /// State root: FACTORY_STATE_DIR, else <cwd>/factory/.state.

@@ -89,6 +89,10 @@ const FAKE_RUSTC: &str = r#"
 echo "rustc 9.9.9-test"; exit 0
 "#;
 
+const FAKE_HC: &str = r#"
+echo "hc 9.9.9-test"; exit 0
+"#;
+
 struct Sandbox {
     dir: PathBuf,
     bin: PathBuf,
@@ -112,6 +116,7 @@ impl Sandbox {
         write_script(&bin, "pi", FAKE_PI);
         write_script(&bin, "cargo", FAKE_CARGO);
         write_script(&bin, "rustc", FAKE_RUSTC);
+        write_script(&bin, "hc", FAKE_HC);
         Self {
             state: dir.join("state"),
             gh_log: dir.join("gh-calls.log"),
@@ -150,6 +155,10 @@ impl Sandbox {
         cmd.env(
             "FACTORY_PI_BIN",
             self.bin.join("pi").to_string_lossy().to_string(),
+        );
+        cmd.env(
+            "FACTORY_HC_BIN",
+            self.bin.join("hc").to_string_lossy().to_string(),
         );
         cmd.env(
             "FACTORY_STATE_DIR",
@@ -198,6 +207,7 @@ const EXPECTED_NAMES: &[&str] = &[
     "adapter-executable",
     "toolchain",
     "model-runner",
+    "agent-runtime",
 ];
 
 /// AC: --fix repairs dirs, metadata, and project files; report shows what changed.
