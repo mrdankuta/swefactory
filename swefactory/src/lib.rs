@@ -4431,6 +4431,153 @@ fn stream_html_envelope(html: &str) -> String {
         .unwrap_or_else(|_| "{\"html\":\"\"}".to_string())
 }
 
+/// Shared per-scope snapshot cache (ticket #142): N simultaneous
+/// connections on one scope share a single fragment render for the same
+/// state instead of forking `gh`/`git` per connection per tick. Entries
+/// are fresh for one change-detection tick; concurrent attaches inside
+/// the window read the cached bytes. Stale entries are still served when
+/// a render is already outstanding (skip ticks while a render is in
+/// flight), so a starved runtime degrades to fewer deltas, never a
+/// silent stream past the deadline.
+fn stream_cache_key(scope: &StreamScope) -> String {
+    let env = [
+        std::env::var("FACTORY_STATE_DIR").unwrap_or_default(),
+        std::env::var("FACTORY_GH_BIN").unwrap_or_default(),
+        std::env::var("FACTORY_GIT_BIN").unwrap_or_default(),
+    ]
+    .join("\0");
+    let scope_part = match scope {
+        StreamScope::Board => "board".to_string(),
+        StreamScope::Ticket { number, .. } => format!("ticket:{number}"),
+        StreamScope::DispatcherLive => "dispatch".to_string(),
+    };
+    format!("{scope_part}\0{env}")
+}
+
+/// Cheap fingerprint of the ledger state backing every scope (no
+/// subprocesses): the dispatch ledger bytes plus log file sizes/mtimes.
+/// Board/gh/git outputs only move with dispatcher activity in practice,
+/// and a staleness cap below bounds any residual drift to one keepalive.
+fn stream_state_fingerprint() -> String {
+    let dir = std::env::var("FACTORY_STATE_DIR").unwrap_or_default();
+    if dir.is_empty() {
+        return String::new();
+    }
+    let mut fp = String::new();
+    let ledger = std::path::Path::new(&dir).join("dispatch.json");
+    fp.push_str(&std::fs::read_to_string(&ledger).unwrap_or_default());
+    fp.push('\0');
+    let logs = std::path::Path::new(&dir).join("logs");
+    if let Ok(entries) = std::fs::read_dir(&logs) {
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            let path = logs.join(&name);
+            let meta = std::fs::metadata(&path);
+            let (len, mtime) = match meta {
+                Ok(m) => (
+                    m.len(),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                ),
+                Err(_) => (0, 0),
+            };
+            fp.push_str(&format!("{name}:{len}:{mtime}\0"));
+        }
+    }
+    fp
+}
+
+/// Cached snapshot bytes per scope key: html, commit state, ledger
+/// fingerprint, and render time.
+type StreamSnapshotEntry = (String, serde_json::Value, String, std::time::Instant);
+type StreamSnapshotCache = std::sync::Mutex<std::collections::HashMap<String, StreamSnapshotEntry>>;
+
+fn stream_cache_store() -> &'static StreamSnapshotCache {
+    static STORE: std::sync::OnceLock<StreamSnapshotCache> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn stream_inflight_store() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    INFLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Cached render for one scope: entries are shared across connections
+/// while the ledger fingerprint is unchanged (a quiet loop costs one
+/// fingerprint read per tick, not N subprocess renders). A moved
+/// fingerprint re-renders once (concurrent callers singleflight onto
+/// the outstanding render); entries older than `stale_after_ms` also
+/// re-render to bound drift from non-ledger seams. While a render is
+/// outstanding, tick callers read the stale bytes so the stream degrades
+/// to fewer deltas, never silence.
+fn stream_cached_snapshot(
+    key: &str,
+    stale_after_ms: u64,
+    render: impl FnOnce() -> (String, serde_json::Value),
+) -> (String, serde_json::Value) {
+    let fingerprint = stream_state_fingerprint();
+    if let Some((html, state, _, _)) = stream_cache_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .filter(|(_, _, fp, at)| {
+            *fp == fingerprint && at.elapsed().as_millis() < u128::from(stale_after_ms.max(1))
+        })
+        .map(|(h, s, fp, at)| (h.clone(), s.clone(), fp.clone(), *at))
+    {
+        return (html, state);
+    }
+    // Skip ticks while a render is outstanding: serve stale bytes so
+    // the stream degrades to fewer deltas, never silence. A caller with
+    // no bytes at all renders directly (rare first-attach race: two
+    // simultaneous fresh attaches may render twice, then share).
+    if stream_inflight_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(key)
+    {
+        if let Some((html, state, _, _)) = stream_cache_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|(h, s, fp, at)| (h.clone(), s.clone(), fp.clone(), *at))
+        {
+            return (html, state);
+        }
+    }
+    stream_inflight_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string());
+    let (html, state) = render();
+    let fingerprint = stream_state_fingerprint();
+    stream_inflight_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(key);
+    stream_cache_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            key.to_string(),
+            (
+                html.clone(),
+                state.clone(),
+                fingerprint,
+                std::time::Instant::now(),
+            ),
+        );
+    (html, state)
+}
+
 /// Spawn the per-connection producer and return its channel: hello,
 /// then a whole snapshot, then a delta whenever the scope's fragment
 /// bytes move. Read-only: the producer only re-reads the polling seams.
@@ -4459,7 +4606,12 @@ fn spawn_stream_producer(
         ) {
             return;
         }
-        let (mut last_html, mut last_state) = scope.snapshot();
+        let scope_key = stream_cache_key(&scope);
+        // Staleness cap is one keepalive: the documented bound two
+        // viewers may disagree by. Quiet loops share one render per
+        // cap window instead of one fork storm per connection per tick.
+        let (mut last_html, mut last_state) =
+            stream_cached_snapshot(&scope_key, keepalive_ms, || scope.snapshot());
         let mut seq: u64 = 0;
         if !producer.push(
             axum::response::sse::Event::default()
@@ -4480,7 +4632,8 @@ fn spawn_stream_producer(
             if producer.is_closed() {
                 return;
             }
-            let (now_html, now_state) = scope.snapshot();
+            let (now_html, now_state) =
+                stream_cached_snapshot(&scope_key, keepalive_ms, || scope.snapshot());
             if now_html != last_html {
                 seq += 1;
                 let mut changes = scope.summarize_change(&last_state, &now_state);
@@ -20046,6 +20199,74 @@ mod stream_backpressure_tests {
             ),
             "then the server ends the stream instead of idling"
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_snapshot_cache_tests {
+    use super::stream_cached_snapshot;
+
+    #[test]
+    fn simultaneous_scopes_share_a_single_render() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = format!(
+            "test-share-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let render = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                "<section>live</section>".to_string(),
+                serde_json::json!({"v": 1}),
+            )
+        };
+        // Two simultaneous connections on one scope: the second reads
+        // the cached bytes instead of re-rendering.
+        let first = stream_cached_snapshot(&key, 60_000, render);
+        let calls2 = calls.clone();
+        let second = stream_cached_snapshot(&key, 60_000, || {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                "<section>other</section>".to_string(),
+                serde_json::json!({"v": 2}),
+            )
+        });
+        assert_eq!(first.0, second.0, "both viewers read identical live state");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_bytes_served_while_render_outstanding() {
+        let key = format!(
+            "test-inflight-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let seed = stream_cached_snapshot(&key, 1, || {
+            (
+                "<section>stale</section>".to_string(),
+                serde_json::json!({"v": 1}),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Simulate a render already in flight for this scope.
+        super::stream_inflight_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        let served = stream_cached_snapshot(&key, 1, || {
+            panic!("must not render while another render is outstanding")
+        });
+        super::stream_inflight_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        assert_eq!(served.0, seed.0, "degrades to fewer deltas, never silence");
     }
 }
 
