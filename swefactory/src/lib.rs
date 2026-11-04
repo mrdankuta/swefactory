@@ -1427,6 +1427,42 @@ pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
     html
 }
 
+/// Left-rail project switcher HTML (ticket #140): lists factory repos;
+/// selecting one scopes board + agents + detail (the `data-scopes` +
+/// `data-active-project` contract the client reads). Pure over inputs.
+pub fn desktop_project_switcher_html(projects: &[String], active: Option<&str>) -> String {
+    let active = active.unwrap_or("");
+    let mut html = format!(
+        "<nav data-project-switcher data-active-project=\"{}\" data-scopes=\"board agents detail\">",
+        escape_html(active)
+    );
+    for p in projects {
+        let sel = if p.as_str() == active {
+            "true"
+        } else {
+            "false"
+        };
+        html.push_str(&format!(
+            "<button data-project=\"{}\" data-selected=\"{}\">{}</button>",
+            escape_html(p),
+            sel,
+            escape_html(p)
+        ));
+    }
+    html.push_str("</nav>");
+    html
+}
+
+/// Settings Privacy telemetry toggle (ticket #140): reflects
+/// `telemetry_enabled` (`checked` = on by default in releases).
+/// Pure over the enabled flag. Escaping is unnecessary (no input).
+pub fn desktop_settings_privacy_html(telemetry_on: bool) -> String {
+    format!(
+        "<section data-settings-privacy><label>Usage telemetry<input type=\"checkbox\" data-telemetry-toggle{}></label></section>",
+        if telemetry_on { " checked" } else { "" }
+    )
+}
+
 // --- ticket detail (ticket #30, spec #27) ---------------------------------
 //
 // Bea taps a board card and lands here: the issue body in plain words,
@@ -1623,6 +1659,246 @@ pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
             "partial": p.partial,
         })),
     })
+}
+
+// --- ticket detail + Run buttons (ticket #138, spec #135) ------------------
+//
+// The detail pane joins three seams: the tracker (`BoardIssue` via the
+// `gh` seam), the watched factory cache (freeze hash from
+// `factory/.cache/SPEC-<spec>.md`, the file the daemon file-watches),
+// and `hc` terminal state (per-attempt terminals). Run buttons invoke
+// the existing command functions directly (`cmd_sync`, the check
+// adapter the `check` command runs, `cmd_handoff`) and map the exit to
+// an inline pass/fail with the cause named. UI copy uses the domain
+// glossary terms exactly (AgentRunner, session identity, verdict tag).
+
+/// Spec issue whose freeze the detail pane carries (spec #135).
+pub const TICKET_SPEC_ISSUE: u64 = 135;
+
+/// Inline Run-button result: pass/fail plus the named cause, matching
+/// CLI exit semantics (0 means pass).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TicketRunOutcome {
+    pub command: String,
+    pub passed: bool,
+    pub cause: String,
+}
+
+/// Pure exit-to-outcome mapping so tests assert the inline
+/// pass/fail without spawning commands. Empty causes fall back to the
+/// command's own exit wording.
+pub fn run_outcome(command: &str, code: i32, cause: &str) -> TicketRunOutcome {
+    let cause = cause.trim();
+    TicketRunOutcome {
+        command: command.to_string(),
+        passed: code == 0,
+        cause: if cause.is_empty() {
+            if code == 0 {
+                format!("{command} passed")
+            } else {
+                format!("{command} failed with exit {code}")
+            }
+        } else {
+            cause.to_string()
+        },
+    }
+}
+
+/// Freeze hash from the watched factory cache (the file-watched join:
+/// `factory sync` writes it, the daemon re-reads it). `None` when the
+/// cache is absent or has no hash yet.
+pub fn ticket_freeze_hash() -> Option<String> {
+    let (hash, _) = read_cache(TICKET_SPEC_ISSUE)?;
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
+/// Calm sentence when the watched cache has no freeze yet.
+pub fn ticket_freeze_missing_sentence() -> &'static str {
+    "No spec freeze cached yet \u{2014} run factory sync 135 to snapshot the approved spec."
+}
+
+/// Acceptance criteria: the `- [ ]` checklist lines under the
+/// `## Acceptance criteria` heading of the ticket body. Empty when the
+/// ticket carries no checklist.
+pub fn ticket_acceptance_criteria(body: &str) -> Vec<String> {
+    let mut criteria = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#") {
+            in_section =
+                trimmed.trim_start_matches('#').trim().to_lowercase() == "acceptance criteria";
+            continue;
+        }
+        if in_section {
+            let item = trimmed
+                .strip_prefix("- [ ]")
+                .or_else(|| trimmed.strip_prefix("- [x]"))
+                .or_else(|| trimmed.strip_prefix("- [X]"))
+                .map(str::trim);
+            if let Some(item) = item {
+                if !item.is_empty() {
+                    criteria.push(item.to_string());
+                }
+            }
+        }
+    }
+    criteria
+}
+
+/// Latest checks output for the detail: the newest attempt's summary
+/// plus its `hc` terminal (the `hc` seam join), or the calm
+/// no-attempts sentence when nothing has run yet.
+pub fn ticket_checks_output(detail: &TicketDetail) -> String {
+    match detail.attempts.first() {
+        None => ticket_no_attempts_sentence().to_string(),
+        Some(latest) => {
+            let terminals = board_attempt_terminals();
+            let terminal = terminals
+                .get(&detail.number)
+                .map(|t| format!(" (hc terminal: {t})"))
+                .unwrap_or_default();
+            format!(
+                "attempt {}: {} (exit {}){terminal}",
+                latest.attempt_no, latest.summary, latest.exit_code
+            )
+        }
+    }
+}
+
+/// Run `sync` for the ticket through the existing command function and
+/// map its exit to an inline outcome with the cause named.
+pub fn ticket_run_sync(issue: &str) -> TicketRunOutcome {
+    let code = cmd_sync(false, issue);
+    run_outcome(
+        "sync",
+        code,
+        if code == 0 {
+            "sync passed \u{2014} freeze matches the watched factory cache"
+        } else {
+            "sync failed \u{2014} freeze drift or unreachable tracker"
+        },
+    )
+}
+
+/// Run the check adapter (the same script `factory check` discovers
+/// via `$FACTORY_CHECK_ADAPTER` or `scripts/factory-check`) and map
+/// its exit to an inline outcome. `run_check` diverges via process
+/// exit, so the backend spawns the adapter instead of calling it.
+pub fn ticket_run_check() -> TicketRunOutcome {
+    let adapter = std::env::var_os("FACTORY_CHECK_ADAPTER")
+        .map(std::path::PathBuf::from)
+        .or_else(discover_adapter);
+    let Some(adapter) = adapter else {
+        return run_outcome("check", 1, "check failed \u{2014} no check adapter found");
+    };
+    let status = std::process::Command::new(&adapter).status();
+    match status {
+        Ok(s) if s.success() => run_outcome("check", 0, "check passed"),
+        Ok(s) => run_outcome(
+            "check",
+            s.code().unwrap_or(1),
+            &format!(
+                "check failed \u{2014} adapter {} exited {}",
+                adapter.display(),
+                s
+            ),
+        ),
+        Err(e) => run_outcome("check", 1, &format!("check failed \u{2014} {e}")),
+    }
+}
+
+/// Run `handoff` for the ticket through the existing command function
+/// and map its exit to an inline outcome with the cause named.
+pub fn ticket_run_handoff(issue: &str, signal: &str) -> TicketRunOutcome {
+    let code = cmd_handoff(issue, signal, None, false);
+    run_outcome(
+        "handoff",
+        code,
+        if code == 0 {
+            "handoff passed \u{2014} handoff posted to the ticket issue"
+        } else {
+            "handoff failed \u{2014} tracker unreachable or bad signal"
+        },
+    )
+}
+
+/// Detail-plus-runs fragment: the existing detail fragment followed by
+/// the freeze/criteria/checks join and the Run buttons. Pure over the
+/// detail plus the watched-cache freeze so tests assert markers
+/// without a server: `data-freeze-hash` (or `data-freeze-missing`),
+/// `data-acceptance-criteria` with one `data-criterion` per item,
+/// `data-checks-output`, and one `data-run` button per command.
+/// The runner note names the AgentRunner seam, the session identity
+/// join, and the verdict tag payload with glossary-exact terms.
+pub fn ticket_detail_runs_fragment_html(
+    detail: &TicketDetail,
+    freeze_hash: Option<&str>,
+) -> String {
+    let mut html = ticket_detail_fragment_html(detail);
+    html.push_str("<section data-detail-runs>");
+    match freeze_hash {
+        Some(hash) => html.push_str(&format!(
+            "<p data-freeze-hash>Spec freeze <code>{}</code> from the watched factory cache.</p>",
+            escape_html(hash)
+        )),
+        None => html.push_str(&format!(
+            "<p data-freeze-missing>{}</p>",
+            ticket_freeze_missing_sentence()
+        )),
+    }
+    let criteria = ticket_acceptance_criteria(&detail.body);
+    if criteria.is_empty() {
+        html.push_str(
+            "<p data-acceptance-criteria-empty>No acceptance criteria listed on this ticket.</p>",
+        );
+    } else {
+        html.push_str("<ul data-acceptance-criteria>");
+        for item in &criteria {
+            html.push_str(&format!("<li data-criterion>{}</li>", escape_html(item)));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str(&format!(
+        "<pre data-checks-output>{}</pre>",
+        escape_html(&ticket_checks_output(detail))
+    ));
+    html.push_str("<div data-run-buttons>");
+    for command in ["sync", "check", "handoff"] {
+        html.push_str(&format!(
+            "<button data-run=\"{command}\" data-ticket=\"{}\">Run {command}</button>",
+            detail.number
+        ));
+    }
+    html.push_str("</div>");
+    html.push_str("<p data-runner-note>Runs execute through the AgentRunner seam; results join the session identity ledger with the latest verdict tag.</p>");
+    html.push_str("</section>");
+    html
+}
+
+/// JSON view for the detail-plus-runs pane: the existing detail JSON
+/// joined with the watched-cache freeze, acceptance criteria, and
+/// latest checks output.
+pub fn ticket_detail_runs_json(
+    detail: &TicketDetail,
+    freeze_hash: Option<&str>,
+) -> serde_json::Value {
+    let mut value = ticket_detail_json(detail);
+    value["freeze_hash"] = freeze_hash
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    value["acceptance_criteria"] = serde_json::Value::Array(
+        ticket_acceptance_criteria(&detail.body)
+            .into_iter()
+            .map(serde_json::Value::from)
+            .collect(),
+    );
+    value["checks_output"] = serde_json::Value::from(ticket_checks_output(detail));
+    value
 }
 
 /// Fragment HTML for one ticket (the polling unit). Pure over the detail
@@ -20239,7 +20515,8 @@ fn extract_approved_hash(body: &str) -> Option<String> {
 }
 
 fn cache_path(number: u64) -> String {
-    format!("factory/.cache/SPEC-{number}.md")
+    let base = std::env::var("FACTORY_CACHE_DIR").unwrap_or_else(|_| "factory/.cache".to_string());
+    format!("{base}/SPEC-{number}.md")
 }
 
 fn write_cache(view: &IssueView, hash: &str) -> Result<String, String> {
