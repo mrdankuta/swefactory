@@ -5,6 +5,41 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+## 0.1.0-rc.12 — desktop client backend + compilable Tauri shell
+
+### Desktop client backend (spec #135, tickets #136–#142)
+
+- Agents presence + peek seam over `hc`: `AgentTerminal` sidebar sort,
+  OSC-7501-only presence, peek attach/detach, resync snapshot+replay.
+- Desktop board feed: label-driven columns, 30–60s poll clamp,
+  stale-banner re-serve, read-only `gh issue list` transport, card
+  selection scoping the detail pane.
+- Ticket detail + Run buttons: freeze hash from the watched factory
+  cache joined with tracker + `hc` state, acceptance criteria, checks
+  output; `ticket_run_sync/check/handoff` invoke the existing command
+  functions with inline pass/fail + named cause.
+- Project switcher (`factory projects`), `hc` core usability probe +
+  guided upgrade, background-update contract, telemetry on-by-default
+  with Settings opt-out (`factory telemetry`), gh-auth/SSH reuse.
+- Review auto-spawn + verdict routing: kept `hc` review terminal,
+  diff summary + schema-validated verdict tag payload (last-match-wins)
+  + findings, Accept → accepted/land, Request-changes → To Do.
+- Shared render loop per stream scope with per-viewer change detection;
+  renders moved off the async runtime (`spawn_blocking`); new
+  render-sharing and churn regression tests.
+
+### Compilable Tauri shell (spec #149, tickets #150–#156)
+
+- New `shell/src-tauri` crate: 15 `#[tauri::command]` handlers calling
+  `factory_lib` in-process, `invoke_handler` wired, `main` boots via
+  `generate_context!`; build script validates config and provisions the
+  gitignored `hc` sidecar binary.
+- `shell/index.html` mounts (left rail, board, detail + Run buttons,
+  peek) wired to the backend commands; `shell/tauri.conf.json` kept
+  schema-valid as the single source (bundling per release pipeline).
+- `TicketRunOutcome`, `AgentTerminal`, `AgentPresence` gain serde;
+  new `hc_terminal_list_json` seam for the agents sidebar.
+
 ## 0.1.0-rc.11 — herdr-core sidecar: persistent-terminal dispatch
 
 ### herdr-core sidecar: persistent-terminal dispatch (tickets #123–#128)
