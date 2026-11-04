@@ -8102,6 +8102,70 @@ struct DispatchAttempt {
     /// surface liveness even if the dispatcher never returns.
     #[serde(default)]
     terminal: String,
+    /// Build backend that ran this attempt (spec #112, ticket #116):
+    /// `"host"` for the default backend. `#[serde(default)]` keeps
+    /// pre-backend ledgers parsing (absent reads as host, the only
+    /// backend that ever ran them).
+    #[serde(default = "default_backend_name")]
+    backend: String,
+}
+
+/// Default build backend name (spec #112): the host. Every attempt
+/// records this unless a future backend opt-in overrides it.
+pub fn default_backend_name() -> String {
+    "host".to_string()
+}
+
+/// Build backend seam (spec #112, ticket #116): one trait that runs an
+/// attempt command against its worktree and streams output line by line
+/// into the existing live-log path. The host is the default
+/// implementation (today's behavior, zero change); Docker/Podman arrive
+/// as later implementations behind the same seam.
+pub trait HermeticBuild {
+    /// Backend identity recorded per attempt (`host`, `docker`, ...).
+    fn backend_name(&self) -> &'static str;
+    /// Spawn the attempt command. Implementations set cwd, slot env,
+    /// and tmpdir exactly like the historical host path; streaming,
+    /// timeouts, and exit-code handling stay in `run_phase`.
+    fn spawn(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        slot: &str,
+        tmpdir: &std::path::Path,
+    ) -> std::io::Result<std::process::Child>;
+}
+
+/// Default host backend: today's behavior, byte-identical.
+pub struct HostBackend;
+
+impl HermeticBuild for HostBackend {
+    fn backend_name(&self) -> &'static str {
+        "host"
+    }
+    fn spawn(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        slot: &str,
+        tmpdir: &std::path::Path,
+    ) -> std::io::Result<std::process::Child> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .env("FACTORY_SLOT", slot)
+            .env("TMPDIR", tmpdir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.spawn()
+    }
 }
 
 #[derive(Serialize, serde::Deserialize, Default)]
@@ -9610,6 +9674,7 @@ mod hc_spike_tests {
 /// viewers within that bound with no SSE code change.
 #[allow(clippy::too_many_arguments)]
 fn run_phase(
+    backend: &dyn HermeticBuild,
     program: &str,
     args: &[&str],
     cwd: &std::path::Path,
@@ -9626,19 +9691,7 @@ fn run_phase(
     // mid-stream kill leaves header + flushed lines as a prefix of the
     // completed shape (append-only from here: flushed bytes never move).
     append_log_append(log, &format!("--- {phase} {slot} running ---\n"));
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("FACTORY_SLOT", slot)
-        .env("TMPDIR", tmpdir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = match cmd.spawn() {
+    let mut child = match backend.spawn(program, args, cwd, slot, tmpdir) {
         Ok(c) => c,
         Err(e) => {
             append_log_append(
@@ -10728,6 +10781,7 @@ fn run_attempt_phases(
             outcome
         } else {
             run_phase(
+                &HostBackend,
                 &pi_bin(),
                 &["-p", &prompt],
                 wt,
@@ -10792,6 +10846,7 @@ fn run_attempt_phases(
         // Verify keeps its own contract (check adapter exit code); only
         // implement/review carry bounded waits (ticket #94).
         let verify_outcome = run_phase(
+            &HostBackend,
             &adapter.to_string_lossy(),
             &[],
             wt,
@@ -10958,6 +11013,7 @@ fn run_attempt_phases(
     }
     println!("  review: pi -p (timeout {}s)", ctx.review_timeout_secs);
     let review_outcome = run_phase(
+        &HostBackend,
         &pi_bin(),
         &["-p", &review_brief],
         &rwt,
@@ -11474,6 +11530,7 @@ fn cmd_dispatch_ticket(
                     timed_out: false,
                     timeout_secs: 0,
                     terminal: String::new(),
+                    backend: default_backend_name(),
                 },
             );
             log_event(&log_path, id, ticket, "spec-gate", 1);
@@ -11548,6 +11605,7 @@ fn cmd_dispatch_ticket(
             timed_out: false,
             timeout_secs: 0,
             terminal: String::new(),
+            backend: default_backend_name(),
         },
     );
     // Plan checkpoint: committed before any side-effecting work begins.
@@ -14046,6 +14104,7 @@ pub fn cmd_log(
             "finished": a.finished_at,
             "exit_code": a.exit_code,
             "terminal": a.terminal,
+            "backend": a.backend,
             "live_transcript": live,
             "transcript": shown,
             "truncated": truncated,
@@ -16637,6 +16696,7 @@ fn cutover_attempt(row: &sqlite::Row) -> Result<DispatchAttempt, String> {
         timed_out: false,
         timeout_secs: 0,
         terminal: String::new(),
+        backend: default_backend_name(),
     })
 }
 
@@ -19522,6 +19582,25 @@ pub fn cmd_verify_freeze(json: bool, issue_raw: &str) -> i32 {
 // store: closed releases are terminal history (preserved in the
 // byte-identical archive), and the newest open release wins, mirroring
 // the bash reader (`ORDER BY id DESC LIMIT 1`).
+#[cfg(test)]
+mod backend_tests {
+    use super::{default_backend_name, HermeticBuild, HostBackend};
+
+    #[test]
+    fn host_is_the_default_backend() {
+        assert_eq!(default_backend_name(), "host");
+        assert_eq!(HostBackend.backend_name(), "host");
+    }
+
+    #[test]
+    fn pre_backend_ledgers_read_as_host() {
+        let attempt: super::DispatchAttempt =
+            serde_json::from_str(r#"{"id":1,"ticket":2,"attempt_no":1,"base_commit":"b","branch":"br","worktree":"w","status":"impl_done","log_path":"l","started_at":"s","finished_at":"f"}"#)
+                .unwrap();
+        assert_eq!(attempt.backend, "host");
+    }
+}
+
 #[cfg(test)]
 mod cutover_tests {
     use super::{cutover_attempt, cutover_open_train};
