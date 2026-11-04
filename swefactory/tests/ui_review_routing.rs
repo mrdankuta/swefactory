@@ -57,7 +57,10 @@ fn detail_shows_diff_summary_verdict_payload_and_findings() {
     assert!(html.contains("accept"), "decision: {html}");
     assert!(html.contains("data-findings"), "findings: {html}");
     assert!(html.contains("looks good"), "finding text: {html}");
-    assert!(html.contains("data-review-terminal"), "peekable terminal: {html}");
+    assert!(
+        html.contains("data-review-terminal"),
+        "peekable terminal: {html}"
+    );
     assert!(html.contains("t141-review-a1"), "terminal addr: {html}");
     // Glossary terms exactly.
     assert!(html.contains("AgentRunner"), "glossary: {html}");
@@ -83,10 +86,7 @@ fn accept_routes_to_land_request_changes_to_todo() {
     );
     // Silent reviewers never read as accepted.
     assert_eq!(review_route(None), ReviewRoute::RequestChanges);
-    assert_eq!(
-        review_route_target(review_route(None)),
-        "To Do"
-    );
+    assert_eq!(review_route_target(review_route(None)), "To Do");
 }
 
 #[test]
