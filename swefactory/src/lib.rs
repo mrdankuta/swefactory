@@ -1397,8 +1397,45 @@ pub fn desktop_board_json(feed: &DesktopBoardFeed) -> String {
 /// number + title + marker; a stale feed renders the visible stale banner.
 /// `poll_ms` is clamped into the 30-60s bound.
 pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
+    desktop_board_html_inner(feed, poll_ms, None)
+}
+
+/// Center-board HTML with card selection (ticket #151, spec #149).
+/// Pure over the feed: the selected card (by number) is flagged
+/// `data-selected="true"` and the board carries
+/// `data-selected-card="<n>" data-scopes="detail"` so selecting a card
+/// scopes the detail pane. `None` (or an unknown number) selects nothing.
+/// `poll_ms` is clamped into the 30-60s bound. No client board database:
+/// selection reads the feed only; Issues stay canonical on the tracker.
+pub fn desktop_board_select(feed: &DesktopBoardFeed, number: u64) -> Option<DesktopBoardCard> {
+    feed.columns
+        .iter()
+        .flat_map(|c| c.cards.iter())
+        .find(|c| c.number == number)
+        .cloned()
+}
+
+/// Center-board HTML with selection. Shared render core via
+/// `desktop_board_html_inner`; `None` behaves like [`desktop_board_html`].
+pub fn desktop_board_html_with_selection(
+    feed: &DesktopBoardFeed,
+    poll_ms: u64,
+    selected: Option<u64>,
+) -> String {
+    let picked = selected.and_then(|n| desktop_board_select(feed, n).map(|c| c.number));
+    desktop_board_html_inner(feed, poll_ms, picked)
+}
+
+/// Shared render core for the center board (single copy of the
+/// columns/cards/stale markup). `selected` flags one card with
+/// `data-selected="true"` and scopes the board to the detail pane.
+fn desktop_board_html_inner(feed: &DesktopBoardFeed, poll_ms: u64, picked: Option<u64>) -> String {
     let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
-    let mut html = format!("<section data-desktop-board data-poll-ms=\"{ms}\">");
+    let sel_attr = match picked {
+        Some(n) => format!(" data-selected-card=\"{n}\" data-scopes=\"detail\"").to_string(),
+        None => String::new(),
+    };
+    let mut html = format!("<section data-desktop-board data-poll-ms=\"{ms}\"{sel_attr}>");
     if feed.stale {
         html.push_str(
             "<p data-stale-banner>Tracker unreachable \u{2014} showing the last saved board.</p>",
@@ -1413,8 +1450,13 @@ pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
             col.cards.len()
         ));
         for card in &col.cards {
+            let sel = if Some(card.number) == picked {
+                " data-selected=\"true\""
+            } else {
+                ""
+            };
             html.push_str(&format!(
-                "<article data-card=\"{}\"><h3>#{} {}</h3><p data-marker>{}</p></article>",
+                "<article data-card=\"{}\"{sel}><h3>#{} {}</h3><p data-marker>{}</p></article>",
                 card.number,
                 card.number,
                 escape_html(&card.title),
@@ -1461,6 +1503,168 @@ pub fn desktop_settings_privacy_html(telemetry_on: bool) -> String {
         "<section data-settings-privacy><label>Usage telemetry<input type=\"checkbox\" data-telemetry-toggle{}></label></section>",
         if telemetry_on { " checked" } else { "" }
     )
+}
+
+// --- shell skeleton + left rail (ticket #150, spec #149) -----------------
+//
+// The Tauri desktop shell boots with its Rust backend calling
+// `factory_lib` directly in-process (the same call pattern the web-board
+// handlers already use for board, detail, sync, check, handoff): no
+// separate daemon process, no new API layer. The left rail pairs the
+// project switcher (ticket #140 seam: factory repos under the root;
+// selecting one scopes board + agents + detail in the client) with the
+// agents sidebar (ticket #136 seam: Working/Blocked/Done presence from
+// the Program Status Protocol only, never inferred; seen-Done clears).
+// Click-to-peek renders `hc` read streams inline; closing the window
+// only detaches peek sessions — terminals keep running in the core.
+
+/// Shell boot manifest: proves the shell-plus-seam contract. The Tauri
+/// backend calls `factory_lib` in-process (`backend` names the crate,
+/// `daemon` is null, `api_layer` is none); `hc` owns terminal liveness.
+/// Pure: the `shell/` skeleton maps each Tauri command to the named
+/// `factory_lib` function in this manifest.
+pub fn desktop_shell_boot() -> serde_json::Value {
+    serde_json::json!({
+        "backend": "factory_lib-in-process",
+        "daemon": null,
+        "api_layer": "none",
+        "terminal_owner": "hc-core",
+        "commands": {
+            "list_projects": "list_factory_projects",
+            "agents_snapshot": "agents_resync",
+            "peek_read": "peek_read",
+            "board_feed": "desktop_board_feed",
+            "board_select": "desktop_board_select",
+        },
+    })
+}
+
+/// Window-close policy: closing the window detaches peek sessions only.
+/// Terminals keep running in the core (`detach_all_peeks` flips stream
+/// flags; it never kills anything). Pure over nothing; the contract.
+pub fn desktop_window_close_policy() -> serde_json::Value {
+    serde_json::json!({
+        "on_close": "detach-peeks",
+        "terminals_keep_running": true,
+        "terminal_owner": "hc-core",
+        "on_reopen": "resync-snapshot-replay",
+    })
+}
+
+// --- hc bundling + installers (ticket #152, spec #149) -----------------
+//
+// Installers ship or bootstrap a usable hc core; an unusable core gets a
+// guided upgrade (never a silent break). Background updates download and
+// take over on restart with terminals surviving in the core. Telemetry is
+// on by default in releases with a Settings Privacy opt-out (ticket #140
+// seam). Auth reuses the gh token + SSH config; no credential store.
+
+/// hc core policy: bundled/bootstrap targets plus the unusable-core path.
+/// Pure; the contract the installer reads.
+pub fn desktop_hc_core_policy() -> serde_json::Value {
+    serde_json::json!({
+        "bundled_targets": ["linux-x86_64", "linux-aarch64", "macos-aarch64"],
+        "provision": "ship-or-bootstrap",
+        "unusable_core": "guided-upgrade",
+        "terminal_owner": "hc-core",
+    })
+}
+
+/// Background-update policy: download in the background, take over on
+/// restart; terminals survive because they live in the hc core.
+/// Pure; the contract the Tauri updater sketch reads.
+pub fn desktop_update_policy() -> serde_json::Value {
+    serde_json::json!({
+        "download": "background",
+        "takeover": "on-restart",
+        "terminals_survive": true,
+        "terminal_owner": "hc-core",
+    })
+}
+
+/// Release telemetry default: on in releases; opt-out lives in Settings
+/// Privacy (`desktop_settings_privacy_html` + `telemetry_enabled`).
+/// Pure over nothing; the contract.
+pub fn desktop_release_telemetry_default() -> bool {
+    true
+}
+
+/// Auth policy: reuse the gh token + SSH config; no credential store.
+/// Pure; the contract the shell documents.
+pub fn desktop_auth_policy() -> serde_json::Value {
+    serde_json::json!({
+        "gh_token": "reuse",
+        "ssh_config": "reuse",
+        "credential_store": "none",
+    })
+}
+
+/// Presence word for one sidebar row: OSC 7501 display presence, or
+/// `unknown` when no well-formed sequence was observed — never a guess.
+fn sidebar_presence_word(term: &AgentTerminal) -> &'static str {
+    match term.display_presence() {
+        Some(AgentPresence::Working) => "working",
+        Some(AgentPresence::Blocked) => "blocked",
+        Some(AgentPresence::Done) => "done",
+        None => "unknown",
+    }
+}
+
+/// Agents sidebar HTML: one row per live terminal with its Program
+/// Status Protocol presence. Blocked rows stand out first (`data-blocked
+/// = "true"` for the client highlight); seen-Done rows clear via
+/// `display_presence`, so no `done` badge survives acknowledgement.
+/// Every row carries its peek target (`data-peek` = terminal address).
+/// Pure over the resynced terminal rows.
+pub fn desktop_agents_sidebar_html(terms: &[AgentTerminal]) -> String {
+    let mut html = String::from("<aside data-agents-sidebar>");
+    for t in terms {
+        let presence = sidebar_presence_word(t);
+        html.push_str(&format!(
+            "<button data-agent=\"{}\" data-presence=\"{}\" data-blocked=\"{}\" data-peek=\"{}\">{}</button>",
+            escape_html(&t.address),
+            presence,
+            t.is_blocked(),
+            escape_html(&t.address),
+            escape_html(&t.name),
+        ));
+    }
+    html.push_str("</aside>");
+    html
+}
+
+/// Left rail HTML: project switcher above the agents sidebar. Selecting
+/// a project scopes the client (`data-scopes` + `data-active-project`
+/// contract the client reads). Pure over projects, selection, and rows.
+pub fn desktop_left_rail_html(
+    projects: &[String],
+    active: Option<&str>,
+    terms: &[AgentTerminal],
+) -> String {
+    format!(
+        "<div data-left-rail data-active-project=\"{}\">{}{}</div>",
+        escape_html(active.unwrap_or("")),
+        desktop_project_switcher_html(projects, active),
+        desktop_agents_sidebar_html(terms),
+    )
+}
+
+/// Click-to-peek pane: renders the live terminal screen (`hc read`
+/// output) inline. A failed or empty read renders a calm empty pane
+/// (`data-peek-empty`) instead of erroring; the ledger stays
+/// authoritative. Pure over the address and optional screen text.
+pub fn desktop_peek_html(addr: &str, screen: Option<&str>) -> String {
+    match screen {
+        Some(text) if !text.trim().is_empty() => format!(
+            "<section data-peek-pane=\"{}\"><pre data-peek-live>{}</pre></section>",
+            escape_html(addr),
+            escape_html(text),
+        ),
+        _ => format!(
+            "<section data-peek-pane=\"{}\" data-peek-empty><p>No live output \u{2014} the terminal may have ended; the attempt ledger stays authoritative.</p></section>",
+            escape_html(addr),
+        ),
+    }
 }
 
 // --- ticket detail (ticket #30, spec #27) ---------------------------------

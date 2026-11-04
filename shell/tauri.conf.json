@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Factory",
+  "version": "0.1.0",
+  "identifier": "com.factory.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Factory",
+        "width": 1280,
+        "height": 800,
+        "onClose": "detach-peeks"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "dmg", "nsis"],
+    "resources": [],
+    "externalBin": ["bin/hc"]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "downloadInBackground": true,
+      "installOnRestart": true
+    }
+  }
+}
