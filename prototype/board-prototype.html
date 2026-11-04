@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!-- PROTOTYPE — throwaway, wipe me. Answers #134: what should board + ticket detail + Run buttons look like? -->
+<html><head><meta charset="utf-8"><title>factory board prototype</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}
+.bar{position:fixed;bottom:0;left:0;right:0;background:#222;padding:8px;display:flex;gap:8px;justify-content:center}
+.bar a{color:#fff;background:#444;padding:6px 12px;border-radius:6px;text-decoration:none}
+.bar a.on{background:#0a84ff}
+.cols{display:flex;gap:12px;padding:16px 16px 60px}
+.col{flex:1;background:#1c1c1c;border-radius:8px;padding:8px;min-width:0}
+.card{background:#2a2a2a;border-radius:6px;padding:8px;margin:6px 0;cursor:pointer}
+.card.sel{outline:2px solid #0a84ff}
+.detail{background:#1c1c1c;margin:0 16px 60px;padding:12px;border-radius:8px}
+button{background:#0a84ff;color:#fff;border:0;border-radius:6px;padding:8px 14px;margin:4px;cursor:pointer}
+.term{background:#000;font-family:monospace;padding:8px;border-radius:6px;white-space:pre-wrap}
+.panes{display:flex;gap:12px;padding:16px 16px 60px;height:70vh}
+.pane{flex:1;background:#1c1c1c;border-radius:8px;padding:8px;overflow:auto}
+.state{position:fixed;top:0;right:0;background:#222;padding:6px 10px;font-size:12px;border-radius:0 0 0 8px}
+h2{font-size:14px;text-transform:uppercase;color:#999;margin:4px}
+</style></head>
+<body>
+<div class="state" id="state"></div>
+<div id="app"></div>
+<div class="bar">
+<a href="?v=board" id="b-board">A: Board-first</a>
+<a href="?v=herdr" id="b-herdr">B: Herdr panes</a>
+<a href="?v=focus" id="b-focus">C: Focus ticket</a>
+</div>
+<script>
+const v=new URLSearchParams(location.search).get('v')||'board';
+document.getElementById('b-'+v)?.classList.add('on');
+const tickets=[
+ {id:131,t:'Research: Tauri vs hc reuse',st:'done',fr:'—',ac:'facts from primary sources',out:'PASS'},
+ {id:132,t:'Grilling: daemon protocol',st:'review',fr:'—',ac:'topology locked',out:'checks green'},
+ {id:134,t:'Prototype: board + Run buttons',st:'todo',fr:'abc123',ac:'artifact to react to',out:'—'},
+ {id:133,t:'Grilling: review-handoff + dist',st:'todo',fr:'—',ac:'inline flow + installers',out:'—'},
+];
+let sel=134;
+const cols={todo:'To Do',review:'Review',done:'Done'};
+function card(t){return `<div class="card ${t.id===sel?'sel':''}" onclick="sel=${t.id};render()"><b>#${t.id}</b> ${t.t}<br><small>${t.st}</small></div>`}
+function detail(){const t=tickets.find(x=>x.id===sel);
+ return `<div class="detail"><h3>#${t.id} ${t.t}</h3>
+ <p>freeze: <code>${t.fr}</code> · acceptance: ${t.ac} · checks: ${t.out}</p>
+ <button onclick="run('sync')">factory sync</button><button onclick="run('check')">factory check</button><button onclick="run('handoff')">factory handoff</button>
+ <div class="term" id="term">$ select Run to simulate…</div></div>`}
+function run(c){document.getElementById('term').textContent='$ factory '+c+' #'+sel+'\nPASS (simulated)';render_state('ran '+c+' #'+sel)}
+function render_state(extra){document.getElementById('state').textContent=`variant=${v} selected=#${sel} ${extra||''}`}
+function render(){render_state();const a=document.getElementById('app');
+ if(v==='board'){a.innerHTML=`<div class="cols">${Object.entries(cols).map(([k,n])=>`<div class="col"><h2>${n}</h2>${tickets.filter(t=>t.st===k).map(card).join('')}</div>`).join('')}</div>`+detail()}
+ if(v==='herdr'){a.innerHTML=`<div class="panes"><div class="pane"><h2>Spaces: swefactory</h2><h2>Agents</h2>🟢 watcher: Working<br>🟡 review-132: Blocked — needs you<br>✅ research-131: Done</div><div class="pane"><h2>Board peek</h2>${tickets.map(card).join('')}</div><div class="pane"><h2>Terminal: review-132 (peek)</h2><div class="term">$ factory check #132\nPASS</div></div></div>`+detail()}
+ if(v==='focus'){const t=tickets.find(x=>x.id===sel);a.innerHTML=`<div class="panes"><div class="pane"><h2>Ticket</h2><h3>#${t.id} ${t.t}</h3><p>freeze ${t.fr} · ${t.ac}</p><button onclick="run('sync')">sync</button><button onclick="run('check')">check</button><button onclick="run('handoff')">handoff</button><div class="term" id="term">$ …</div></div><div class="pane"><h2>Agent terminal (hc live)</h2><div class="term">$ pi session attached\nWorking…</div></div></div>`}}
+render();
+</script></body></html>
