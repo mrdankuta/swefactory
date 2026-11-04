@@ -16,7 +16,20 @@
          `board_select` and scopes the detail pane
          (`data-selected-card` + `data-scopes="detail"`). -->
     <main id="board" data-board-fragment data-selected-card data-scopes="detail"></main>
-    <section id="detail" data-detail-pane></section>
+    <!-- Ticket #153: detail pane serves the ticket detail (spec freeze
+         hash from the watched factory cache + acceptance criteria +
+         latest checks output) with Sync/Check/Handoff Run buttons.
+         Run buttons invoke the backend commands and render pass/fail
+         inline with the cause named. -->
+    <section id="detail" data-detail-pane data-detail-runs>
+      <div data-detail-body></div>
+      <div data-run-buttons>
+        <button data-run="sync">Run sync</button>
+        <button data-run="check">Run check</button>
+        <button data-run="handoff">Run handoff</button>
+      </div>
+      <p data-run-outcome aria-live="polite"></p>
+    </section>
     <!-- Click-to-peek renders desktop_peek_html(addr, hc read stream). -->
     <section id="peek" data-peek-mount></section>
     <script type="module">
@@ -53,8 +66,26 @@
         if (picked) {
           const board = document.getElementById("board");
           board.dataset.selectedCard = String(picked.number);
-          document.getElementById("detail").dataset.ticket = String(picked.number);
+          const detail = document.getElementById("detail");
+          detail.dataset.ticket = String(picked.number);
+          // Ticket #153: serve the detail (freeze + criteria + checks)
+          // through the backend; Run buttons call run_sync/run_check/
+          // run_handoff and render pass/fail inline with the cause named.
+          const full = await invoke("ticket_detail", { number: picked.number, tail: 50 });
+          if (full) detail.querySelector("[data-detail-body]").textContent = full.checks_output;
         }
+      });
+      document.getElementById("detail").addEventListener("click", async (ev) => {
+        const btn = ev.target.closest("[data-run]");
+        if (!btn) return;
+        const detail = document.getElementById("detail");
+        const ticket = detail.dataset.ticket;
+        const out = document.querySelector("[data-run-outcome]");
+        let outcome = null;
+        if (btn.dataset.run === "sync") outcome = await invoke("run_sync", { issue: ticket });
+        if (btn.dataset.run === "check") outcome = await invoke("run_check");
+        if (btn.dataset.run === "handoff") outcome = await invoke("run_handoff", { issue: ticket, signal: "ready" });
+        if (outcome && out) out.textContent = `${outcome.passed ? "pass" : "fail"}: ${outcome.cause}`;
       });
       await refreshBoard();
       setInterval(refreshBoard, 45000);

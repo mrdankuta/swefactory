@@ -39,6 +39,37 @@
 //     factory_lib::desktop_board_select(&feed, number)
 // }
 //
+// Ticket #153 (spec #149): ticket detail + Run buttons. Selecting a
+// board card shows the detail: spec freeze hash (file-watched factory
+// cache joined in), acceptance criteria, and latest checks output.
+// Run buttons invoke the existing command functions through the
+// backend and render pass/fail inline with the cause named.
+//
+// #[tauri::command]
+// fn ticket_detail(number: u64, tail: usize) -> Option<serde_json::Value> {
+//     // Freeze hash comes from the watched factory cache
+//     // (`ticket_detail_freeze_hash`, spec #149), joined with tracker +
+//     // hc state via `desktop_detail_runs_json`.
+//     let detail = factory_lib::ticket_detail(number, tail)?;
+//     let freeze = factory_lib::ticket_detail_freeze_hash();
+//     Some(factory_lib::desktop_detail_runs_json(&detail, freeze.as_deref()))
+// }
+//
+// #[tauri::command]
+// fn run_sync(issue: String) -> factory_lib::TicketRunOutcome {
+//     factory_lib::ticket_run_sync(&issue)
+// }
+//
+// #[tauri::command]
+// fn run_check() -> factory_lib::TicketRunOutcome {
+//     factory_lib::ticket_run_check()
+// }
+//
+// #[tauri::command]
+// fn run_handoff(issue: String, signal: String) -> factory_lib::TicketRunOutcome {
+//     factory_lib::ticket_run_handoff(&issue, &signal)
+// }
+//
 // #[tauri::command]
 // fn peek_read(addr: String) -> Option<String> { factory_lib::peek_read(&addr) }
 //
