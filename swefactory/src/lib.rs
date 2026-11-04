@@ -21866,3 +21866,140 @@ mod verdict_tag_tests {
         assert_eq!(verdict_of_transcript("nothing here\n"), None);
     }
 }
+
+// --- review auto-spawn + verdict routing (ticket #141, spec #135) --------
+//
+// Moving a ticket to Review auto-spawns the review agent as a kept `hc`
+// terminal (a `--keep` pane, so it survives window close) visible in the
+// agents sidebar. Ticket detail shows the diff summary plus the
+// schema-validated verdict tag payload (last-match-wins via
+// `parse_verdict_tag`) plus findings inline; Accept routes to
+// accepted/land and Request-changes returns the ticket to To Do. The
+// review terminal stays peekable from the ticket (same peek attach as
+// the agents sidebar). UI copy uses the domain glossary terms exactly
+// (AgentRunner, session identity, verdict tag).
+
+/// Kept review-terminal name for one ticket attempt (`t11-review-a1`).
+pub fn review_terminal_name(ticket: u64, attempt_no: u64) -> String {
+    format!("t{ticket}-review-a{attempt_no}")
+}
+
+/// Pure `hc run` argv that spawns the review agent as a kept terminal:
+/// `--bg --keep` so the pane survives window close and stays visible in
+/// the sidebar. Spawning itself stays behind the `hc` seam (env
+/// `FACTORY_HC_BIN`); tests assert this argv, never a live core.
+pub fn review_spawn_argv(ticket: u64, attempt_no: u64, review_cmd: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--bg".to_string(),
+        "--keep".to_string(),
+        "--json".to_string(),
+        "--name".to_string(),
+        review_terminal_name(ticket, attempt_no),
+        "--".to_string(),
+        review_cmd.to_string(),
+    ]
+}
+
+/// Sidebar row for the auto-spawned review terminal: a kept `hc`
+/// terminal like any other agent row, so it sorts and peeks the same
+/// way. Starts detached; the ticket's peek button attaches.
+pub fn review_sidebar_entry(ticket: u64, attempt_no: u64) -> AgentTerminal {
+    let name = review_terminal_name(ticket, attempt_no);
+    AgentTerminal::new(&name, &name)
+}
+
+/// Where a review decision routes: Accept to the accepted/land flow,
+/// anything else (request-changes, missing, invalid) back to To Do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewRoute {
+    Accept,
+    RequestChanges,
+}
+
+/// Pure decision-to-route mapping over the schema-validated verdict tag
+/// decision (`accept` vs `changes_requested`). `None` (no usable tag)
+/// reads as RequestChanges: silent reviewers never read as accepted.
+pub fn review_route(decision: Option<&str>) -> ReviewRoute {
+    match decision {
+        Some("accept") => ReviewRoute::Accept,
+        _ => ReviewRoute::RequestChanges,
+    }
+}
+
+/// Human lane name for a route: Accept to accepted/land, Request-changes
+/// back to To Do.
+pub fn review_route_target(route: ReviewRoute) -> &'static str {
+    match route {
+        ReviewRoute::Accept => "accepted/land",
+        ReviewRoute::RequestChanges => "To Do",
+    }
+}
+
+/// Diff summary for the detail pane: the bounded `git diff --stat`
+/// text, trimmed; empty input reads as "(no changes)".
+pub fn review_diff_summary(stat: &str) -> String {
+    let t = stat.trim();
+    if t.is_empty() {
+        "(no changes)".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Findings for the detail pane: the review transcript with every
+/// `<verdict>...</verdict>` tag stripped, so the typed payload and the
+/// human findings read side by side instead of interleaved.
+pub fn review_findings(transcript: &str) -> String {
+    let mut out = transcript.to_string();
+    while let Some(open) = out.find("<verdict>") {
+        let after = open + "<verdict>".len();
+        let Some(rel) = out[after..].find("</verdict>") else {
+            break;
+        };
+        let end = after + rel + "</verdict>".len();
+        out.replace_range(open..end, "[verdict tag]");
+    }
+    out.trim().to_string()
+}
+
+/// Review detail HTML: diff summary + verdict tag payload + findings
+/// inline, Accept / Request-changes routing buttons, and the peekable
+/// review terminal address. Pure over strings so tests pin markers.
+pub fn desktop_review_html(
+    ticket: u64,
+    attempt_no: u64,
+    diff_stat: &str,
+    transcript: &str,
+    terminal_address: &str,
+) -> String {
+    let decision = parse_verdict_tag(transcript).ok();
+    let route = review_route(decision.as_deref());
+    let target = review_route_target(route);
+    let payload = match &decision {
+        Some(d) => format!(
+            "<p data-verdict-payload>verdict tag: {}</p>",
+            escape_html(&format!("{{\"decision\":\"{d}\"}}"))
+        ),
+        None => "<p data-verdict-payload>verdict tag: none yet \u{2014} the reviewer has not recorded a verdict tag.</p>"
+            .to_string(),
+    };
+    format!(
+        "<section data-review=\"{ticket}\" data-attempt=\"{attempt_no}\">\
+<h3>Review</h3>\
+<p data-diff-summary>{}</p>\
+{payload}\
+<pre data-findings>{}</pre>\
+<p data-review-target>Decision routes to: {target}</p>\
+<div data-review-actions><button data-review-accept data-ticket=\"{ticket}\">Accept</button>\
+<button data-review-request-changes data-ticket=\"{ticket}\">Request changes</button></div>\
+<p data-review-terminal data-terminal=\"{ta}\">Review terminal <code>{ta}</code> \
+runs through the AgentRunner seam as a kept hc terminal; \
+<a href=\"#peek-{ta}\" data-review-peek=\"{ta}\">peek live</a>. \
+session identity joins the attempt ledger.</p>\
+</section>",
+        escape_html(&review_diff_summary(diff_stat)),
+        escape_html(&review_findings(transcript)),
+        ta = escape_html(terminal_address),
+    )
+}
