@@ -5,6 +5,25 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+### herdr-core sidecar: persistent-terminal dispatch (tickets #123–#128)
+
+- `factory doctor` gains the `agent-runtime` check: `hc` presence/version
+  via the `FACTORY_HC_BIN` seam, plus the `HC_SESSION` this process would
+  use so daemon/UI/CLI session mismatches are visible (missing `hc` fails
+  with the install pointer and session-agreement hint).
+- `factory init`/`update` install `implementer` + `reviewer` role templates
+  into the herdr config dir (XDG-aware, never overwriting customizations).
+- `dispatch once --persistent-terminal` runs implement inside `hc run --bg
+  --name t<N>-impl-a<M>`: the terminal outlives the dispatcher, stays
+  attachable, and expiry leaves it running (resumable, orphan named).
+  Readiness is gated on first-message delivery; waits re-wait on check-in
+  with elapsed-time logging. Missing/refused `hc` fails loudly.
+- The ledger records the terminal address (`machine/terminal` for remote
+  builders via `dispatch once --on <machine>`, preflighted with
+  `hc machine ls`); `factory log` shows the live tail beside the ledger
+  transcript and board cards link their terminal (`hc attach`).
+  Docs state the sidecar contract: core owns liveness, ledger owns audit.
+
 ## 0.1.0-rc.10 — readable history: durations, real spend minutes, slots line
 
 ### Presentation: history answers "how long" (no ticket)
