@@ -227,6 +227,26 @@ pub enum Commands {
     },
     /// Read-only drift report: open issues vs the dev branch.
     Reconcile,
+    /// Left-rail project switcher (ticket #140): list local repos under
+    /// --root (default: cwd parent scan) containing factory project files
+    /// (same presence rule as `status`). Selecting one scopes board +
+    /// agents + detail in the client. Read-only.
+    Projects {
+        /// Root directory to scan for factory repos (default: cwd).
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+    },
+    /// Usage telemetry (ticket #140): on by default in releases, opt-out
+    /// via Settings Privacy (opt-out file) or FACTORY_TELEMETRY=0.
+    /// `--opt-out` writes the opt-out file; `--opt-in` removes it.
+    Telemetry {
+        /// Opt out of usage telemetry.
+        #[arg(long)]
+        opt_out: bool,
+        /// Opt back in to usage telemetry.
+        #[arg(long)]
+        opt_in: bool,
+    },
     /// Open the work for a ticket: worktree + branch + brief, ready to implement in.
     Start {
         /// Ticket issue number (e.g. 11 or #11).
@@ -8047,6 +8067,179 @@ fn slugify(title: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+/// Project switcher (ticket #140, spec #135): list local repos under
+/// `root` containing factory project files (same presence rule as
+/// `status`: every STATUS_PROJECT_FILES entry is a file). Sorted by
+/// name; selection scopes board/agents/detail in the client.
+pub fn list_factory_projects(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if STATUS_PROJECT_FILES
+            .iter()
+            .all(|rel| p.join(rel).is_file())
+        {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Usability of the hc core sidecar (ticket #140): `usable` when `hc`
+/// answers `--version`, `missing` when no binary responds, and
+/// `guided-upgrade` when a binary exists but does not answer (stale or
+/// incompatible core gets a guided upgrade, mirroring the herdr-app
+/// installer flow). Linux + macOS ARM installers ship or bootstrap hc.
+pub fn hc_core_usability() -> &'static str {
+    let hc = hc_bin();
+    match probe_stdout(&hc, &["--version"]) {
+        Some(_) => "usable",
+        None => {
+            if tool_present(&hc) || std::path::Path::new(&hc).exists() {
+                "guided-upgrade"
+            } else {
+                "missing"
+            }
+        }
+    }
+}
+
+/// Machine-readable core status over the `hc_bin` seam.
+pub fn hc_core_status() -> serde_json::Value {
+    let usability = hc_core_usability();
+    let version = probe_stdout(&hc_bin(), &["--version"])
+        .map(|v| v.lines().next().unwrap_or("").to_string())
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "bin": hc_bin(),
+        "usability": usability,
+        "version": version,
+        "guided_upgrade": usability == "guided-upgrade",
+    })
+}
+
+/// Background-update contract (ticket #140): the client downloads in
+/// the background and takes over on restart; terminals survive because
+/// they live in the hc core, which the client never owns.
+pub fn background_update_policy() -> serde_json::Value {
+    serde_json::json!({
+        "download": "background",
+        "takeover": "on-restart",
+        "terminals_survive": true,
+        "terminal_owner": "hc-core",
+    })
+}
+
+/// Telemetry opt-out file: <state>/telemetry-opt-out (state root honours
+/// FACTORY_STATE_DIR via dispatch_state_dir; project-local default is
+/// factory/.cache/telemetry-opt-out for the CLI surface).
+fn telemetry_opt_out_file() -> PathBuf {
+    let dir = std::env::var_os("FACTORY_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("factory")
+                .join(".cache")
+        });
+    dir.join("telemetry-opt-out")
+}
+
+/// Usage telemetry (ticket #140): on by default in releases; opt out
+/// via the Settings Privacy opt-out file or FACTORY_TELEMETRY=0.
+pub fn telemetry_enabled() -> bool {
+    if let Ok(v) = std::env::var("FACTORY_TELEMETRY") {
+        if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+            return false;
+        }
+    }
+    !telemetry_opt_out_file().is_file()
+}
+
+/// Write (opt_out=true) or remove (opt_out=false) the opt-out file.
+pub fn set_telemetry_opt_out(opt_out: bool) -> bool {
+    let f = telemetry_opt_out_file();
+    if opt_out {
+        if let Some(parent) = f.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&f, "opt-out\n").is_ok()
+    } else {
+        if f.is_file() {
+            std::fs::remove_file(&f).is_ok()
+        } else {
+            true
+        }
+    }
+}
+
+/// Auth reuse (ticket #140, spec decision): the client reuses `gh` auth
+/// tokens + SSH config; no separate credential store.
+pub fn client_auth_reuse() -> serde_json::Value {
+    serde_json::json!({
+        "gh_auth_token": "reuse",
+        "ssh_config": "reuse",
+        "credential_store": "none",
+    })
+}
+
+pub fn cmd_projects(json: bool, root: Option<&std::path::Path>) -> i32 {
+    let scan = root
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let projects = list_factory_projects(&scan);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "root": scan.to_string_lossy(), "projects": projects })
+        );
+        return 0;
+    }
+    if projects.is_empty() {
+        println!("no factory projects under {}", scan.display());
+    } else {
+        for p in &projects {
+            println!("{p}");
+        }
+    }
+    0
+}
+
+pub fn cmd_telemetry(json: bool, opt_out: bool, opt_in: bool) -> i32 {
+    if opt_out && opt_in {
+        eprintln!("cannot pass both --opt-out and --opt-in");
+        return 1;
+    }
+    if opt_out {
+        set_telemetry_opt_out(true);
+    } else if opt_in {
+        set_telemetry_opt_out(false);
+    }
+    let enabled = telemetry_enabled();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"enabled": enabled, "opt_out_file": telemetry_opt_out_file().to_string_lossy()})
+        );
+        return 0;
+    }
+    println!(
+        "telemetry {}",
+        if enabled { "enabled" } else { "disabled (opt-out)" }
+    );
+    0
 }
 
 #[derive(Serialize)]
@@ -18761,6 +18954,8 @@ pub fn run() -> i32 {
             body,
         } => cmd_handoff(&issue, &signal, body.as_ref(), cli.json),
         Commands::Reconcile => cmd_reconcile(cli.json),
+        Commands::Projects { root } => cmd_projects(cli.json, root.as_deref()),
+        Commands::Telemetry { opt_out, opt_in } => cmd_telemetry(cli.json, opt_out, opt_in),
         Commands::Start { ticket, worktree } => cmd_start(&ticket, worktree.as_ref(), cli.json),
         Commands::Dispatch { action } => match action {
             DispatchAction::Once {
