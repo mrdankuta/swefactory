@@ -9,7 +9,14 @@
          (desktop_left_rail_html: switcher + agents sidebar).
          Selecting a project scopes board + agents + detail. -->
     <div id="left-rail" data-left-rail></div>
-    <main id="board" data-board-fragment></main>
+    <!-- Ticket #151: center board over the DesktopBoard feed (To Do /
+         Review / Done from issue labels). The backend polls `board_feed`
+         every 45s (30-60s bound); an unreachable tracker re-serves the
+         last cache with a stale banner. Clicking a card invokes
+         `board_select` and scopes the detail pane
+         (`data-selected-card` + `data-scopes="detail"`). -->
+    <main id="board" data-board-fragment data-selected-card data-scopes="detail"></main>
+    <section id="detail" data-detail-pane></section>
     <!-- Click-to-peek renders desktop_peek_html(addr, hc read stream). -->
     <section id="peek" data-peek-mount></section>
     <script type="module">
@@ -25,6 +32,32 @@
         if (render_left_rail) render_left_rail({ projects, agents, active });
       }
       await refreshRail();
+      // Ticket #151: center-board poll (45s, inside the 30-60s bound).
+      // Read-only: `board_feed` runs `gh issue list` only; a stale feed
+      // keeps the last cache visible with its stale banner.
+      let last = null;
+      async function refreshBoard() {
+        const feed = await invoke("board_feed", { last });
+        last = feed;
+        const board = document.getElementById("board");
+        board.dataset.stale = String(feed.stale);
+        board.dataset.pollMs = "45000";
+      }
+      // Click-to-select: registered a single time (outside the poll loop) so
+      // repeated clicks keep scoping #detail.
+      document.getElementById("board").addEventListener("click", async (ev) => {
+        const card = ev.target.closest("[data-card]");
+        if (!card) return;
+        const number = Number(card.dataset.card);
+        const picked = await invoke("board_select", { feed: last, number });
+        if (picked) {
+          const board = document.getElementById("board");
+          board.dataset.selectedCard = String(picked.number);
+          document.getElementById("detail").dataset.ticket = String(picked.number);
+        }
+      });
+      await refreshBoard();
+      setInterval(refreshBoard, 45000);
     </script>
   </body>
 </html>

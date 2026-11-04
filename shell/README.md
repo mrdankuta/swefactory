@@ -16,7 +16,8 @@ Each Tauri command below is a thin in-process call into the named seam:
 | `list_projects`   | `list_factory_projects(root)`   | Left-rail switcher; selection scopes client |
 | `agents_snapshot` | `agents_resync(list, screens, seen)` | OSC 7501 presence only, never inferred |
 | `peek_read`       | `peek_read(addr)`               | `hc read` stream; calm note on failure   |
-| `board_feed`      | `desktop_board_feed(last)`      | Center board (ticket #151 builds the view) |
+| `board_feed`      | `desktop_board_feed(last)`      | Center board poll every 45s (30-60s bound); stale banner on unreachable tracker (ticket #151) |
+| `board_select`    | `desktop_board_select(feed, n)`   | Card selection scopes detail pane; pure over feed, no writes (ticket #151) |
 
 Left-rail rendering is pure HTML over seam values:
 `desktop_left_rail_html` = `desktop_project_switcher_html` +
