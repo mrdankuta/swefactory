@@ -4436,7 +4436,64 @@ fn stream_html_envelope(html: &str) -> String {
 /// bytes move. Read-only: the producer only re-reads the polling seams.
 /// Past `buffer_bound` queued deltas the viewer is disconnected with a
 /// re-attach instruction (the shared queue collapses, the stream ends).
-fn spawn_stream_producer(
+/// One render loop per scope (ticket #142): however many viewers attach
+/// to one scope, the fragment renders once per tick and every
+/// connection reads the same bytes. Change detection stays per
+/// viewer — a shared "last" would swallow transitions a viewer never
+/// saw — so only the render is shared, never the backpressure, buffer,
+/// sequence, or seen-state.
+#[derive(Clone)]
+struct ScopeViewer {
+    queue: std::sync::Arc<StreamShared>,
+    last_html: Option<String>,
+    last_state: Option<serde_json::Value>,
+    seq: u64,
+}
+
+struct ScopeHub {
+    scope: StreamScope,
+    tick_ms: u64,
+    buffer_bound: usize,
+    viewers: Vec<ScopeViewer>,
+}
+
+/// Hub registry, keyed by scope plus the state identity the render
+/// reads (state dir and seam binaries) plus the live rules the hub
+/// runs (tick interval and buffer bound): a second attach with
+/// different keepalive/buffer rules gets its own loop rather than
+/// silently reusing the first subscriber's rates. One process serves
+/// one project, so production holds one hub per scope; hermetic tests
+/// each seed their own state dir and stay isolated without any
+/// test-only reset.
+fn scope_hubs() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<ScopeHub>>>,
+> {
+    static HUBS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<ScopeHub>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    HUBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn scope_hub_key(scope: &StreamScope, keepalive_ms: u64, buffer_bound: usize) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        scope.stream_path(),
+        std::env::var("FACTORY_STATE_DIR").unwrap_or_default(),
+        std::env::var("FACTORY_GH_BIN").unwrap_or_default(),
+        std::env::var("FACTORY_GIT_BIN").unwrap_or_default(),
+        keepalive_ms,
+        buffer_bound
+    )
+}
+
+/// Subscribe one connection to its scope hub: hello plus the retained
+/// snapshot go out immediately when a render already exists, otherwise
+/// the hub's first render delivers the snapshot to every waiter.
+/// Dropping the channel prunes the viewer on the next tick; the last
+/// viewer out stops the loop and deregisters the hub.
+fn subscribe_scope_stream(
     scope: StreamScope,
     keepalive_ms: u64,
     buffer_bound: usize,
@@ -4448,75 +4505,153 @@ fn spawn_stream_producer(
             waker: None,
         }),
     });
-    let producer = shared.clone();
-    tokio::spawn(async move {
-        let hello = serde_json::to_string(&stream_hello_json(scope.name(), scope.ticket()))
-            .unwrap_or_else(|_| "{}".to_string());
-        if !producer.push(
-            axum::response::sse::Event::default()
-                .event("hello")
-                .data(hello),
-        ) {
-            return;
-        }
-        let (mut last_html, mut last_state) = scope.snapshot();
-        let mut seq: u64 = 0;
-        if !producer.push(
-            axum::response::sse::Event::default()
-                .event("snapshot")
-                .data(stream_html_envelope(&last_html)),
-        ) {
-            return;
-        }
-        // Per-connection commit sequence: the first emitted change is
-        // seq 1, so a compact-feed consumer can tell a missed middle
-        // (a gap in seq) from a quiet loop.
-        let mut ticks = tokio::time::interval(std::time::Duration::from_millis(
-            scope.tick_ms(keepalive_ms),
-        ));
-        ticks.tick().await;
-        loop {
-            ticks.tick().await;
-            if producer.is_closed() {
-                return;
-            }
-            let (now_html, now_state) = scope.snapshot();
-            if now_html != last_html {
-                seq += 1;
-                let mut changes = scope.summarize_change(&last_state, &now_state);
-                if changes.is_empty() {
-                    changes.push("state moved".to_string());
+    let hello = serde_json::to_string(&stream_hello_json(scope.name(), scope.ticket()))
+        .unwrap_or_else(|_| "{}".to_string());
+    shared.push(
+        axum::response::sse::Event::default()
+            .event("hello")
+            .data(hello),
+    );
+    let key = scope_hub_key(&scope, keepalive_ms, buffer_bound);
+    let hub = scope_hubs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key.clone())
+        .or_insert_with(|| {
+            let hub = std::sync::Arc::new(std::sync::Mutex::new(ScopeHub {
+                scope: scope.clone(),
+                tick_ms: scope.tick_ms(keepalive_ms),
+                buffer_bound,
+                viewers: Vec::new(),
+            }));
+            let task_hub = hub.clone();
+            tokio::spawn(async move {
+                let mut ticks = tokio::time::interval(std::time::Duration::from_millis(
+                    task_hub.lock().unwrap_or_else(|e| e.into_inner()).tick_ms,
+                ));
+                ticks.tick().await;
+                // Render-first: the first pass runs immediately so a
+                // fresh attach lands its snapshot without waiting out
+                // a full idle interval; the tick wait closes the loop.
+                loop {
+                    // Prune under a short lock, then render off the
+                    // runtime: snapshot shells out to `gh`/`git`, and
+                    // blocking the runtime thread starves accepts and
+                    // keepalives (ticket #142). The lock is never held
+                    // across a fork.
+                    let (scope, buffer_bound, viewers) = {
+                        let mut hub = task_hub.lock().unwrap_or_else(|e| e.into_inner());
+                        hub.viewers.retain(|v| !v.queue.is_closed());
+                        if hub.viewers.is_empty() {
+                            drop(hub);
+                            scope_hubs()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&key);
+                            return;
+                        }
+                        (
+                            hub.scope.clone(),
+                            hub.buffer_bound,
+                            hub.viewers
+                                .iter()
+                                .map(|v| v.queue.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    let render_scope = scope.clone();
+                    let rendered =
+                        tokio::task::spawn_blocking(move || render_scope.snapshot()).await;
+                    let Ok((now_html, now_state)) = rendered else {
+                        continue;
+                    };
+                    // One render per tick for every viewer on this scope;
+                    // each viewer diffs against what it alone has seen,
+                    // so no transition is ever swallowed by a shared last.
+                    // Scoped so the guard drops before the tick wait:
+                    // a std guard must never cross an await.
+                    {
+                        let mut hub = task_hub.lock().unwrap_or_else(|e| e.into_inner());
+                        for viewer in hub.viewers.iter_mut() {
+                            if !viewers
+                                .iter()
+                                .any(|q| std::sync::Arc::ptr_eq(q, &viewer.queue))
+                            {
+                                continue;
+                            }
+                            match viewer.last_html.clone() {
+                                None => {
+                                    viewer.last_html = Some(now_html.clone());
+                                    viewer.last_state = Some(now_state.clone());
+                                    viewer.queue.push(
+                                        axum::response::sse::Event::default()
+                                            .event("snapshot")
+                                            .data(stream_html_envelope(&now_html)),
+                                    );
+                                }
+                                Some(last_html) if last_html != now_html => {
+                                    viewer.seq += 1;
+                                    let seq = viewer.seq;
+                                    let mut changes = scope.summarize_change(
+                                        viewer.last_state.as_ref().unwrap_or(&now_state),
+                                        &now_state,
+                                    );
+                                    if changes.is_empty() {
+                                        changes.push("state moved".to_string());
+                                    }
+                                    let commit = serde_json::to_string(&stream_commit_json(
+                                        &scope,
+                                        seq,
+                                        &stream_commit_id(&now_html),
+                                        &changes,
+                                    ))
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                    viewer.last_html = Some(now_html.clone());
+                                    viewer.last_state = Some(now_state.clone());
+                                    // One entry per commit, announced before the
+                                    // full state it derives from; the pair
+                                    // travels together past the same
+                                    // backpressure bound, per viewer.
+                                    if !viewer.queue.push_delta(
+                                        axum::response::sse::Event::default()
+                                            .event("commit")
+                                            .data(commit),
+                                        &scope,
+                                        buffer_bound,
+                                    ) {
+                                        continue;
+                                    }
+                                    viewer.queue.push_delta(
+                                        axum::response::sse::Event::default()
+                                            .event("delta")
+                                            .data(stream_html_envelope(&now_html)),
+                                        &scope,
+                                        buffer_bound,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    ticks.tick().await;
                 }
-                let commit = serde_json::to_string(&stream_commit_json(
-                    &scope,
-                    seq,
-                    &stream_commit_id(&now_html),
-                    &changes,
-                ))
-                .unwrap_or_else(|_| "{}".to_string());
-                last_html = now_html;
-                last_state = now_state;
-                // One entry per commit, announced before the full state
-                // it derives from; the pair travels together past the
-                // same backpressure bound.
-                if !producer.push_delta(
-                    axum::response::sse::Event::default()
-                        .event("commit")
-                        .data(commit),
-                    &scope,
-                    buffer_bound,
-                ) {
-                    return;
-                }
-                let event = axum::response::sse::Event::default()
-                    .event("delta")
-                    .data(stream_html_envelope(&last_html));
-                if !producer.push_delta(event, &scope, buffer_bound) {
-                    return;
-                }
-            }
-        }
-    });
+            });
+            hub
+        })
+        .clone();
+    {
+        let mut hub = hub.lock().unwrap_or_else(|e| e.into_inner());
+        // Register only: hello already went out above, and the next
+        // shared tick renders the snapshot. Nothing in the attach path
+        // blocks the runtime, so accepts and keepalives stay prompt
+        // however loaded the machine is (ticket #142).
+        hub.viewers.push(ScopeViewer {
+            queue: shared.clone(),
+            last_html: None,
+            last_state: None,
+            seq: 0,
+        });
+    }
     StreamChannel { shared }
 }
 
@@ -4528,7 +4663,7 @@ fn open_stream(
     scope: StreamScope,
     keepalive_ms: u64,
 ) -> axum::response::Sse<axum::response::sse::KeepAliveStream<StreamChannel>> {
-    axum::response::Sse::new(spawn_stream_producer(
+    axum::response::Sse::new(subscribe_scope_stream(
         scope,
         keepalive_ms,
         stream_buffer_bound(),

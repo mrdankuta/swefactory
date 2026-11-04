@@ -1780,3 +1780,124 @@ async fn commit_feed_reconnects_from_snapshot_with_no_replay_and_changes_nothing
     server.abort();
     clear_stream_env();
 }
+
+/// AC (ticket #142): two simultaneous connections on one scope share a
+/// single fragment render for the same state. One renderer per scope per
+/// tick, however many viewers attach — otherwise N viewers multiply the
+/// per-tick `gh`/`git` fork storm and starve the stream under load.
+/// Counts `gh` invocations through a counting fake: phase one (one tap)
+/// bounds the per-renderer rate, phase two (two taps) must not exceed it.
+#[tokio::test]
+async fn concurrent_board_connections_share_one_render() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("shared-render");
+    let state = seed_state(&root, "impl_running");
+    let counter = root.join("gh-calls");
+    fs::write(&counter, "").unwrap();
+    let counter_sh = counter.to_string_lossy().into_owned();
+    let gh_body = [
+        "#!/bin/sh\necho x >> \"",
+        counter_sh.as_str(),
+        "\"\ncat <<GH_EOF\n",
+        BOARD_JSON,
+        "\nGH_EOF\n",
+    ]
+    .concat();
+    let gh = write_script(&root, "gh", &gh_body);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    let (port, server) = serve_port().await;
+
+    fn gh_calls(counter: &Path) -> usize {
+        fs::read_to_string(counter).unwrap_or_default().len()
+    }
+
+    // Phase one: one viewer over a fixed window bounds the rate of a
+    // single renderer (snapshot plus one render per change tick).
+    // Counts are deltas: the attach renders above do not count.
+    // Async sleeps: this runtime is single-threaded, so only a yielding
+    // sleep lets the server tick while the window runs.
+    let mut tap_a = LiveTap::attach(port, "/streams/board").await;
+    let (event, _) = next_event(&mut tap_a, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, data) = next_event(&mut tap_a, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    assert!(
+        data[0].contains("Sprout"),
+        "board renders through the counting fake, got: {}",
+        &data[0][..data[0].len().min(200)]
+    );
+    let base = gh_calls(&counter);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let phase_one = gh_calls(&counter) - base;
+
+    // Phase two: two viewers over the same window. A second renderer
+    // would (near-)double the call rate; a shared one holds it flat.
+    let mut tap_b = LiveTap::attach(port, "/streams/board").await;
+    let (event, _) = next_event(&mut tap_b, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello");
+    let (event, _) = next_event(&mut tap_b, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot");
+    let base = gh_calls(&counter);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let phase_two = gh_calls(&counter) - base;
+
+    assert!(
+        phase_one > 0,
+        "the window must actually render: {phase_one} gh calls"
+    );
+    assert!(
+        phase_two * 2 < phase_one * 3,
+        "two viewers must share one renderer (near-flat rate, not near-double): one-viewer window made {phase_one} gh calls, two-viewer window made {phase_two}"
+    );
+
+    server.abort();
+    clear_stream_env();
+}
+
+/// AC (ticket #142, TDD cycle 2): a snapshot arrives within a bounded
+/// wait even while CPU churn runs beside the attach. The old design
+/// rendered (forking `gh`/`git`) on the async runtime thread, so a
+/// loaded machine starved accepts and keepalives; the hub renders off
+/// the runtime, so the handshake stays prompt. Churn is plain threads
+/// (hermetic, no external processes) to pin the property, not a
+/// particular load shape.
+#[tokio::test]
+async fn snapshot_arrives_within_bound_beside_cpu_churn() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("churn");
+    let state = seed_state(&root, "impl_running");
+    let gh = write_fake_gh(&root, BOARD_JSON);
+    let git = write_fake_git(&root, "/tmp/wt1 abc123 [factory/T9-x]");
+    set_stream_env(&state, &gh, &git);
+    let (port, server) = serve_port().await;
+
+    let churn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut churn_handles = Vec::new();
+    for _ in 0..4 {
+        let flag = churn.clone();
+        churn_handles.push(std::thread::spawn(move || {
+            let mut x = 0u64;
+            while flag.load(std::sync::atomic::Ordering::Relaxed) {
+                for _ in 0..10_000 {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+            }
+            std::hint::black_box(x);
+        }));
+    }
+
+    let mut tap = LiveTap::attach(port, "/streams/board").await;
+    let (event, _) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "hello", "hello stays prompt under churn");
+    let (event, _) = next_event(&mut tap, std::time::Duration::from_secs(10)).await;
+    assert_eq!(event, "snapshot", "snapshot lands within bound under churn");
+
+    churn.store(false, std::sync::atomic::Ordering::Relaxed);
+    for handle in churn_handles {
+        let _ = handle.join();
+    }
+
+    server.abort();
+    clear_stream_env();
+}
