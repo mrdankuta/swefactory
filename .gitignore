@@ -5,3 +5,6 @@ factory/.state/
 *.log
 .DS_Store
 .code-cuts/
+# Tauri dev-provisioned sidecar binaries (ticket #156): the real hc is
+# staged here by shell/src-tauri/build.rs, never committed.
+shell/src-tauri/bin/
