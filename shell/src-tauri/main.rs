@@ -32,6 +32,16 @@
 //     factory_lib::detach_all_peeks(terms);
 // }
 //
+// Ticket #152 (spec #149): packaging track. Installers ship or bootstrap
+// the hc core (externalBin `bin/hc`: linux-x86_64, linux-aarch64,
+// macos-aarch64; unusable core -> guided upgrade per
+// `desktop_hc_core_policy`). Background updates download and take over on
+// restart (`plugins.updater` in tauri.conf.json; terminals survive in the
+// core per `desktop_update_policy`). Telemetry on by default in releases
+// with Settings Privacy opt-out (`desktop_release_telemetry_default` +
+// `desktop_settings_privacy_html`). Auth reuses gh token + SSH config;
+// no credential store (`desktop_auth_policy`).
+//
 // fn main() {
 //     tauri::Builder::default()
 //         .invoke_handler(tauri::generate_handler![
