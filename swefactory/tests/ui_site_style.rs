@@ -45,9 +45,6 @@ fn every_page_shell_carries_the_stylesheet() {
         body: "body".to_string(),
         labels: vec![],
         state: "open".to_string(),
-        freeze_hash: None,
-        acceptance: Vec::new(),
-        checks_output: String::new(),
         transcript: None,
         attempts: vec![],
     };
@@ -102,9 +99,6 @@ fn dynamic_titles_keep_their_data_and_no_css() {
         body: "body".to_string(),
         labels: vec![],
         state: "open".to_string(),
-        freeze_hash: None,
-        acceptance: Vec::new(),
-        checks_output: String::new(),
         transcript: None,
         attempts: vec![],
     };

@@ -239,9 +239,6 @@ fn pane_missing_session_reads_calmly() {
         body: "b".to_string(),
         labels: vec![],
         state: "open".to_string(),
-        freeze_hash: None,
-        acceptance: Vec::new(),
-        checks_output: String::new(),
         attempts: vec![],
         transcript: Some(pane),
     };
@@ -336,9 +333,6 @@ fn pane_empty_ticket_is_none_and_fragment_omits_pane() {
         body: "b".to_string(),
         labels: vec![],
         state: "open".to_string(),
-        freeze_hash: None,
-        acceptance: Vec::new(),
-        checks_output: String::new(),
         attempts: vec![],
         transcript: None,
     };
@@ -363,9 +357,6 @@ fn detail_fragment_embeds_pane_beside_attempts() {
         body: "Grow.".to_string(),
         labels: vec!["ready".to_string()],
         state: "open".to_string(),
-        freeze_hash: None,
-        acceptance: Vec::new(),
-        checks_output: String::new(),
         attempts: vec![TicketAttemptView {
             attempt_no: 1,
             status: "impl_running".to_string(),
@@ -495,9 +486,6 @@ fn transcript_read_path_never_mutates_state() {
         body: "b".to_string(),
         labels: vec![],
         state: "open".to_string(),
-        freeze_hash: None,
-        acceptance: Vec::new(),
-        checks_output: String::new(),
         attempts: vec![],
         transcript: Some(pane),
     };
