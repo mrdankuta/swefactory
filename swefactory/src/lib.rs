@@ -10929,10 +10929,7 @@ pub fn peek_read(addr: &str) -> Option<String> {
 /// known terminal without presence rather than erroring. Overridable
 /// via FACTORY_HC_BIN for hermetic tests.
 pub fn hc_terminal_list_json() -> Option<String> {
-    let out = Command::new(hc_bin())
-        .args(["ls"])
-        .output()
-        .ok()?;
+    let out = Command::new(hc_bin()).args(["ls"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
