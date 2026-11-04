@@ -79,26 +79,52 @@ fn card_selection_scopes_detail_pane() {
     assert!(!unselected.contains("data-selected-card"));
 }
 
+/// Extract the full body of `pub fn {name}` from `src`: from the `pub fn`
+/// marker to the next top-level `pub fn` (or EOF). Anchored to function
+/// boundaries, not fixed char windows, so refactors don't shift/break it.
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let marker = format!("pub fn {name}");
+    let start = src.find(&marker).unwrap_or_else(|| panic!("{name} fn exists"));
+    let rest = &src[start..];
+    // Skip past the marker itself, then find the next top-level fn.
+    let after = &rest[marker.len()..];
+    let end = after.find("\npub fn ").map(|i| i + marker.len());
+    match end {
+        Some(e) => &rest[..e],
+        None => rest,
+    }
+}
+
 #[test]
 fn polling_is_read_only() {
     let src = include_str!("../src/lib.rs");
-    let i = src
-        .find("pub fn desktop_board_feed")
-        .expect("board feed fn exists");
-    let body = &src[i..i + 600];
-    assert!(body.contains("desktop_fetch_board_issues"), "got:\n{body}");
-    let j = src
-        .find("pub fn desktop_fetch_board_issues")
-        .expect("fetch fn exists");
-    let fbody = &src[j..j + 900];
-    assert!(fbody.contains("\"issue\"") && fbody.contains("\"list\""));
+    let feed_body = fn_body(src, "desktop_board_feed");
+    assert!(
+        feed_body.contains("desktop_fetch_board_issues"),
+        "got:\n{feed_body}"
+    );
+    let fetch_body = fn_body(src, "desktop_fetch_board_issues");
+    assert!(fetch_body.contains("\"issue\"") && fetch_body.contains("\"list\""));
     for w in ["issue create", "issue edit", "--add-label"] {
-        assert!(!fbody.contains(w), "read-only: must not contain {w:?}");
+        assert!(!fetch_body.contains(w), "read-only: must not contain {w:?}");
     }
+    assert!(
+        !fetch_body.contains("INSERT") && !fetch_body.contains("UPDATE"),
+        "feed path must not write"
+    );
     // No client board database: selection is pure over the feed.
-    let k = src
-        .find("pub fn desktop_board_select")
-        .expect("select fn exists");
-    let sbody = &src[k..k + 500];
-    assert!(!sbody.contains("INSERT") && !sbody.contains("UPDATE"));
+    let select_body = fn_body(src, "desktop_board_select");
+    assert!(!select_body.contains("INSERT") && !select_body.contains("UPDATE"));
+}
+
+#[test]
+fn repeated_card_selection_keeps_scoping_detail() {
+    let f = feed();
+    for n in [7u64, 8, 7] {
+        let html = desktop_board_html_with_selection(&f, DESKTOP_BOARD_POLL_MS, Some(n));
+        assert!(html.contains(&format!("data-selected-card=\"{n}\"")) && html.contains("data-scopes=\"detail\""), "repeat select scopes detail, got:\n{html}");
+    }
+    let shell = include_str!("../../shell/index.html");
+    assert!(!shell.contains("once:true") && !shell.contains("once: true"), "click listener must not use once:true");
+    assert!(shell.contains("addEventListener"), "click listener registered");
 }

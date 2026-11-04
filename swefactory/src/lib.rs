@@ -1397,34 +1397,7 @@ pub fn desktop_board_json(feed: &DesktopBoardFeed) -> String {
 /// number + title + marker; a stale feed renders the visible stale banner.
 /// `poll_ms` is clamped into the 30-60s bound.
 pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
-    let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
-    let mut html = format!("<section data-desktop-board data-poll-ms=\"{ms}\">");
-    if feed.stale {
-        html.push_str(
-            "<p data-stale-banner>Tracker unreachable \u{2014} showing the last saved board.</p>",
-        );
-    }
-    html.push_str("<div data-desktop-columns>");
-    for col in &feed.columns {
-        html.push_str(&format!(
-            "<section data-column=\"{}\"><h2>{} ({})</h2>",
-            escape_html(&col.id),
-            escape_html(&col.title),
-            col.cards.len()
-        ));
-        for card in &col.cards {
-            html.push_str(&format!(
-                "<article data-card=\"{}\"><h3>#{} {}</h3><p data-marker>{}</p></article>",
-                card.number,
-                card.number,
-                escape_html(&card.title),
-                escape_html(&card.marker),
-            ));
-        }
-        html.push_str("</section>");
-    }
-    html.push_str("</div></section>");
-    html
+    desktop_board_html_inner(feed, poll_ms, None)
 }
 
 /// Center-board HTML with card selection (ticket #151, spec #149).
@@ -1442,15 +1415,25 @@ pub fn desktop_board_select(feed: &DesktopBoardFeed, number: u64) -> Option<Desk
         .cloned()
 }
 
-/// Center-board HTML with selection. Delegates the unselected case to
-/// [`desktop_board_html`]; the selected case re-renders with the
-/// selection contract above.
+/// Center-board HTML with selection. Shared render core via
+/// `desktop_board_html_inner`; `None` behaves like [`desktop_board_html`].
 pub fn desktop_board_html_with_selection(
     feed: &DesktopBoardFeed,
     poll_ms: u64,
     selected: Option<u64>,
 ) -> String {
     let picked = selected.and_then(|n| desktop_board_select(feed, n).map(|c| c.number));
+    desktop_board_html_inner(feed, poll_ms, picked)
+}
+
+/// Shared render core for the center board (single copy of the
+/// columns/cards/stale markup). `selected` flags one card with
+/// `data-selected="true"` and scopes the board to the detail pane.
+fn desktop_board_html_inner(
+    feed: &DesktopBoardFeed,
+    poll_ms: u64,
+    picked: Option<u64>,
+) -> String {
     let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
     let sel_attr = match picked {
         Some(n) => format!(" data-selected-card=\"{n}\" data-scopes=\"detail\"").to_string(),

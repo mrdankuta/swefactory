@@ -42,19 +42,20 @@
         const board = document.getElementById("board");
         board.dataset.stale = String(feed.stale);
         board.dataset.pollMs = "45000";
-        // Rendering is server-side (desktop_board_html); cards carry
-        // number + title + marker. Click scopes the detail pane.
-        board.addEventListener("click", async (ev) => {
-          const card = ev.target.closest("[data-card]");
-          if (!card) return;
-          const number = Number(card.dataset.card);
-          const picked = await invoke("board_select", { feed: last, number });
-          if (picked) {
-            board.dataset.selectedCard = String(picked.number);
-            document.getElementById("detail").dataset.ticket = String(picked.number);
-          }
-        }, { once: true });
       }
+      // Click-to-select: registered a single time (outside the poll loop) so
+      // repeated clicks keep scoping #detail.
+      document.getElementById("board").addEventListener("click", async (ev) => {
+        const card = ev.target.closest("[data-card]");
+        if (!card) return;
+        const number = Number(card.dataset.card);
+        const picked = await invoke("board_select", { feed: last, number });
+        if (picked) {
+          const board = document.getElementById("board");
+          board.dataset.selectedCard = String(picked.number);
+          document.getElementById("detail").dataset.ticket = String(picked.number);
+        }
+      });
       await refreshBoard();
       setInterval(refreshBoard, 45000);
     </script>
