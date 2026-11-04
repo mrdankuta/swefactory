@@ -1471,6 +1471,18 @@ pub struct TicketDetail {
     pub labels: Vec<String>,
     pub state: String,
     pub attempts: Vec<TicketAttemptView>,
+    /// Spec freeze hash from the file-watched factory cache
+    /// (`factory/.cache/SPEC-<n>.md`, written by `factory sync`). `None`
+    /// when the ticket was never synced: the page says so instead of
+    /// inventing a hash. Read-only (ticket #138, spec #135).
+    pub freeze_hash: Option<String>,
+    /// Acceptance criteria parsed from the issue body checkboxes
+    /// (`- [ ]` / `- [x]`). `(done, text)` in body order.
+    pub acceptance: Vec<(bool, String)>,
+    /// Latest checks output for the ticket: the newest attempt's summary
+    /// plus its exit, or the calm no-checks sentence when nothing ran.
+    /// Joined from hc/ledger state, like the attempt views.
+    pub checks_output: String,
     /// Latest attempt's conversation pane (the same items
     /// `factory log --transcript` renders). `None` when the ticket has no
     /// attempts; `Some` with `session: None` when no session was recorded.
@@ -1568,15 +1580,170 @@ pub fn ticket_attempt_views(ticket: u64, tail: usize) -> Vec<TicketAttemptView> 
 /// when `gh` has no such issue; `Some` with possibly-empty attempts
 /// otherwise. Read-only.
 pub fn ticket_detail(number: u64, tail: usize) -> Option<TicketDetail> {
-    fetch_ticket_issue(number).map(|issue| TicketDetail {
-        number: issue.number,
-        title: issue.title,
-        body: issue.body,
-        labels: issue.labels,
-        state: issue.state,
-        attempts: ticket_attempt_views(number, tail),
-        transcript: ticket_transcript_pane(number),
+    fetch_ticket_issue(number).map(|issue| {
+        let acceptance = ticket_acceptance_criteria(&issue.body);
+        let attempts = ticket_attempt_views(number, tail);
+        let checks_output = ticket_checks_output_for(&attempts);
+        let freeze_hash = ticket_freeze_hash(number, &issue.body);
+        TicketDetail {
+            number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            labels: issue.labels,
+            state: issue.state,
+            attempts,
+            freeze_hash,
+            acceptance,
+            checks_output,
+            transcript: ticket_transcript_pane(number),
+        }
     })
+}
+
+/// Acceptance criteria: body checkbox lines (`- [ ] text`, `- [x] text`)
+/// in body order. Pure over the body so tests assert without a server.
+/// Non-checkbox lines are not criteria and never appear here.
+pub fn ticket_acceptance_criteria(body: &str) -> Vec<(bool, String)> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let t = line.trim_start();
+        let t = t.strip_prefix(['-', '*']).map(str::trim_start).unwrap_or(t);
+        if let Some(rest) = t.strip_prefix("[ ]") {
+            out.push((false, rest.trim().to_string()));
+        } else if let Some(rest) = t.strip_prefix("[x]").or_else(|| t.strip_prefix("[X]")) {
+            out.push((true, rest.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// Freeze hash for one ticket from the file-watched factory cache
+/// (`factory/.cache/SPEC-<n>.md`, `factory sync` output). The hash shown
+/// is the linked spec's (`linked_spec` over the body), falling back to the
+/// ticket's own number when no spec link is present. `None` when no cache
+/// file exists. Joins the tracker issue (gh) with the cache file; the
+/// detail fragment polls, so a fresh `factory sync` shows up without a
+/// reload. Read-only.
+pub fn ticket_freeze_hash(_number: u64, body: &str) -> Option<String> {
+    let spec = linked_spec(body)?;
+    let (hash, _) = read_cache(spec)?;
+    if hash.is_empty() {
+        return None;
+    }
+    Some(hash)
+}
+
+/// Latest checks output for one ticket from already-assembled attempt
+/// views (hc/ledger state): newest attempt's summary plus its exit code,
+/// or the calm no-checks sentence when nothing ran yet.
+pub fn ticket_checks_output_for(attempts: &[TicketAttemptView]) -> String {
+    match attempts.first() {
+        Some(a) => format!("{} (exit {})", a.summary, a.exit_code),
+        None => "No checks recorded yet \u{2014} nothing has run for this ticket.".to_string(),
+    }
+}
+
+/// Run one detail action (`sync`, `check`, `handoff`) through the same
+/// seams the CLI commands use, returning pass/fail plus the named cause
+/// for inline rendering. `sync` compares the live body hash against the
+/// approved freeze (the `cmd_sync` comparison, read-only here: the POST
+/// writes the cache via the same `write_cache` the CLI uses). `check`
+/// reports the latest recorded attempt outcome (running the full adapter
+/// per click would stall the page; the adapter stays a `factory check`
+/// CLI run). `handoff` validates the signal (the `cmd_handoff` gate)
+/// and posts the handoff comment via the gh seam.
+pub fn ticket_run_outcome(number: u64, action: &str, signal: Option<&str>) -> (bool, String) {
+    match action {
+        "sync" => match fetch_ticket_issue(number) {
+            None => (false, ticket_missing_sentence(&number.to_string())),
+            Some(issue) => {
+                let hash = body_hash(&issue.body);
+                // Execute the sync: refresh the watched factory cache through
+                // the same `write_cache` the `factory sync` CLI uses, so the
+                // file-watched hash on the page updates without a reload.
+                let view = IssueView {
+                    number: issue.number,
+                    title: issue.title.clone(),
+                    body: issue.body.clone(),
+                    state: issue.state.clone(),
+                };
+                if let Err(e) = write_cache(&view, &hash) {
+                    return (false, format!("sync failed: {e}"));
+                }
+                match fetch_approved(number) {
+                    Err(e) => (false, format!("sync failed: {e}")),
+                    Ok(approved) => {
+                        let ok = approved.as_deref() == Some(hash.as_str());
+                        if ok {
+                            (true, format!("freeze OK: #{number} hash={hash}"))
+                        } else {
+                            (false, format!("freeze MISMATCH: #{number} body={hash} approved={} \u{2014} re-freeze required", approved.as_deref().unwrap_or("none")))
+                        }
+                    }
+                }
+            }
+        },
+        "check" => {
+            let views = ticket_attempt_views(number, 1);
+            match views.first() {
+                None => (
+                    false,
+                    "check has nothing to report: no attempts recorded yet.".to_string(),
+                ),
+                Some(a) if a.exit_code == 0 => (
+                    true,
+                    format!(
+                        "check passed: attempt {} exit 0 \u{2014} {}",
+                        a.attempt_no, a.summary
+                    ),
+                ),
+                Some(a) => (
+                    false,
+                    format!(
+                        "check failed: attempt {} exit {} \u{2014} {}",
+                        a.attempt_no, a.exit_code, a.summary
+                    ),
+                ),
+            }
+        }
+        "handoff" => {
+            let sig = signal.unwrap_or("").trim();
+            if let Err(e) = validate_signal(sig) {
+                return (false, format!("handoff refused: {e}"));
+            }
+            let body = format!("HANDOFF `FACTORY:{sig}`");
+            match run_gh_output(&["issue", "comment", &number.to_string(), "--body", &body]) {
+                Ok(out) if out.status.success() => (
+                    true,
+                    format!("handoff posted: FACTORY:{sig} on ticket #{number}"),
+                ),
+                Ok(out) => (
+                    false,
+                    format!(
+                        "handoff failed: gh issue comment #{number} failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                ),
+                Err(e) => (false, format!("handoff failed: {e}")),
+            }
+        }
+        other => (
+            false,
+            format!("unknown run action: {other} \u{2014} expected sync, check, or handoff."),
+        ),
+    }
+}
+
+/// Inline pass/fail snippet for a run outcome: `data-run-result` with
+/// `data-pass`, naming the cause in prose. Pure so tests assert markers.
+pub fn ticket_run_result_html(action: &str, passed: bool, cause: &str) -> String {
+    format!(
+        "<p data-run-result data-run=\"{}\" data-pass=\"{}\">{}: {}</p>",
+        escape_html(action),
+        if passed { "true" } else { "false" },
+        if passed { "Passed" } else { "Failed" },
+        escape_html(cause),
+    )
 }
 
 /// JSON shape for the detail: the same facts as the prose page with the
@@ -1611,6 +1778,9 @@ pub fn ticket_detail_json(detail: &TicketDetail) -> serde_json::Value {
         "body": detail.body,
         "labels": detail.labels,
         "state": detail.state,
+        "freeze_hash": detail.freeze_hash,
+        "acceptance": detail.acceptance.iter().map(|(done, text)| serde_json::json!({"done": done, "text": text})).collect::<Vec<_>>(),
+        "checks_output": detail.checks_output,
         "attempts": attempts,
         "transcript_pane": detail.transcript.as_ref().map(|p| serde_json::json!({
             "ticket": p.ticket,
@@ -1673,6 +1843,85 @@ pub fn ticket_detail_fragment_html(detail: &TicketDetail) -> String {
         }
         html.push_str("</ol>");
     }
+    // Spec freeze hash from the file-watched factory cache (ticket #138,
+    // spec #135): the cache file `factory sync` writes, joined with the
+    // tracker issue above and the hc attempt state below. The fragment
+    // polls, so a fresh sync shows up without a reload.
+    match detail.freeze_hash.as_deref() {
+        Some(hash) => html.push_str(&format!(
+            "<p data-freeze-hash>Spec freeze hash: <code>{}</code> (from the watched factory cache; verify with <code>factory sync {}</code>).</p>",
+            escape_html(hash),
+            detail.number,
+        )),
+        None => html.push_str(&format!(
+            "<p data-freeze-hash-missing>No spec freeze hash cached yet \u{2014} run <code>factory sync {}</code> to freeze this ticket.</p>",
+            detail.number,
+        )),
+    }
+    if detail.acceptance.is_empty() {
+        html.push_str("<p data-acceptance-empty>No acceptance criteria listed on this ticket.</p>");
+    } else {
+        html.push_str("<ul data-acceptance-criteria>");
+        for (done, text) in &detail.acceptance {
+            html.push_str(&format!(
+                "<li data-criterion data-done=\"{}\">{}</li>",
+                if *done { "true" } else { "false" },
+                escape_html(text),
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str(&format!(
+        "<p data-checks>Latest checks: {}</p>",
+        escape_html(&detail.checks_output),
+    ));
+    // Run buttons invoke the existing command functions (sync, check,
+    // handoff) and render pass/fail inline with the cause named.
+    html.push_str(&format!(
+        "<div data-run-buttons><form method=\"post\" action=\"/api/tickets/{n}/run/sync\"><button type=\"submit\" data-run-button=\"sync\">Run sync</button></form> \
+<form method=\"post\" action=\"/api/tickets/{n}/run/check\"><button type=\"submit\" data-run-button=\"check\">Run check</button></form> \
+<form method=\"post\" action=\"/api/tickets/{n}/run/handoff\"><button type=\"submit\" data-run-button=\"handoff\">Run handoff</button></form></div>",
+        n = detail.number,
+    ));
+    // Glossary terms, exactly as GLOSSARY.md names them.
+    html.push_str("<p data-glossary>Runs under AgentRunner; attempts carry session identity; reviews carry a verdict tag.</p>");
+    match detail.freeze_hash.as_deref() {
+        Some(hash) => html.push_str(&format!(
+            "<p data-freeze-hash>Spec freeze hash: <code>{}</code> (watched factory cache, joined with tracker state).</p>",
+            escape_html(hash),
+        )),
+        None => html.push_str(&format!(
+            "<p data-freeze-hash-missing>Spec freeze hash: not synced yet \u{2014} run <code>factory sync {}</code> to join the watched factory cache.</p>",
+            detail.number,
+        )),
+    }
+    if detail.acceptance.is_empty() {
+        html.push_str(
+            "<p data-acceptance-criteria>Acceptance criteria: none listed on the ticket.</p>",
+        );
+    } else {
+        html.push_str("<ul data-acceptance-criteria>");
+        for (done, text) in &detail.acceptance {
+            html.push_str(&format!(
+                "<li data-criterion data-done=\"{}\">{}</li>",
+                if *done { "true" } else { "false" },
+                escape_html(text),
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str(&format!(
+        "<p data-checks-output>Latest checks: {}</p>",
+        escape_html(&detail.checks_output),
+    ));
+    html.push_str(&format!(
+        "<div data-run-buttons><p data-run-note>Runs use the same AgentRunner commands as the CLI; results carry the session identity and the latest verdict tag.</p>\
+<form method=\"post\" action=\"/tickets/{}/run/sync\"><button type=\"submit\" data-run=\"sync\">Run sync</button></form>\
+<form method=\"post\" action=\"/tickets/{}/run/check\"><button type=\"submit\" data-run=\"check\">Run check</button></form>\
+<form method=\"post\" action=\"/tickets/{}/run/handoff\"><input type=\"hidden\" name=\"signal\" value=\"READY_FOR_REVIEW\"><button type=\"submit\" data-run=\"handoff\">Run handoff</button></form>\
+<div data-run-result></div></div>",
+        detail.number, detail.number, detail.number,
+    ));
     if let Some(pane) = detail.transcript.as_ref() {
         html.push_str(&ticket_transcript_pane_html(pane));
     }
@@ -2087,6 +2336,38 @@ async fn ticket_api_handler(
             axum::Json(serde_json::json!({"error": ticket_missing_sentence(&raw)})),
         ),
     }
+}
+
+/// Run one detail action from the Run buttons (ticket #138, spec #135).
+/// POST-only: executes `sync`, `check`, or `handoff` through the same
+/// seams the CLI commands use and renders pass/fail inline with the
+/// cause named (`data-run-result` + `data-pass`). Optional `signal` form
+/// field feeds handoff; other actions ignore it.
+async fn ticket_run_handler(
+    axum::extract::Path((raw, action)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::Form(form): axum::Form<std::collections::HashMap<String, String>>,
+) -> (axum::http::StatusCode, axum::response::Html<String>) {
+    let Some(number) = parse_issue_number(&raw).ok() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::response::Html(ticket_missing_fragment_html(&raw)),
+        );
+    };
+    let signal = form
+        .get("signal")
+        .or_else(|| query.get("signal"))
+        .map(String::as_str);
+    let (passed, cause) = ticket_run_outcome(number, action.as_str(), signal);
+    let status = if passed {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (
+        status,
+        axum::response::Html(ticket_run_result_html(action.as_str(), passed, &cause)),
+    )
 }
 
 /// Handler shape for UI tickets: board page + polling fragment + health,
@@ -3402,6 +3683,14 @@ pub fn web_router() -> axum::Router {
         .route(
             "/api/tickets/{number}",
             axum::routing::get(ticket_api_handler),
+        )
+        .route(
+            "/api/tickets/{number}/run/{action}",
+            axum::routing::post(ticket_run_handler),
+        )
+        .route(
+            "/tickets/{number}/run/{action}",
+            axum::routing::post(ticket_run_handler),
         )
         .route("/dispatch", axum::routing::get(dispatcher_page_handler))
         .route(
@@ -20148,7 +20437,7 @@ fn parse_issue_number(raw: &str) -> Result<u64, String> {
 /// version-manager noise on stdout (the bash shim filters them too); real
 /// errors still surface via the exit status on stderr.
 fn run_gh(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
+    let output = Command::new(gh_bin())
         .args(args)
         .output()
         .map_err(|e| format!("failed to run gh: {e}"))?;
@@ -20239,7 +20528,10 @@ fn extract_approved_hash(body: &str) -> Option<String> {
 }
 
 fn cache_path(number: u64) -> String {
-    format!("factory/.cache/SPEC-{number}.md")
+    match std::env::var("FACTORY_CACHE_DIR") {
+        Ok(dir) if !dir.is_empty() => format!("{}/SPEC-{number}.md", dir.trim_end_matches('/')),
+        _ => format!("factory/.cache/SPEC-{number}.md"),
+    }
 }
 
 fn write_cache(view: &IssueView, hash: &str) -> Result<String, String> {

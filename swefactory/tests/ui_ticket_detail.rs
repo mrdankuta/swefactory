@@ -110,6 +110,12 @@ fn fixture_detail() -> TicketDetail {
         body: "Grow the sprout.".to_string(),
         labels: vec!["ready".to_string()],
         state: "open".to_string(),
+        freeze_hash: Some("abc123".to_string()),
+        acceptance: vec![
+            (false, "Sprout shows freeze hash".to_string()),
+            (true, "Sprout lists criteria".to_string()),
+        ],
+        checks_output: "Ticket 9 attempt 2 is being reviewed (exit 0)".to_string(),
         transcript: None,
         attempts: vec![
             TicketAttemptView {
@@ -498,5 +504,198 @@ async fn ticket_read_path_never_mutates_state() {
         assert_eq!(rel_b, rel_a);
         assert_eq!(bytes_b, bytes_a, "bytes of {rel_b} unchanged");
         assert_eq!(mtime_b, mtime_a, "mtime of {rel_b} unchanged");
+    }
+}
+
+// Ticket #138 (spec #135): the board card's detail shows the spec freeze
+// hash (file-watched factory cache), acceptance criteria, and latest
+// checks output; Run buttons execute sync/check/handoff with inline
+// pass/fail and the cause named; copy uses glossary terms exactly.
+
+#[test]
+fn detail_shows_freeze_acceptance_and_checks() {
+    let detail = fixture_detail();
+    let html = ticket_detail_fragment_html(&detail);
+    assert!(html.contains("data-freeze-hash"), "got:\n{html}");
+    assert!(html.contains("abc123"), "cached hash renders, got:\n{html}");
+    assert!(html.contains("data-acceptance-criteria"), "got:\n{html}");
+    assert!(
+        html.contains("Sprout shows freeze hash"),
+        "criteria text renders, got:\n{html}"
+    );
+    assert!(html.contains("data-criterion"), "got:\n{html}");
+    assert!(html.contains("data-checks"), "got:\n{html}");
+    assert!(
+        html.contains("being reviewed"),
+        "checks output renders, got:\n{html}"
+    );
+    // Run buttons name their POST targets.
+    for action in ["sync", "check", "handoff"] {
+        assert!(
+            html.contains(&format!("/api/tickets/9/run/{action}")),
+            "missing run {action}, got:\n{html}"
+        );
+        assert!(
+            html.contains(&format!("data-run-button=\"{action}\"")),
+            "got:\n{html}"
+        );
+    }
+    // Glossary terms, exactly.
+    for term in ["AgentRunner", "session identity", "verdict tag"] {
+        assert!(
+            html.contains(term),
+            "missing glossary {term:?}, got:\n{html}"
+        );
+    }
+    // No cached freeze reads as a sentence, never a bare hash.
+    let uncached = TicketDetail {
+        freeze_hash: None,
+        ..fixture_detail()
+    };
+    let html = ticket_detail_fragment_html(&uncached);
+    assert!(html.contains("data-freeze-hash-missing"), "got:\n{html}");
+    assert!(html.contains("factory sync 9"), "got:\n{html}");
+}
+
+#[test]
+fn acceptance_parses_only_body_checkboxes() {
+    let body = "Grow the sprout.\n- [ ] water daily\n- [x] pick pot\n- plain line\n* [ ] starred\n[X] no bullet still counts";
+    let criteria = factory_lib::ticket_acceptance_criteria(body);
+    assert_eq!(
+        criteria,
+        vec![
+            (false, "water daily".to_string()),
+            (true, "pick pot".to_string()),
+            (false, "starred".to_string()),
+            (true, "no bullet still counts".to_string()),
+        ],
+        "got: {criteria:?}"
+    );
+    assert!(factory_lib::ticket_acceptance_criteria("no boxes here").is_empty());
+}
+
+#[test]
+fn run_results_name_pass_fail_and_cause() {
+    let ok = factory_lib::ticket_run_result_html("sync", true, "freeze OK: #9 hash=abc");
+    assert!(ok.contains("data-run-result"), "got:\n{ok}");
+    assert!(ok.contains("data-pass=\"true\""), "got:\n{ok}");
+    assert!(ok.contains("Passed"), "got:\n{ok}");
+    assert!(ok.contains("freeze OK"), "cause is named, got:\n{ok}");
+
+    let bad = factory_lib::ticket_run_result_html("handoff", false, "handoff refused: bad signal");
+    assert!(bad.contains("data-pass=\"false\""), "got:\n{bad}");
+    assert!(bad.contains("Failed"), "got:\n{bad}");
+    assert!(
+        bad.contains("handoff refused"),
+        "cause is named, got:\n{bad}"
+    );
+
+    // Unknown actions fail calmly with the cause named.
+    let (passed, cause) = factory_lib::ticket_run_outcome(9, "dance", None);
+    assert!(!passed);
+    assert!(cause.contains("unknown run action"), "got: {cause}");
+}
+
+#[test]
+fn check_outcome_follows_latest_attempt_exit() {
+    let _guard = lock_env();
+    let root = tmpdir("runcheck");
+    let state = seed_state(&root);
+    unsafe {
+        std::env::set_var("FACTORY_STATE_DIR", &state);
+    }
+    // Newest attempt (a2, exit 0) is reviewing: check passes.
+    let (passed, cause) = factory_lib::ticket_run_outcome(9, "check", None);
+    unsafe {
+        std::env::remove_var("FACTORY_STATE_DIR");
+    }
+    assert!(passed, "got: {cause}");
+    assert!(
+        cause.contains("exit 0"),
+        "cause names the exit, got: {cause}"
+    );
+
+    // Handoff with a bad signal refuses before touching gh.
+    let (passed, cause) = factory_lib::ticket_run_outcome(9, "handoff", Some("nope"));
+    assert!(!passed);
+    assert!(cause.contains("handoff refused"), "got: {cause}");
+}
+
+#[test]
+fn detail_json_carries_freeze_acceptance_and_checks() {
+    let detail = fixture_detail();
+    let json = factory_lib::ticket_detail_json(&detail);
+    assert_eq!(
+        json.get("freeze_hash").and_then(|h| h.as_str()),
+        Some("abc123"),
+        "got: {json}"
+    );
+    let acceptance = json.get("acceptance").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(acceptance.len(), 2);
+    assert_eq!(
+        acceptance[0].get("text").and_then(|t| t.as_str()),
+        Some("Sprout shows freeze hash"),
+        "got: {json}"
+    );
+    assert!(
+        json.get("checks_output")
+            .and_then(|c| c.as_str())
+            .unwrap()
+            .contains("being reviewed"),
+        "got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn run_buttons_post_inline_pass_fail() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tmpdir("runbuttons");
+    let state = seed_state(&root);
+    let gh = write_fake_gh(&root);
+    unsafe {
+        std::env::set_var("FACTORY_STATE_DIR", &state);
+        std::env::set_var("FACTORY_GH_BIN", &gh);
+    }
+    let (port, server) = serve_port().await;
+
+    // Blocking POST helper (same single-threaded rationale as `get`).
+    async fn post(port: u16, path: &str, body: &str) -> String {
+        let (path, body) = (path.to_string(), body.to_string());
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await
+        .unwrap()
+    }
+
+    // Check runs against recorded attempt state: newest attempt exit 0.
+    let res = post(port, "/tickets/9/run/check", "").await;
+    assert!(res.contains("data-run-result"), "got:\n{res}");
+    assert!(res.contains("data-pass=\"true\""), "got:\n{res}");
+
+    // Bad handoff signal refuses inline with the cause named.
+    let res = post(port, "/tickets/9/run/handoff", "signal=nope").await;
+    assert!(res.contains("data-run-result"), "got:\n{res}");
+    assert!(res.contains("data-pass=\"false\""), "got:\n{res}");
+    assert!(res.contains("handoff refused"), "got:\n{res}");
+
+    // Unknown action fails calmly, never a 500.
+    let res = post(port, "/tickets/9/run/dance", "").await;
+    assert!(res.contains("422"), "got:\n{res}");
+    assert!(res.contains("unknown run action"), "got:\n{res}");
+
+    server.abort();
+    unsafe {
+        std::env::remove_var("FACTORY_STATE_DIR");
+        std::env::remove_var("FACTORY_GH_BIN");
     }
 }
