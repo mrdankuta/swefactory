@@ -1535,6 +1535,10 @@ pub fn desktop_shell_boot() -> serde_json::Value {
             "peek_read": "peek_read",
             "board_feed": "desktop_board_feed",
             "board_select": "desktop_board_select",
+            "ticket_detail": "desktop_detail_runs_json",
+            "run_sync": "ticket_run_sync",
+            "run_check": "ticket_run_check",
+            "run_handoff": "ticket_run_handoff",
         },
     })
 }
@@ -1923,6 +1927,92 @@ pub fn ticket_freeze_hash() -> Option<String> {
 /// Calm sentence when the watched cache has no freeze yet.
 pub fn ticket_freeze_missing_sentence() -> &'static str {
     "No spec freeze cached yet \u{2014} run factory sync 135 to snapshot the approved spec."
+}
+
+// --- ticket detail + Run buttons in the desktop shell (ticket #153, spec #149) ---
+//
+// Same detail-plus-runs join as ticket #138, but served through the
+// desktop shell seams: the freeze hash comes from the watched factory
+// cache for the desktop spec (#149), joined with tracker + hc state,
+// and the Run buttons invoke the existing command functions through
+// the Tauri backend (`ticket_detail`, `run_sync`, `run_check`,
+// `run_handoff`, all in-process factory_lib calls).
+
+/// Spec issue whose freeze the desktop detail pane carries (spec #149).
+pub const DESKTOP_DETAIL_SPEC_ISSUE: u64 = 149;
+
+/// Freeze hash from the watched factory cache for the desktop spec.
+/// `None` when the cache is absent or has no hash yet.
+pub fn ticket_detail_freeze_hash() -> Option<String> {
+    let (hash, _) = read_cache(DESKTOP_DETAIL_SPEC_ISSUE)?;
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
+/// Calm sentence when the watched cache has no desktop-spec freeze yet.
+pub fn ticket_detail_freeze_missing_sentence() -> String {
+    format!(
+        "No spec freeze cached yet \u{2014} run factory sync {} to snapshot the approved spec.",
+        DESKTOP_DETAIL_SPEC_ISSUE
+    )
+}
+
+/// Desktop detail-plus-runs fragment: the shared runs fragment over the
+/// detail, with the freeze joined from the watched factory cache for
+/// spec #149. Pure over the detail plus the freeze so tests assert
+/// markers without a server.
+pub fn desktop_detail_runs_html(detail: &TicketDetail, freeze_hash: Option<&str>) -> String {
+    let mut html = ticket_detail_fragment_html(detail);
+    html.push_str("<section data-detail-runs>");
+    match freeze_hash {
+        Some(hash) => html.push_str(&format!(
+            "<p data-freeze-hash>Spec freeze <code>{}</code> from the watched factory cache.</p>",
+            escape_html(hash)
+        )),
+        None => html.push_str(&format!(
+            "<p data-freeze-missing>{}</p>",
+            ticket_detail_freeze_missing_sentence()
+        )),
+    }
+    let criteria = ticket_acceptance_criteria(&detail.body);
+    if criteria.is_empty() {
+        html.push_str(
+            "<p data-acceptance-criteria-empty>No acceptance criteria listed on this ticket.</p>",
+        );
+    } else {
+        html.push_str("<ul data-acceptance-criteria>");
+        for item in &criteria {
+            html.push_str(&format!("<li data-criterion>{}</li>", escape_html(item)));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str(&format!(
+        "<pre data-checks-output>{}</pre>",
+        escape_html(&ticket_checks_output(detail))
+    ));
+    html.push_str("<div data-run-buttons>");
+    for command in ["sync", "check", "handoff"] {
+        html.push_str(&format!(
+            "<button data-run=\"{command}\" data-ticket=\"{}\">Run {command}</button>",
+            detail.number
+        ));
+    }
+    html.push_str("</div>");
+    html.push_str("<p data-runner-note>Runs execute through the AgentRunner seam; results join the session identity ledger with the latest verdict tag.</p>");
+    html.push_str("</section>");
+    html
+}
+
+/// Desktop detail-plus-runs JSON: the shared runs JSON over the detail,
+/// with the freeze joined from the watched factory cache for spec #149.
+pub fn desktop_detail_runs_json(
+    detail: &TicketDetail,
+    freeze_hash: Option<&str>,
+) -> serde_json::Value {
+    ticket_detail_runs_json(detail, freeze_hash)
 }
 
 /// Acceptance criteria: the `- [ ]` checklist lines under the
