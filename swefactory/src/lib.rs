@@ -1539,6 +1539,10 @@ pub fn desktop_shell_boot() -> serde_json::Value {
             "run_sync": "ticket_run_sync",
             "run_check": "ticket_run_check",
             "run_handoff": "ticket_run_handoff",
+            "move_to_review": "review_spawn_argv",
+            "review_detail": "desktop_review_html",
+            "review_accept": "review_route",
+            "review_request_changes": "review_route",
         },
     })
 }

@@ -102,3 +102,41 @@
 //         .run(tauri::generate_context!())
 //         .expect("factory shell failed to boot");
 // }
+//
+// Ticket #155 (spec #149): review auto-spawn + verdict routing. Moving a
+// ticket to Review auto-spawns the review agent as a kept hc terminal
+// visible in the sidebar; detail shows diff summary + schema-validated
+// verdict tag payload (last-match-wins via `parse_verdict_tag`) +
+// findings, with Accept routing to accepted/land and Request-changes
+// returning the ticket to To Do. The review terminal stays peekable.
+//
+// #[tauri::command]
+// fn move_to_review(ticket: u64, attempt: u64, review_cmd: String) -> Vec<String> {
+//     // Kept `--bg --keep` hc pane named `t{ticket}-review-a{attempt}`;
+//     // spawning itself stays behind the hc seam; the returned row joins
+//     // the agents sidebar via `review_sidebar_entry` + `sort_agents_sidebar`.
+//     factory_lib::review_spawn_argv(ticket, attempt, &review_cmd)
+// }
+//
+// #[tauri::command]
+// fn review_detail(ticket: u64, attempt: u64, diff_stat: String, transcript: String) -> String {
+//     // Diff summary + verdict tag payload + findings inline, plus the
+//     // peekable review terminal address (`data-review-peek`).
+//     let addr = factory_lib::review_terminal_name(ticket, attempt);
+//     factory_lib::desktop_review_html(ticket, attempt, &diff_stat, &transcript, &addr)
+// }
+//
+// #[tauri::command]
+// fn review_accept(transcript: String) -> String {
+//     // Accept reads only the schema-validated verdict tag decision;
+//     // `accept` routes to accepted/land, anything else to To Do.
+//     let route = factory_lib::review_route(factory_lib::parse_verdict_tag(&transcript).ok().as_deref());
+//     factory_lib::review_route_target(route).to_string()
+// }
+//
+// #[tauri::command]
+// fn review_request_changes(ticket: u64) -> String {
+//     // Explicit Request-changes always returns the ticket to To Do.
+//     let _ = ticket;
+//     factory_lib::review_route_target(factory_lib::ReviewRoute::RequestChanges).to_string()
+// }
