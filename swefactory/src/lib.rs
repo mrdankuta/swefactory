@@ -1508,6 +1508,54 @@ pub fn desktop_window_close_policy() -> serde_json::Value {
     })
 }
 
+// --- hc bundling + installers (ticket #152, spec #149) -----------------
+//
+// Installers ship or bootstrap a usable hc core; an unusable core gets a
+// guided upgrade (never a silent break). Background updates download and
+// take over on restart with terminals surviving in the core. Telemetry is
+// on by default in releases with a Settings Privacy opt-out (ticket #140
+// seam). Auth reuses the gh token + SSH config; no credential store.
+
+/// hc core policy: bundled/bootstrap targets plus the unusable-core path.
+/// Pure; the contract the installer reads.
+pub fn desktop_hc_core_policy() -> serde_json::Value {
+    serde_json::json!({
+        "bundled_targets": ["linux-x86_64", "linux-aarch64", "macos-aarch64"],
+        "provision": "ship-or-bootstrap",
+        "unusable_core": "guided-upgrade",
+        "terminal_owner": "hc-core",
+    })
+}
+
+/// Background-update policy: download in the background, take over on
+/// restart; terminals survive because they live in the hc core.
+/// Pure; the contract the Tauri updater sketch reads.
+pub fn desktop_update_policy() -> serde_json::Value {
+    serde_json::json!({
+        "download": "background",
+        "takeover": "on-restart",
+        "terminals_survive": true,
+        "terminal_owner": "hc-core",
+    })
+}
+
+/// Release telemetry default: on in releases; opt-out lives in Settings
+/// Privacy (`desktop_settings_privacy_html` + `telemetry_enabled`).
+/// Pure over nothing; the contract.
+pub fn desktop_release_telemetry_default() -> bool {
+    true
+}
+
+/// Auth policy: reuse the gh token + SSH config; no credential store.
+/// Pure; the contract the shell documents.
+pub fn desktop_auth_policy() -> serde_json::Value {
+    serde_json::json!({
+        "gh_token": "reuse",
+        "ssh_config": "reuse",
+        "credential_store": "none",
+    })
+}
+
 /// Presence word for one sidebar row: OSC 7501 display presence, or
 /// `unknown` when no well-formed sequence was observed — never a guess.
 fn sidebar_presence_word(term: &AgentTerminal) -> &'static str {

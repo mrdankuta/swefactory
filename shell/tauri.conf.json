@@ -19,8 +19,16 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage", "dmg"],
+    "targets": ["deb", "appimage", "dmg", "nsis"],
     "resources": [],
     "externalBin": ["bin/hc"]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "downloadInBackground": true,
+      "installOnRestart": true
+    }
   }
 }
