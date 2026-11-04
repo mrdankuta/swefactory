@@ -8083,10 +8083,7 @@ pub fn list_factory_projects(root: &std::path::Path) -> Vec<String> {
         if !p.is_dir() {
             continue;
         }
-        if STATUS_PROJECT_FILES
-            .iter()
-            .all(|rel| p.join(rel).is_file())
-        {
+        if STATUS_PROJECT_FILES.iter().all(|rel| p.join(rel).is_file()) {
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                 out.push(name.to_string());
             }
@@ -8237,7 +8234,11 @@ pub fn cmd_telemetry(json: bool, opt_out: bool, opt_in: bool) -> i32 {
     }
     println!(
         "telemetry {}",
-        if enabled { "enabled" } else { "disabled (opt-out)" }
+        if enabled {
+            "enabled"
+        } else {
+            "disabled (opt-out)"
+        }
     );
     0
 }
