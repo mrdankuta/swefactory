@@ -227,6 +227,26 @@ pub enum Commands {
     },
     /// Read-only drift report: open issues vs the dev branch.
     Reconcile,
+    /// Left-rail project switcher (ticket #140): list local repos under
+    /// --root (default: cwd parent scan) containing factory project files
+    /// (same presence rule as `status`). Selecting one scopes board +
+    /// agents + detail in the client. Read-only.
+    Projects {
+        /// Root directory to scan for factory repos (default: cwd).
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+    },
+    /// Usage telemetry (ticket #140): on by default in releases, opt-out
+    /// via Settings Privacy (opt-out file) or FACTORY_TELEMETRY=0.
+    /// `--opt-out` writes the opt-out file; `--opt-in` removes it.
+    Telemetry {
+        /// Opt out of usage telemetry.
+        #[arg(long)]
+        opt_out: bool,
+        /// Opt back in to usage telemetry.
+        #[arg(long)]
+        opt_in: bool,
+    },
     /// Open the work for a ticket: worktree + branch + brief, ready to implement in.
     Start {
         /// Ticket issue number (e.g. 11 or #11).
@@ -1221,6 +1241,190 @@ async fn board_page_handler() -> axum::response::Html<String> {
 
 async fn board_fragment_handler() -> axum::response::Html<String> {
     axum::response::Html(board_fragment_html(&board_data()))
+}
+
+// --- desktop board feed (ticket #137, spec #135) --------------------------
+//
+// The desktop client's center board: the daemon polls the tracker through
+// the `gh` seam and maps issue labels into three columns (To Do / Review /
+// Done) via the existing `board_column_for_labels` mapping. The JSON feed
+// is the polling unit; the HTML center board renders the same feed.
+// No client board database: issues stay canonical on the tracker.
+// Polling is read-only (`gh issue list` only, never a write).
+
+/// Desktop poll bounds: the daemon polls every 30-60s.
+pub const DESKTOP_BOARD_POLL_MS_MIN: u64 = 30_000;
+pub const DESKTOP_BOARD_POLL_MS_MAX: u64 = 60_000;
+/// Default desktop poll interval (inside the 30-60s bound).
+pub const DESKTOP_BOARD_POLL_MS: u64 = 45_000;
+
+/// Fixed desktop column order: To Do, Review, Done.
+pub const DESKTOP_BOARD_COLUMNS: &[(&str, &str)] =
+    &[("todo", "To Do"), ("review", "Review"), ("done", "Done")];
+
+/// One desktop card: number + title + status marker. The marker is the
+/// short column word (`todo` / `review` / `done`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopBoardCard {
+    pub number: u64,
+    pub title: String,
+    pub marker: String,
+}
+
+/// One desktop column: a lane of cards.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopBoardColumn {
+    pub id: String,
+    pub title: String,
+    pub cards: Vec<DesktopBoardCard>,
+}
+
+/// One desktop board feed: three columns plus the staleness flag. `stale`
+/// is true only when the tracker was unreachable and these columns are
+/// the last cache (the board renders the stale banner then).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopBoardFeed {
+    pub columns: Vec<DesktopBoardColumn>,
+    pub stale: bool,
+}
+
+/// Map issue labels into a desktop column via the existing column mapping:
+/// `review` stays Review, `done` stays Done, everything else is To Do.
+/// Pure: unit-tested without `gh`.
+pub fn desktop_board_column_for_labels(labels: &[String]) -> (&'static str, &'static str) {
+    let (id, _) = board_column_for_labels(labels);
+    match id {
+        "review" => ("review", "Review"),
+        "done" => ("done", "Done"),
+        _ => ("todo", "To Do"),
+    }
+}
+
+/// Group issues into the three desktop columns. Pure over fixtures.
+pub fn desktop_board_issues_to_columns(issues: &[BoardIssue]) -> Vec<DesktopBoardColumn> {
+    let mut cols: Vec<DesktopBoardColumn> = DESKTOP_BOARD_COLUMNS
+        .iter()
+        .map(|(id, title)| DesktopBoardColumn {
+            id: id.to_string(),
+            title: title.to_string(),
+            cards: Vec::new(),
+        })
+        .collect();
+    for issue in issues {
+        let (id, _) = desktop_board_column_for_labels(&issue.labels);
+        if let Some(col) = cols.iter_mut().find(|c| c.id == id) {
+            col.cards.push(DesktopBoardCard {
+                number: issue.number,
+                title: issue.title.clone(),
+                marker: id.to_string(),
+            });
+        }
+    }
+    cols
+}
+
+/// Read-only issue fetch for the desktop feed: `Some(issues)` on success
+/// (possibly empty when the tracker has no open issues), `None` when the
+/// tracker is unreachable (`gh` failure or unparseable output). Only runs
+/// `gh issue list` — never a tracker write.
+pub fn desktop_fetch_board_issues() -> Option<Vec<BoardIssue>> {
+    let out = match run_gh_output(&[
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,body,labels,state",
+    ]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return None,
+    };
+    let items: Vec<serde_json::Value> = serde_json::from_str(&out).ok()?;
+    Some(
+        items
+            .iter()
+            .map(|v| BoardIssue {
+                number: v.get("number").and_then(|n| n.as_u64()).unwrap_or(0),
+                title: v
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                body: v
+                    .get("body")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                labels: gh_labels(v),
+                state: v
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("open")
+                    .to_string(),
+            })
+            .filter(|i| i.number != 0)
+            .collect(),
+    )
+}
+
+/// Assemble the desktop feed. `last` is the previous feed (the cache): on
+/// a live fetch the feed is fresh (`stale: false`); when the tracker is
+/// unreachable the last cache is re-served with `stale: true` (empty
+/// columns when there is no cache yet). Read-only.
+pub fn desktop_board_feed(last: Option<&DesktopBoardFeed>) -> DesktopBoardFeed {
+    match desktop_fetch_board_issues() {
+        Some(issues) => DesktopBoardFeed {
+            columns: desktop_board_issues_to_columns(&issues),
+            stale: false,
+        },
+        None => DesktopBoardFeed {
+            columns: last
+                .map(|f| f.columns.clone())
+                .unwrap_or_else(|| desktop_board_issues_to_columns(&[])),
+            stale: true,
+        },
+    }
+}
+
+/// Serialize the feed to JSON (the daemon's polling unit).
+pub fn desktop_board_json(feed: &DesktopBoardFeed) -> String {
+    serde_json::to_string(feed).unwrap_or_else(|_| "{\"columns\":[],\"stale\":true}".to_string())
+}
+
+/// Center-board HTML for the desktop feed. Pure over the feed: cards carry
+/// number + title + marker; a stale feed renders the visible stale banner.
+/// `poll_ms` is clamped into the 30-60s bound.
+pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
+    let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
+    let mut html = format!("<section data-desktop-board data-poll-ms=\"{ms}\">");
+    if feed.stale {
+        html.push_str(
+            "<p data-stale-banner>Tracker unreachable \u{2014} showing the last saved board.</p>",
+        );
+    }
+    html.push_str("<div data-desktop-columns>");
+    for col in &feed.columns {
+        html.push_str(&format!(
+            "<section data-column=\"{}\"><h2>{} ({})</h2>",
+            escape_html(&col.id),
+            escape_html(&col.title),
+            col.cards.len()
+        ));
+        for card in &col.cards {
+            html.push_str(&format!(
+                "<article data-card=\"{}\"><h3>#{} {}</h3><p data-marker>{}</p></article>",
+                card.number,
+                card.number,
+                escape_html(&card.title),
+                escape_html(&card.marker),
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("</div></section>");
+    html
 }
 
 // --- ticket detail (ticket #30, spec #27) ---------------------------------
@@ -8049,6 +8253,180 @@ fn slugify(title: &str) -> String {
         .to_string()
 }
 
+/// Project switcher (ticket #140, spec #135): list local repos under
+/// `root` containing factory project files (same presence rule as
+/// `status`: every STATUS_PROJECT_FILES entry is a file). Sorted by
+/// name; selection scopes board/agents/detail in the client.
+pub fn list_factory_projects(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if STATUS_PROJECT_FILES.iter().all(|rel| p.join(rel).is_file()) {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Usability of the hc core sidecar (ticket #140): `usable` when `hc`
+/// answers `--version`, `missing` when no binary responds, and
+/// `guided-upgrade` when a binary exists but does not answer (stale or
+/// incompatible core gets a guided upgrade, mirroring the herdr-app
+/// installer flow). Linux + macOS ARM installers ship or bootstrap hc.
+pub fn hc_core_usability() -> &'static str {
+    let hc = hc_bin();
+    match probe_stdout(&hc, &["--version"]) {
+        Some(_) => "usable",
+        None => {
+            if tool_present(&hc) || std::path::Path::new(&hc).exists() {
+                "guided-upgrade"
+            } else {
+                "missing"
+            }
+        }
+    }
+}
+
+/// Machine-readable core status over the `hc_bin` seam.
+pub fn hc_core_status() -> serde_json::Value {
+    let usability = hc_core_usability();
+    let version = probe_stdout(&hc_bin(), &["--version"])
+        .map(|v| v.lines().next().unwrap_or("").to_string())
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "bin": hc_bin(),
+        "usability": usability,
+        "version": version,
+        "guided_upgrade": usability == "guided-upgrade",
+    })
+}
+
+/// Background-update contract (ticket #140): the client downloads in
+/// the background and takes over on restart; terminals survive because
+/// they live in the hc core, which the client never owns.
+pub fn background_update_policy() -> serde_json::Value {
+    serde_json::json!({
+        "download": "background",
+        "takeover": "on-restart",
+        "terminals_survive": true,
+        "terminal_owner": "hc-core",
+    })
+}
+
+/// Telemetry opt-out file: <state>/telemetry-opt-out (state root honours
+/// FACTORY_STATE_DIR via dispatch_state_dir; project-local default is
+/// factory/.cache/telemetry-opt-out for the CLI surface).
+fn telemetry_opt_out_file() -> PathBuf {
+    let dir = std::env::var_os("FACTORY_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("factory")
+                .join(".cache")
+        });
+    dir.join("telemetry-opt-out")
+}
+
+/// Usage telemetry (ticket #140): on by default in releases; opt out
+/// via the Settings Privacy opt-out file or FACTORY_TELEMETRY=0.
+pub fn telemetry_enabled() -> bool {
+    if let Ok(v) = std::env::var("FACTORY_TELEMETRY") {
+        if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+            return false;
+        }
+    }
+    !telemetry_opt_out_file().is_file()
+}
+
+/// Write (opt_out=true) or remove (opt_out=false) the opt-out file.
+pub fn set_telemetry_opt_out(opt_out: bool) -> bool {
+    let f = telemetry_opt_out_file();
+    if opt_out {
+        if let Some(parent) = f.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&f, "opt-out\n").is_ok()
+    } else {
+        if f.is_file() {
+            std::fs::remove_file(&f).is_ok()
+        } else {
+            true
+        }
+    }
+}
+
+/// Auth reuse (ticket #140, spec decision): the client reuses `gh` auth
+/// tokens + SSH config; no separate credential store.
+pub fn client_auth_reuse() -> serde_json::Value {
+    serde_json::json!({
+        "gh_auth_token": "reuse",
+        "ssh_config": "reuse",
+        "credential_store": "none",
+    })
+}
+
+pub fn cmd_projects(json: bool, root: Option<&std::path::Path>) -> i32 {
+    let scan = root
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let projects = list_factory_projects(&scan);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "root": scan.to_string_lossy(), "projects": projects })
+        );
+        return 0;
+    }
+    if projects.is_empty() {
+        println!("no factory projects under {}", scan.display());
+    } else {
+        for p in &projects {
+            println!("{p}");
+        }
+    }
+    0
+}
+
+pub fn cmd_telemetry(json: bool, opt_out: bool, opt_in: bool) -> i32 {
+    if opt_out && opt_in {
+        eprintln!("cannot pass both --opt-out and --opt-in");
+        return 1;
+    }
+    if opt_out {
+        set_telemetry_opt_out(true);
+    } else if opt_in {
+        set_telemetry_opt_out(false);
+    }
+    let enabled = telemetry_enabled();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"enabled": enabled, "opt_out_file": telemetry_opt_out_file().to_string_lossy()})
+        );
+        return 0;
+    }
+    println!(
+        "telemetry {}",
+        if enabled {
+            "enabled"
+        } else {
+            "disabled (opt-out)"
+        }
+    );
+    0
+}
+
 #[derive(Serialize)]
 struct StartOutput {
     ticket: u64,
@@ -9725,6 +10103,417 @@ fn live_terminal_tail(addr: &str, tail: usize) -> Option<String> {
 /// only then can a recorded terminal have a live tail worth showing.
 fn attempt_may_be_live(status: &str) -> bool {
     status.ends_with("_running")
+}
+
+// --- agents presence + peek (ticket #136) -------------------------------
+// Backend seam for the Herdr-like desktop client: the Tauri shell lists
+// terminals, subscribes to events, and snapshots status over the `hc`
+// sidecar seam (`hc_bin`, like the existing `pi`/`gh` seams). Presence is
+// Program Status Protocol only (OSC 7501 sequences in the terminal
+// screen) and is never inferred from exit codes, log text, or liveness.
+//
+// Window lifecycle: closing the window only detaches peek sessions —
+// terminals keep running in the core. Reopening resyncs via snapshot
+// (list) + replay (presence re-read per terminal screen).
+
+/// Agent presence from the Program Status Protocol (OSC 7501), and only
+/// from there: no other signal may construct this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPresence {
+    Working,
+    Blocked,
+    Done,
+}
+
+/// Parse the latest OSC 7501 status in terminal screen text:
+/// `ESC ] 7501 ; status=<working|blocked|done>` terminated by BEL or ST.
+/// Returns `None` when no well-formed sequence is present — callers show
+/// "unknown", never a guess. Matching is case-insensitive on the value;
+/// unknown values are ignored (a later well-formed one still wins).
+pub fn parse_osc7501_status(screen: &str) -> Option<AgentPresence> {
+    let bytes = screen.as_bytes();
+    let mut found: Option<AgentPresence> = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b']' {
+            let mut j = i + 2;
+            while j < bytes.len()
+                && bytes[j] != 0x07
+                && !(bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\')
+            {
+                j += 1;
+            }
+            if j < bytes.len() {
+                let end = j;
+                let body = &screen[i + 2..end.min(screen.len())];
+                if let Some(status) = parse_osc7501_body(body) {
+                    found = Some(status);
+                }
+                i = end;
+            } else {
+                // Unterminated trailing sequence: still try the tail.
+                let body = &screen[i + 2..];
+                if let Some(status) = parse_osc7501_body(body) {
+                    found = Some(status);
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// One `7501;...` parameter body: accept `status=<value>` among
+/// semicolon-separated params, case-insensitive on the value.
+fn parse_osc7501_body(body: &str) -> Option<AgentPresence> {
+    let (code, rest) = body.split_once(';')?;
+    if code.trim() != "7501" {
+        return None;
+    }
+    for param in rest.split(';') {
+        let (k, v) = param.split_once('=')?;
+        if k.trim().eq_ignore_ascii_case("status") {
+            return match v.trim().to_ascii_lowercase().as_str() {
+                "working" => Some(AgentPresence::Working),
+                "blocked" => Some(AgentPresence::Blocked),
+                "done" => Some(AgentPresence::Done),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// One live terminal as the agents sidebar shows it. `presence` is
+/// `None` until an OSC 7501 sequence has been observed on its screen.
+/// `seen_done` records that a Done badge was shown and acknowledged, so
+/// it clears; `attached` is whether a peek session streams this terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTerminal {
+    pub address: String,
+    pub name: String,
+    pub presence: Option<AgentPresence>,
+    pub seen_done: bool,
+    pub attached: bool,
+}
+
+impl AgentTerminal {
+    pub fn new(address: &str, name: &str) -> Self {
+        AgentTerminal {
+            address: address.to_string(),
+            name: name.to_string(),
+            presence: None,
+            seen_done: false,
+            attached: false,
+        }
+    }
+
+    /// A Done badge shows at most once: after `mark_done_seen` the row
+    /// reads as cleared (presence stays recorded, display drops it).
+    pub fn mark_done_seen(&mut self) {
+        if self.presence == Some(AgentPresence::Done) {
+            self.seen_done = true;
+        }
+    }
+
+    /// Display presence: seen-Done clears to unknown.
+    pub fn display_presence(&self) -> Option<AgentPresence> {
+        match self.presence {
+            Some(AgentPresence::Done) if self.seen_done => None,
+            other => other,
+        }
+    }
+
+    /// Blocked rows stand out: they sort first in the sidebar.
+    pub fn is_blocked(&self) -> bool {
+        self.display_presence() == Some(AgentPresence::Blocked)
+    }
+}
+
+/// Lenient terminal-list parse (snapshot half of resync): accepts an
+/// array of address strings or objects with a `terminal`/`address`/
+/// `name`/`id` field, or an object holding such an array under
+/// `terminals`/`items`/`data`. Unparseable input reads as no terminals,
+/// never an error — the sidebar renders empty, not broken.
+pub fn parse_hc_terminal_list(stdout: &str) -> Vec<(String, String)> {
+    let value: serde_json::Value = match serde_json::from_str(stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let items: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        serde_json::Value::Object(m) => m
+            .get("terminals")
+            .or_else(|| m.get("items"))
+            .or_else(|| m.get("data"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(s) if !s.is_empty() => Some((s.clone(), s.clone())),
+            serde_json::Value::Object(m) => {
+                let addr = ["terminal", "address", "id"]
+                    .iter()
+                    .find_map(|k| m.get(*k))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())?;
+                let name = m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(addr);
+                Some((addr.to_string(), name.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Snapshot (list) + replay (presence per terminal screen): the whole
+/// reopen path. `screens` maps terminal address to its current screen
+/// text (`hc read` output); presence is parsed from OSC 7501 only.
+/// Previously seen-Done rows stay cleared across resyncs.
+pub fn agents_resync(
+    list_json: &str,
+    screens: &std::collections::HashMap<String, String>,
+    previously_seen_done: &std::collections::HashSet<String>,
+) -> Vec<AgentTerminal> {
+    let mut terms: Vec<AgentTerminal> = parse_hc_terminal_list(list_json)
+        .into_iter()
+        .map(|(address, name)| {
+            let mut t = AgentTerminal::new(&address, &name);
+            if let Some(screen) = screens.get(&address) {
+                t.presence = parse_osc7501_status(screen);
+            }
+            if previously_seen_done.contains(&address) && t.presence == Some(AgentPresence::Done) {
+                t.seen_done = true;
+            }
+            t
+        })
+        .collect();
+    sort_agents_sidebar(&mut terms);
+    terms
+}
+
+/// Sidebar order: blocked stands out first, then working, then done
+/// (uncleared), then unknown — stable within each band.
+pub fn sort_agents_sidebar(terms: &mut [AgentTerminal]) {
+    terms.sort_by_key(|t| match t.display_presence() {
+        Some(AgentPresence::Blocked) => 0,
+        Some(AgentPresence::Working) => 1,
+        Some(AgentPresence::Done) => 2,
+        None => 3,
+    });
+}
+
+/// Click-to-peek attach: streams the live terminal inline. Attaching
+/// twice is a clean no-op.
+pub fn peek_attach(term: &mut AgentTerminal) {
+    term.attached = true;
+}
+
+/// Detach a peek session: stops streaming, terminal keeps running.
+/// Detaching a non-attached row is a clean no-op.
+pub fn peek_detach(term: &mut AgentTerminal) {
+    term.attached = false;
+}
+
+/// Close-the-window path: detach every peek session. Terminals keep
+/// running in the core — this function never kills anything; it only
+/// flips stream flags so reopen can resync from a clean slate.
+pub fn detach_all_peeks(terms: &mut [AgentTerminal]) {
+    for t in terms {
+        t.attached = false;
+    }
+}
+
+/// Live screen for one peeked terminal (`hc read --lines 0 <addr>`).
+/// `None` when the read fails or is empty — the peek pane renders a
+/// calm note instead of erroring; the ledger stays authoritative.
+pub fn peek_read(addr: &str) -> Option<String> {
+    let out = Command::new(hc_bin())
+        .args(["read", "--lines", "0", addr])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// Unit tests (ticket #136): presence parsing, sidebar order,
+/// seen-Done clearing, peek attach/detach, and snapshot+replay resync
+/// are pure, so they pin without windows, terminals, or `hc`.
+#[cfg(test)]
+mod agents_presence_tests {
+    use super::{
+        agents_resync, detach_all_peeks, parse_hc_terminal_list, parse_osc7501_status, peek_attach,
+        peek_detach, sort_agents_sidebar, AgentPresence, AgentTerminal,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn status_parses_all_three_presence_words() {
+        assert_eq!(
+            parse_osc7501_status("\x1b]7501;status=working\x07"),
+            Some(AgentPresence::Working)
+        );
+        assert_eq!(
+            parse_osc7501_status("\x1b]7501;status=blocked\x07"),
+            Some(AgentPresence::Blocked)
+        );
+        assert_eq!(
+            parse_osc7501_status("\x1b]7501;status=done\x07"),
+            Some(AgentPresence::Done)
+        );
+    }
+
+    #[test]
+    fn status_accepts_st_terminator_and_case_variants() {
+        assert_eq!(
+            parse_osc7501_status("\x1b]7501;status=Blocked\x1b\\"),
+            Some(AgentPresence::Blocked)
+        );
+        assert_eq!(
+            parse_osc7501_status("noise\x1b]7501;STATUS=Done\x07trailing"),
+            Some(AgentPresence::Done)
+        );
+    }
+
+    #[test]
+    fn status_is_never_inferred() {
+        // Exit codes, prose, other OSC codes, and unknown values read as unknown.
+        assert_eq!(parse_osc7501_status("exit_code 0\nall tests pass"), None);
+        assert_eq!(parse_osc7501_status("\x1b]7499;status=working\x07"), None);
+        assert_eq!(parse_osc7501_status("\x1b]7501;status=napping\x07"), None);
+        assert_eq!(parse_osc7501_status(""), None);
+        // Unknown values do not poison a later well-formed sequence.
+        assert_eq!(
+            parse_osc7501_status("\x1b]7501;status=napping\x07more\x1b]7501;status=done\x07"),
+            Some(AgentPresence::Done)
+        );
+    }
+
+    #[test]
+    fn status_last_sequence_wins() {
+        let screen = "\x1b]7501;status=working\x07doing things\x1b]7501;status=blocked\x07";
+        assert_eq!(parse_osc7501_status(screen), Some(AgentPresence::Blocked));
+    }
+
+    #[test]
+    fn blocked_sorts_first_and_seen_done_clears() {
+        let mut terms = vec![
+            AgentTerminal::new("a", "a"),
+            AgentTerminal::new("b", "b"),
+            AgentTerminal::new("c", "c"),
+            AgentTerminal::new("d", "d"),
+        ];
+        terms[0].presence = Some(AgentPresence::Done);
+        terms[1].presence = Some(AgentPresence::Working);
+        terms[2].presence = Some(AgentPresence::Blocked);
+        // d stays unknown.
+        sort_agents_sidebar(&mut terms);
+        assert!(terms[0].is_blocked());
+        assert_eq!(terms[0].address, "c");
+        assert_eq!(terms[1].display_presence(), Some(AgentPresence::Working));
+        assert_eq!(terms[2].display_presence(), Some(AgentPresence::Done));
+        assert_eq!(terms[3].display_presence(), None);
+        // Done clears once seen: drops out of the Done band to unknown.
+        terms[2].mark_done_seen();
+        assert_eq!(terms[2].display_presence(), None);
+        assert!(!terms[2].is_blocked());
+        // Seeing a non-Done row is a no-op.
+        terms[0].mark_done_seen();
+        assert!(terms[0].is_blocked());
+    }
+
+    #[test]
+    fn peek_attach_detach_is_clean() {
+        let mut t = AgentTerminal::new("m/box", "worker");
+        assert!(!t.attached);
+        peek_attach(&mut t);
+        assert!(t.attached);
+        // Re-attach is a no-op.
+        peek_attach(&mut t);
+        assert!(t.attached);
+        peek_detach(&mut t);
+        assert!(!t.attached);
+        // Detaching twice stays clean.
+        peek_detach(&mut t);
+        assert!(!t.attached);
+    }
+
+    #[test]
+    fn close_detaches_peeks_without_killing() {
+        let mut terms = vec![AgentTerminal::new("a", "a"), AgentTerminal::new("b", "b")];
+        for t in &mut terms {
+            peek_attach(t);
+        }
+        detach_all_peeks(&mut terms);
+        assert!(terms.iter().all(|t| !t.attached));
+        // Rows (and by construction their core terminals) survive.
+        assert_eq!(terms.len(), 2);
+    }
+
+    #[test]
+    fn terminal_list_parse_accepts_observed_shapes() {
+        let arr = r#"[{"terminal":"m/t1","name":"w1"},"m/t2"]"#;
+        assert_eq!(
+            parse_hc_terminal_list(arr),
+            vec![
+                ("m/t1".to_string(), "w1".to_string()),
+                ("m/t2".to_string(), "m/t2".to_string()),
+            ]
+        );
+        let wrapped = r#"{"terminals":[{"address":"m/t3"}]}"#;
+        assert_eq!(
+            parse_hc_terminal_list(wrapped),
+            vec![("m/t3".to_string(), "m/t3".to_string())]
+        );
+        assert!(parse_hc_terminal_list("not json").is_empty());
+        assert!(parse_hc_terminal_list("{}").is_empty());
+    }
+
+    #[test]
+    fn resync_snapshots_lists_and_replays_presence() {
+        let list = r#"[{"terminal":"m/a","name":"impl"},{"terminal":"m/b","name":"review"}]"#;
+        let mut screens = HashMap::new();
+        screens.insert(
+            "m/a".to_string(),
+            "\x1b]7501;status=blocked\x07".to_string(),
+        );
+        screens.insert("m/b".to_string(), "plain output, no protocol".to_string());
+        let terms = agents_resync(list, &screens, &HashSet::new());
+        assert_eq!(terms.len(), 2);
+        // Blocked stands out first after resync.
+        assert_eq!(terms[0].address, "m/a");
+        assert!(terms[0].is_blocked());
+        // No OSC 7501 on b: unknown, never inferred from liveness.
+        assert_eq!(terms[1].display_presence(), None);
+        // Peek sessions never survive a close: resynced rows start detached.
+        assert!(terms.iter().all(|t| !t.attached));
+    }
+
+    #[test]
+    fn resync_keeps_seen_done_cleared() {
+        let list = r#"["m/a"]"#;
+        let mut screens = HashMap::new();
+        screens.insert("m/a".to_string(), "\x1b]7501;status=done\x07".to_string());
+        let mut seen = HashSet::new();
+        seen.insert("m/a".to_string());
+        let terms = agents_resync(list, &screens, &seen);
+        assert_eq!(terms[0].presence, Some(AgentPresence::Done));
+        assert_eq!(terms[0].display_presence(), None);
+    }
 }
 
 /// Unit tests (ticket #125): the persistent-terminal naming and output
@@ -18761,6 +19550,8 @@ pub fn run() -> i32 {
             body,
         } => cmd_handoff(&issue, &signal, body.as_ref(), cli.json),
         Commands::Reconcile => cmd_reconcile(cli.json),
+        Commands::Projects { root } => cmd_projects(cli.json, root.as_deref()),
+        Commands::Telemetry { opt_out, opt_in } => cmd_telemetry(cli.json, opt_out, opt_in),
         Commands::Start { ticket, worktree } => cmd_start(&ticket, worktree.as_ref(), cli.json),
         Commands::Dispatch { action } => match action {
             DispatchAction::Once {
