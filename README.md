@@ -1,38 +1,55 @@
 # swefactory — the software factory as a product
 
 > Vision: production-grade software engineering, consumer-simple UX.
-> Read first: `docs/product/FACTORY-PRODUCT.md`.
 >
 > Download: https://mrdankuta.github.io/swefactory/ (prebuilt binaries +
 > one-line installers for every release).
 
+Single static `factory` binary (Rust, `swefactory/`): issues are the
+authority, the dispatch ledger is the audit trail, and an optional
+[herdr-core](https://herdr.dev/core) sidecar gives attempts persistent,
+attachable terminals (local or on remote builders).
+
 ## Layout
 
-* `pi-factory/` — git submodule of the true source, `github.com/mrdankuta/pi-factory` @ `bec5572` (v0.5.1+; retry worktree-reuse fix). This is the rewrite reference. Clone with `git clone --recurse-submodules`, or run `git submodule update --init` after clone.
-  * `bin/` — `factory`, `factory-dispatch` · `checks/` — elixir/node/python adapters
-  * `prompts/` (incl. `review-integration.md`), `skills/`, `templates/`,
-  * `docs/` (`DISPATCHER`, `HERDR`, `SKILL-PINS`, `USAGE`, `WORKFLOW`),
-  * `github/` (issue templates + labels + CI workflows), `install.sh`, `README.md`
-* `factory-v0.4.0/` — installed/adapted instance as deployed in booksbuddy
-  (project shim layout: `scripts/` instead of `bin/`, adapted `SKILL.md`
-  files, `AGENTS.header.md` merge result, `GLOSSARY` example). Shows how
-  the toolkit lands in a real project; secondary reference.
-  * `scripts/` — `factory`, `factory-dispatch`, `factory-check`, `factory-reconcile`
-  * `prompts/` — `plan`, `build`, `review`, `handoff`
-  * `skills/` — `to-spec`, `to-tickets`, `tdd`, `code-review`, `land`, `pr`, `retro`, …
-  * `factory/` — toolkit README (issues-are-authority model)
-  * `AGENTS.header.md`, `GLOSSARY.example.md`, `VERSION`
-* `docs/product/FACTORY-PRODUCT.md` — product vision (users, Orca learnings, Rust architecture, roadmap).
-* `sessions/` — exported working-session notes that led here.
+* `swefactory/` — the product: CLI + library, embedded templates,
+  integration tests. See `swefactory/README.md` for commands.
+* `swefactory/templates/` — prompts, skills, check adapters, issue
+  templates, and herdr-core agent-role templates, all baked into the
+  binary at compile time.
+* `scripts/factory-check` — the repo's own gate: `fmt --check` →
+  `clippy -D warnings` → `cargo test`. Run before every handoff.
+* `factory/` — local runtime state (gitignored): dispatch ledger,
+  logs, worktrees, cache snapshots.
+* `docs/adr/` — architecture decisions (`0001`: herdr-core stays a
+  sidecar; ledger owns audit, core owns liveness).
+* `GLOSSARY.md` — domain vocabulary used in issues and code.
+* `oranda.json` — download-site config (Pages home + cargo-dist
+  artifacts source).
 
-## Origin
+## Workflow
 
-Forked from an Orca agent session (`9cff49ef…`, agent `pi`) that was
-proving the release-train dispatcher (`integration/20261008-first-train`,
-tickets #98/#99). This repo is the independent continuation.
+Product decisions live in GitHub issues (epic + spec + ticket); the
+spec issue body at the `SPEC-APPROVED` freeze is authoritative.
+`factory freeze/sync` manage the freeze, `factory dispatch` runs
+attempts through implement → verify → review, and humans land via the
+release train. See `AGENTS.md` for the delivery rules.
 
-## Next steps
+## Install & release
 
-1. Decide wedge (solo builders vs Linear teams) — see open questions in the vision doc.
-2. Scaffold Rust workspace: `factory` CLI + `factoryd` daemon (v0.5 parity).
-3. `TaskStore: github` backed by the v0.4.0 protocol, then `linear`.
+```sh
+# From a release (no toolchain):
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/mrdankuta/swefactory/releases/latest/download/factory-installer.sh | sh
+factory --version
+```
+
+```sh
+# From source:
+cargo install --path swefactory --locked
+scripts/factory-check      # green before every handoff
+```
+
+Releases are tag-driven: bump `swefactory/Cargo.toml` + `CHANGELOG.md`,
+commit, push tag `vX.Y.Z` — cargo-dist builds and uploads all
+platforms plus installers (see `.github/workflows/release.yml`).

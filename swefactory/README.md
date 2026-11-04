@@ -56,7 +56,8 @@ factory verify-freeze 6    # exit 0 iff body still matches the freeze;
 
 factory init [--stack rust|elixir|node|python|go|ruby|php|java|dotnet|swift] [--global-skills]
                          # seed prompts, skills, check adapter, issue
-                         # templates, and labels into the current project
+                         # templates, agent-role templates, and labels
+                         # into the current project
 factory update [--pin vX.Y.Z]
                          # refresh from embedded templates (no-op when in place)
 ```
@@ -89,7 +90,10 @@ Installed into the project: `.pi/prompts/*`, `.agents/skills/*`
 (`--global-skills` targets `~/.agents/skills` instead), the stack's
 check adapter, `.github/ISSUE_TEMPLATE/{spec,ticket}.yml`, the `AGENTS.md`
 header merge, `GLOSSARY.md` + `docs/README.md` skeletons,
-`factory/.cache/`, and `.factory-version`.
+`factory/.cache/`, and `.factory-version`. Agent-role templates
+(`implementer`, `reviewer`) go to the herdr-core config dir
+(`~/.config/herdr-core/templates/`, honoring `XDG_CONFIG_HOME`) so
+`hc run --bg <name>` resolves them — see below.
 
 ## Seed layout contracts
 
@@ -170,6 +174,37 @@ override the binaries under test. `reconcile` never writes: no issue
 comments/edits and no pushes. `start` never touches GitHub state either —
 it reads the ticket via `gh issue view` and creates only local
 worktree/branch/brief state.
+
+## Persistent terminals (herdr-core sidecar)
+
+`factory` treats [herdr-core](https://herdr.dev/core) (`hc`) as its
+execution sidecar: the core owns terminal liveness, the dispatch ledger
+owns audit. `factory doctor` probes it (`agent-runtime` check reports
+`hc` version plus the `HC_SESSION` in use — daemon, UI, and CLI must
+agree on one session). Seams: `FACTORY_HC_BIN`, `HC_SESSION`.
+
+```sh
+factory dispatch once --persistent-terminal
+                         # implement runs inside hc run --bg --name
+                         # t<N>-impl-a<M> in the ticket worktree: survives
+                         # dispatcher restarts, stays attachable
+                         # (hc attach <addr>), expiry leaves it running
+factory dispatch once --persistent-terminal --on box
+                         # schedule on the hc machine `box`
+                         # (hc machine add first); ledger records the
+                         # full machine/terminal address
+```
+
+The terminal address is recorded on the attempt row at spawn, so
+liveness survives the dispatcher either way: `factory log` shows the
+live `hc read` tail beside the ledger transcript for running attempts
+(calm note when unreachable, nothing once finished), and board cards
+for running tickets carry their `hc attach` command. Launch readiness
+is gated on first-message delivery — an undelivered task fails loudly
+with attach instructions instead of running blind.
+
+Default path unchanged: without the flag, implement stays a one-shot
+subprocess with the historical timeout-kill semantics.
 
 ## factory ui (local web, Bea-first)
 
