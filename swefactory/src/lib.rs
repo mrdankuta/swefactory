@@ -21952,10 +21952,7 @@ pub fn review_diff_summary(stat: &str) -> String {
 /// human findings read side by side instead of interleaved.
 pub fn review_findings(transcript: &str) -> String {
     let mut out = transcript.to_string();
-    loop {
-        let Some(open) = out.find("<verdict>") else {
-            break;
-        };
+    while let Some(open) = out.find("<verdict>") {
         let after = open + "<verdict>".len();
         let Some(rel) = out[after..].find("</verdict>") else {
             break;
