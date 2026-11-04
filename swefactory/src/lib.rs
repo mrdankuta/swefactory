@@ -1427,6 +1427,69 @@ pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
     html
 }
 
+/// Center-board HTML with card selection (ticket #151, spec #149).
+/// Pure over the feed: the selected card (by number) is flagged
+/// `data-selected="true"` and the board carries
+/// `data-selected-card="<n>" data-scopes="detail"` so selecting a card
+/// scopes the detail pane. `None` (or an unknown number) selects nothing.
+/// `poll_ms` is clamped into the 30-60s bound. No client board database:
+/// selection reads the feed only; Issues stay canonical on the tracker.
+pub fn desktop_board_select(feed: &DesktopBoardFeed, number: u64) -> Option<DesktopBoardCard> {
+    feed.columns
+        .iter()
+        .flat_map(|c| c.cards.iter())
+        .find(|c| c.number == number)
+        .cloned()
+}
+
+/// Center-board HTML with selection. Delegates the unselected case to
+/// [`desktop_board_html`]; the selected case re-renders with the
+/// selection contract above.
+pub fn desktop_board_html_with_selection(
+    feed: &DesktopBoardFeed,
+    poll_ms: u64,
+    selected: Option<u64>,
+) -> String {
+    let picked = selected.and_then(|n| desktop_board_select(feed, n).map(|c| c.number));
+    let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
+    let sel_attr = match picked {
+        Some(n) => format!(" data-selected-card=\"{n}\" data-scopes=\"detail\"").to_string(),
+        None => String::new(),
+    };
+    let mut html = format!("<section data-desktop-board data-poll-ms=\"{ms}\"{sel_attr}>");
+    if feed.stale {
+        html.push_str(
+            "<p data-stale-banner>Tracker unreachable \u{2014} showing the last saved board.</p>",
+        );
+    }
+    html.push_str("<div data-desktop-columns>");
+    for col in &feed.columns {
+        html.push_str(&format!(
+            "<section data-column=\"{}\"><h2>{} ({})</h2>",
+            escape_html(&col.id),
+            escape_html(&col.title),
+            col.cards.len()
+        ));
+        for card in &col.cards {
+            let sel = if Some(card.number) == picked {
+                " data-selected=\"true\""
+            } else {
+                ""
+            };
+            html.push_str(&format!(
+                "<article data-card=\"{}\"{sel}><h3>#{} {}</h3><p data-marker>{}</p></article>",
+                card.number,
+                card.number,
+                escape_html(&card.title),
+                escape_html(&card.marker),
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("</div></section>");
+    html
+}
+
 /// Left-rail project switcher HTML (ticket #140): lists factory repos;
 /// selecting one scopes board + agents + detail (the `data-scopes` +
 /// `data-active-project` contract the client reads). Pure over inputs.
@@ -1492,6 +1555,7 @@ pub fn desktop_shell_boot() -> serde_json::Value {
             "agents_snapshot": "agents_resync",
             "peek_read": "peek_read",
             "board_feed": "desktop_board_feed",
+            "board_select": "desktop_board_select",
         },
     })
 }

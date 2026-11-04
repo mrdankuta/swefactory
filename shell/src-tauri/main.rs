@@ -3,7 +3,8 @@
 // no new API layer). Reference for the beta installer milestone;
 // the contract is pinned by desktop_shell_boot() + ui_shell_left_rail tests.
 //
-// use factory_lib::{agents_resync, desktop_board_feed, list_factory_projects, peek_read};
+// use factory_lib::{agents_resync, desktop_board_feed, desktop_board_select,
+//     list_factory_projects, peek_read, DesktopBoardFeed};
 // use std::collections::{HashMap, HashSet};
 //
 // #[tauri::command]
@@ -24,6 +25,21 @@
 // }
 //
 // #[tauri::command]
+// fn board_feed(last: Option<DesktopBoardFeed>) -> DesktopBoardFeed {
+//     // Ticket #151: read-only poll of the tracker (`gh issue list` only);
+//     // unreachable tracker re-serves the last cache with a stale banner.
+//     // No client board database; Issues stay canonical.
+//     factory_lib::desktop_board_feed(last.as_ref())
+// }
+//
+// #[tauri::command]
+// fn board_select(feed: DesktopBoardFeed, number: u64) -> Option<factory_lib::DesktopBoardCard> {
+//     // Ticket #151: pure over the feed — selecting a card scopes the
+//     // detail pane; never writes to the tracker.
+//     factory_lib::desktop_board_select(&feed, number)
+// }
+//
+// #[tauri::command]
 // fn peek_read(addr: String) -> Option<String> { factory_lib::peek_read(&addr) }
 //
 // #[tauri::command]
@@ -38,6 +54,8 @@
 //             shell_boot,
 //             list_projects,
 //             agents_snapshot,
+//             board_feed,
+//             board_select,
 //             peek_read
 //         ])
 //         .run(tauri::generate_context!())
