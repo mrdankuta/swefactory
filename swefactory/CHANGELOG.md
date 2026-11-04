@@ -5,6 +5,8 @@ file when generating release notes for each tagged release.
 
 ## [Unreleased]
 
+## 0.1.0-rc.11 — herdr-core sidecar: persistent-terminal dispatch
+
 ### herdr-core sidecar: persistent-terminal dispatch (tickets #123–#128)
 
 - `factory doctor` gains the `agent-runtime` check: `hc` presence/version
