@@ -1889,7 +1889,7 @@ pub const TICKET_SPEC_ISSUE: u64 = 135;
 
 /// Inline Run-button result: pass/fail plus the named cause, matching
 /// CLI exit semantics (0 means pass).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TicketRunOutcome {
     pub command: String,
     pub passed: bool,
@@ -10692,7 +10692,7 @@ fn attempt_may_be_live(status: &str) -> bool {
 
 /// Agent presence from the Program Status Protocol (OSC 7501), and only
 /// from there: no other signal may construct this value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentPresence {
     Working,
     Blocked,
@@ -10763,7 +10763,7 @@ fn parse_osc7501_body(body: &str) -> Option<AgentPresence> {
 /// `None` until an OSC 7501 sequence has been observed on its screen.
 /// `seen_done` records that a Done badge was shown and acknowledged, so
 /// it clears; `attached` is whether a peek session streams this terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentTerminal {
     pub address: String,
     pub name: String,
@@ -10922,6 +10922,21 @@ pub fn peek_read(addr: &str) -> Option<String> {
         return None;
     }
     Some(text)
+}
+
+/// Raw `hc ls` output for the shell's agents sidebar (ticket #156).
+/// `None` when the core is unreachable — the sidebar renders every
+/// known terminal without presence rather than erroring. Overridable
+/// via FACTORY_HC_BIN for hermetic tests.
+pub fn hc_terminal_list_json() -> Option<String> {
+    let out = Command::new(hc_bin())
+        .args(["ls"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Unit tests (ticket #136): presence parsing, sidebar order,
