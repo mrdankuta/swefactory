@@ -1223,6 +1223,190 @@ async fn board_fragment_handler() -> axum::response::Html<String> {
     axum::response::Html(board_fragment_html(&board_data()))
 }
 
+// --- desktop board feed (ticket #137, spec #135) --------------------------
+//
+// The desktop client's center board: the daemon polls the tracker through
+// the `gh` seam and maps issue labels into three columns (To Do / Review /
+// Done) via the existing `board_column_for_labels` mapping. The JSON feed
+// is the polling unit; the HTML center board renders the same feed.
+// No client board database: issues stay canonical on the tracker.
+// Polling is read-only (`gh issue list` only, never a write).
+
+/// Desktop poll bounds: the daemon polls every 30-60s.
+pub const DESKTOP_BOARD_POLL_MS_MIN: u64 = 30_000;
+pub const DESKTOP_BOARD_POLL_MS_MAX: u64 = 60_000;
+/// Default desktop poll interval (inside the 30-60s bound).
+pub const DESKTOP_BOARD_POLL_MS: u64 = 45_000;
+
+/// Fixed desktop column order: To Do, Review, Done.
+pub const DESKTOP_BOARD_COLUMNS: &[(&str, &str)] =
+    &[("todo", "To Do"), ("review", "Review"), ("done", "Done")];
+
+/// One desktop card: number + title + status marker. The marker is the
+/// short column word (`todo` / `review` / `done`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopBoardCard {
+    pub number: u64,
+    pub title: String,
+    pub marker: String,
+}
+
+/// One desktop column: a lane of cards.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopBoardColumn {
+    pub id: String,
+    pub title: String,
+    pub cards: Vec<DesktopBoardCard>,
+}
+
+/// One desktop board feed: three columns plus the staleness flag. `stale`
+/// is true only when the tracker was unreachable and these columns are
+/// the last cache (the board renders the stale banner then).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopBoardFeed {
+    pub columns: Vec<DesktopBoardColumn>,
+    pub stale: bool,
+}
+
+/// Map issue labels into a desktop column via the existing column mapping:
+/// `review` stays Review, `done` stays Done, everything else is To Do.
+/// Pure: unit-tested without `gh`.
+pub fn desktop_board_column_for_labels(labels: &[String]) -> (&'static str, &'static str) {
+    let (id, _) = board_column_for_labels(labels);
+    match id {
+        "review" => ("review", "Review"),
+        "done" => ("done", "Done"),
+        _ => ("todo", "To Do"),
+    }
+}
+
+/// Group issues into the three desktop columns. Pure over fixtures.
+pub fn desktop_board_issues_to_columns(issues: &[BoardIssue]) -> Vec<DesktopBoardColumn> {
+    let mut cols: Vec<DesktopBoardColumn> = DESKTOP_BOARD_COLUMNS
+        .iter()
+        .map(|(id, title)| DesktopBoardColumn {
+            id: id.to_string(),
+            title: title.to_string(),
+            cards: Vec::new(),
+        })
+        .collect();
+    for issue in issues {
+        let (id, _) = desktop_board_column_for_labels(&issue.labels);
+        if let Some(col) = cols.iter_mut().find(|c| c.id == id) {
+            col.cards.push(DesktopBoardCard {
+                number: issue.number,
+                title: issue.title.clone(),
+                marker: id.to_string(),
+            });
+        }
+    }
+    cols
+}
+
+/// Read-only issue fetch for the desktop feed: `Some(issues)` on success
+/// (possibly empty when the tracker has no open issues), `None` when the
+/// tracker is unreachable (`gh` failure or unparseable output). Only runs
+/// `gh issue list` — never a tracker write.
+pub fn desktop_fetch_board_issues() -> Option<Vec<BoardIssue>> {
+    let out = match run_gh_output(&[
+        "issue",
+        "list",
+        "--state",
+        "open",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,body,labels,state",
+    ]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return None,
+    };
+    let items: Vec<serde_json::Value> = serde_json::from_str(&out).ok()?;
+    Some(
+        items
+            .iter()
+            .map(|v| BoardIssue {
+                number: v.get("number").and_then(|n| n.as_u64()).unwrap_or(0),
+                title: v
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                body: v
+                    .get("body")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                labels: gh_labels(v),
+                state: v
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("open")
+                    .to_string(),
+            })
+            .filter(|i| i.number != 0)
+            .collect(),
+    )
+}
+
+/// Assemble the desktop feed. `last` is the previous feed (the cache): on
+/// a live fetch the feed is fresh (`stale: false`); when the tracker is
+/// unreachable the last cache is re-served with `stale: true` (empty
+/// columns when there is no cache yet). Read-only.
+pub fn desktop_board_feed(last: Option<&DesktopBoardFeed>) -> DesktopBoardFeed {
+    match desktop_fetch_board_issues() {
+        Some(issues) => DesktopBoardFeed {
+            columns: desktop_board_issues_to_columns(&issues),
+            stale: false,
+        },
+        None => DesktopBoardFeed {
+            columns: last
+                .map(|f| f.columns.clone())
+                .unwrap_or_else(|| desktop_board_issues_to_columns(&[])),
+            stale: true,
+        },
+    }
+}
+
+/// Serialize the feed to JSON (the daemon's polling unit).
+pub fn desktop_board_json(feed: &DesktopBoardFeed) -> String {
+    serde_json::to_string(feed).unwrap_or_else(|_| "{\"columns\":[],\"stale\":true}".to_string())
+}
+
+/// Center-board HTML for the desktop feed. Pure over the feed: cards carry
+/// number + title + marker; a stale feed renders the visible stale banner.
+/// `poll_ms` is clamped into the 30-60s bound.
+pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
+    let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
+    let mut html = format!("<section data-desktop-board data-poll-ms=\"{ms}\">");
+    if feed.stale {
+        html.push_str(
+            "<p data-stale-banner>Tracker unreachable \u{2014} showing the last saved board.</p>",
+        );
+    }
+    html.push_str("<div data-desktop-columns>");
+    for col in &feed.columns {
+        html.push_str(&format!(
+            "<section data-column=\"{}\"><h2>{} ({})</h2>",
+            escape_html(&col.id),
+            escape_html(&col.title),
+            col.cards.len()
+        ));
+        for card in &col.cards {
+            html.push_str(&format!(
+                "<article data-card=\"{}\"><h3>#{} {}</h3><p data-marker>{}</p></article>",
+                card.number,
+                card.number,
+                escape_html(&card.title),
+                escape_html(&card.marker),
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("</div></section>");
+    html
+}
+
 // --- ticket detail (ticket #30, spec #27) ---------------------------------
 //
 // Bea taps a board card and lands here: the issue body in plain words,
