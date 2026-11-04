@@ -1463,6 +1463,119 @@ pub fn desktop_settings_privacy_html(telemetry_on: bool) -> String {
     )
 }
 
+// --- shell skeleton + left rail (ticket #150, spec #149) -----------------
+//
+// The Tauri desktop shell boots with its Rust backend calling
+// `factory_lib` directly in-process (the same call pattern the web-board
+// handlers already use for board, detail, sync, check, handoff): no
+// separate daemon process, no new API layer. The left rail pairs the
+// project switcher (ticket #140 seam: factory repos under the root;
+// selecting one scopes board + agents + detail in the client) with the
+// agents sidebar (ticket #136 seam: Working/Blocked/Done presence from
+// the Program Status Protocol only, never inferred; seen-Done clears).
+// Click-to-peek renders `hc` read streams inline; closing the window
+// only detaches peek sessions — terminals keep running in the core.
+
+/// Shell boot manifest: proves the shell-plus-seam contract. The Tauri
+/// backend calls `factory_lib` in-process (`backend` names the crate,
+/// `daemon` is null, `api_layer` is none); `hc` owns terminal liveness.
+/// Pure: the `shell/` skeleton maps each Tauri command to the named
+/// `factory_lib` function in this manifest.
+pub fn desktop_shell_boot() -> serde_json::Value {
+    serde_json::json!({
+        "backend": "factory_lib-in-process",
+        "daemon": null,
+        "api_layer": "none",
+        "terminal_owner": "hc-core",
+        "commands": {
+            "list_projects": "list_factory_projects",
+            "agents_snapshot": "agents_resync",
+            "peek_read": "peek_read",
+            "board_feed": "desktop_board_feed",
+        },
+    })
+}
+
+/// Window-close policy: closing the window detaches peek sessions only.
+/// Terminals keep running in the core (`detach_all_peeks` flips stream
+/// flags; it never kills anything). Pure over nothing; the contract.
+pub fn desktop_window_close_policy() -> serde_json::Value {
+    serde_json::json!({
+        "on_close": "detach-peeks",
+        "terminals_keep_running": true,
+        "terminal_owner": "hc-core",
+        "on_reopen": "resync-snapshot-replay",
+    })
+}
+
+/// Presence word for one sidebar row: OSC 7501 display presence, or
+/// `unknown` when no well-formed sequence was observed — never a guess.
+fn sidebar_presence_word(term: &AgentTerminal) -> &'static str {
+    match term.display_presence() {
+        Some(AgentPresence::Working) => "working",
+        Some(AgentPresence::Blocked) => "blocked",
+        Some(AgentPresence::Done) => "done",
+        None => "unknown",
+    }
+}
+
+/// Agents sidebar HTML: one row per live terminal with its Program
+/// Status Protocol presence. Blocked rows stand out first (`data-blocked
+/// = "true"` for the client highlight); seen-Done rows clear via
+/// `display_presence`, so no `done` badge survives acknowledgement.
+/// Every row carries its peek target (`data-peek` = terminal address).
+/// Pure over the resynced terminal rows.
+pub fn desktop_agents_sidebar_html(terms: &[AgentTerminal]) -> String {
+    let mut html = String::from("<aside data-agents-sidebar>");
+    for t in terms {
+        let presence = sidebar_presence_word(t);
+        html.push_str(&format!(
+            "<button data-agent=\"{}\" data-presence=\"{}\" data-blocked=\"{}\" data-peek=\"{}\">{}</button>",
+            escape_html(&t.address),
+            presence,
+            t.is_blocked(),
+            escape_html(&t.address),
+            escape_html(&t.name),
+        ));
+    }
+    html.push_str("</aside>");
+    html
+}
+
+/// Left rail HTML: project switcher above the agents sidebar. Selecting
+/// a project scopes the client (`data-scopes` + `data-active-project`
+/// contract the client reads). Pure over projects, selection, and rows.
+pub fn desktop_left_rail_html(
+    projects: &[String],
+    active: Option<&str>,
+    terms: &[AgentTerminal],
+) -> String {
+    format!(
+        "<div data-left-rail data-active-project=\"{}\">{}{}</div>",
+        escape_html(active.unwrap_or("")),
+        desktop_project_switcher_html(projects, active),
+        desktop_agents_sidebar_html(terms),
+    )
+}
+
+/// Click-to-peek pane: renders the live terminal screen (`hc read`
+/// output) inline. A failed or empty read renders a calm empty pane
+/// (`data-peek-empty`) instead of erroring; the ledger stays
+/// authoritative. Pure over the address and optional screen text.
+pub fn desktop_peek_html(addr: &str, screen: Option<&str>) -> String {
+    match screen {
+        Some(text) if !text.trim().is_empty() => format!(
+            "<section data-peek-pane=\"{}\"><pre data-peek-live>{}</pre></section>",
+            escape_html(addr),
+            escape_html(text),
+        ),
+        _ => format!(
+            "<section data-peek-pane=\"{}\" data-peek-empty><p>No live output \u{2014} the terminal may have ended; the attempt ledger stays authoritative.</p></section>",
+            escape_html(addr),
+        ),
+    }
+}
+
 // --- ticket detail (ticket #30, spec #27) ---------------------------------
 //
 // Bea taps a board card and lands here: the issue body in plain words,

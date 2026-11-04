@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Factory</title>
+  </head>
+  <body>
+    <!-- Ticket #150: left rail mounts the server-rendered rail
+         (desktop_left_rail_html: switcher + agents sidebar).
+         Selecting a project scopes board + agents + detail. -->
+    <div id="left-rail" data-left-rail></div>
+    <main id="board" data-board-fragment></main>
+    <!-- Click-to-peek renders desktop_peek_html(addr, hc read stream). -->
+    <section id="peek" data-peek-mount></section>
+    <script type="module">
+      import { invoke } from "@tauri-apps/api/core";
+      const boot = await invoke("shell_boot");
+      document.getElementById("left-rail").dataset.backend = boot.backend;
+      async function refreshRail() {
+        const projects = await invoke("list_projects");
+        const agents = await invoke("agents_snapshot");
+        const active = document.getElementById("left-rail").dataset.activeProject || null;
+        // Rendering is server-side (factory_lib HTML); the client mounts it.
+        const { render_left_rail } = await import("./rail.js").catch(() => ({}));
+        if (render_left_rail) render_left_rail({ projects, agents, active });
+      }
+      await refreshRail();
+    </script>
+  </body>
+</html>
