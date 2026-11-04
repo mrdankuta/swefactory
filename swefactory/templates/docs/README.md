@@ -43,3 +43,23 @@ The factory's own footprint. Leave these to the tool.
 All future seeds land under the factory-owned directory (`factory/`).
 No new top-level or conventional-path files will be added by seeding;
 what exists today stays exactly where it is.
+
+## Agent runtime (sidecar contract)
+
+The factory does not own agent execution. [herdr-core](https://herdr.dev/core)
+(`hc`) owns terminal liveness: persistent terminals, agent delegation,
+waits, and remote machines. The factory owns audit and product decisions:
+the dispatch ledger, spec freeze hashes, train membership, and land.
+
+Concretely: an attempt's life lives in a named `hc` terminal; the ledger
+records the terminal address and the outcome, never the process. `factory
+doctor` probes the sidecar (`agent-runtime` check: `hc` answers, and the
+`HC_SESSION` this process would use is reported). Daemon, UI server, and
+CLI must agree on one `HC_SESSION`, or they see different terminal worlds.
+
+Remote builders ride the same contract: `dispatch once
+--persistent-terminal --on <machine>` spawns the attempt terminal on that
+`hc` machine (`hc machine add` first; the pass preflights it with `hc
+machine ls`). The ledger records the full `machine/terminal` address, so
+`log` and the board surface remote liveness exactly like local — the
+program and files stay on the builder, the audit stays here.

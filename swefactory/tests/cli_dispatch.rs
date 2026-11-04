@@ -6,6 +6,7 @@
 //! the check adapter are fakes. Mirrors the `cli_issue_ops.rs` patterns.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -100,6 +101,68 @@ echo "<verdict>{\"decision\":\"${PI_VERDICT:-accept}\"}</verdict>"
     )
 }
 
+/// Fake `hc` (tickets #125/#128): `run --bg --json --name N [--on M]
+/// --cwd D -- prog args` executes the worker synchronously under D (PATH
+/// prefixed so the fake `pi` resolves), records output/exit per terminal
+/// under $HC_STATE, and reports JSON the spike parses. `wait` returns at
+/// once; `get` reports finished (with the recorded exit code) or live when
+/// HC_STATE_MODE=live; `read` replays the recorded output. HC_RUN_FAIL=1
+/// refuses the run. `machine ls` lists two machines unless
+/// HC_MACHINE_LS_EMPTY=1. Addresses carry the machine (`box/t11-impl-a1`);
+/// state files use the address with `/` → `_`.
+fn write_fake_hc(dir: &Path) -> PathBuf {
+    write_exe(
+        dir,
+        "hc",
+        r#"#!/bin/sh
+for a in "$@"; do printf '%s ' "$a"; done >> "$HC_LOG"
+printf '\n' >> "$HC_LOG"
+if [ "$1" = "run" ]; then
+  NAME=""; DIR=""; ON=""; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) NAME="$2"; shift 2;;
+      --cwd) DIR="$2"; shift 2;;
+      --on) ON="$2"; shift 2;;
+      --) shift; break;;
+      *) shift;;
+    esac
+  done
+  if [ "$HC_RUN_FAIL" = "1" ]; then echo "refused" >&2; exit 1; fi
+  ADDR="$NAME"; if [ -n "$ON" ]; then ADDR="$ON/$NAME"; fi
+  STEM=$(printf '%s' "$ADDR" | tr '/' '_')
+  mkdir -p "$HC_STATE"
+  ( cd "$DIR" && PATH="$(dirname "$0"):$PATH" "$@" > "$HC_STATE/$STEM.out" 2>&1; echo "$?" > "$HC_STATE/$STEM.code" )
+  printf '{"terminal":"%s"}\n' "$ADDR"
+  exit 0
+fi
+if [ "$1" = "machine" ] && [ "$2" = "ls" ]; then
+  if [ "$HC_MACHINE_LS_EMPTY" = "1" ]; then exit 0; fi
+  echo "box connected"
+  echo "big-train connected"
+  exit 0
+fi
+if [ "$1" = "wait" ]; then exit 0; fi
+if [ "$1" = "get" ]; then
+  for a in "$@"; do ADDR="$a"; done
+  STEM=$(printf '%s' "$ADDR" | tr '/' '_')
+  SENT="true"; if [ "$HC_FIRST_SENT" = "0" ]; then SENT="false"; fi
+  if [ "$HC_STATE_MODE" = "live" ]; then printf '{"terminal":{"name":"%s","state":"live","first_message":{"sent":%s}}}\n' "$ADDR" "$SENT"; exit 0; fi
+  CODE="0"; if [ -f "$HC_STATE/$STEM.code" ]; then CODE=$(cat "$HC_STATE/$STEM.code"); fi
+  printf '{"terminal":{"name":"%s","state":"finished","exit_code":%s,"first_message":{"sent":%s}}}\n' "$ADDR" "$CODE" "$SENT"
+  exit 0
+fi
+if [ "$1" = "read" ]; then
+  for a in "$@"; do ADDR="$a"; done
+  STEM=$(printf '%s' "$ADDR" | tr '/' '_')
+  cat "$HC_STATE/$STEM.out" 2>/dev/null
+  exit 0
+fi
+exit 0
+"#,
+    )
+}
+
 /// Fake check adapter: records the observed slot, then passes/fails on cue.
 fn write_fake_adapter(dir: &Path) -> PathBuf {
     write_exe(
@@ -132,14 +195,17 @@ struct Harness {
     repo: PathBuf,
     state: PathBuf,
     views: PathBuf,
+    hc_state: PathBuf,
     gh_log: PathBuf,
     git_log: PathBuf,
     pi_log: PathBuf,
     adapter_log: PathBuf,
+    hc_log: PathBuf,
     gh: PathBuf,
     git_shim: PathBuf,
     pi: PathBuf,
     adapter: PathBuf,
+    hc: PathBuf,
 }
 
 fn setup(name: &str) -> Harness {
@@ -151,21 +217,26 @@ fn setup(name: &str) -> Harness {
     fs::create_dir_all(&views).unwrap();
     let h = Harness {
         state: root.join("state"),
+        hc_state: root.join("hc-state"),
         gh_log: root.join("gh.log"),
         git_log: root.join("git.log"),
         pi_log: root.join("pi.log"),
         adapter_log: root.join("adapter.log"),
+        hc_log: root.join("hc.log"),
         gh: write_fake_gh(&root),
         git_shim: write_git_shim(&root),
         pi: write_fake_pi(&root),
         adapter: write_fake_adapter(&root),
+        hc: write_fake_hc(&root),
         repo,
         views,
     };
+    fs::create_dir_all(&h.hc_state).unwrap();
     fs::write(&h.gh_log, "").unwrap();
     fs::write(&h.git_log, "").unwrap();
     fs::write(&h.pi_log, "").unwrap();
     fs::write(&h.adapter_log, "").unwrap();
+    fs::write(&h.hc_log, "").unwrap();
     h
 }
 
@@ -184,12 +255,15 @@ fn dispatch_cmd(h: &Harness, args: &[&str]) -> Command {
     cmd.env("FACTORY_GH_BIN", &h.gh)
         .env("FACTORY_GIT_BIN", &h.git_shim)
         .env("FACTORY_PI_BIN", &h.pi)
+        .env("FACTORY_HC_BIN", &h.hc)
         .env("FACTORY_CHECK_ADAPTER", &h.adapter)
         .env("FACTORY_STATE_DIR", &h.state)
         .env("GH_LOG", &h.gh_log)
         .env("GIT_LOG", &h.git_log)
         .env("PI_LOG", &h.pi_log)
         .env("ADAPTER_LOG", &h.adapter_log)
+        .env("HC_LOG", &h.hc_log)
+        .env("HC_STATE", &h.hc_state)
         .env("GH_VIEWS_DIR", &h.views)
         .env("GH_LIST_JSON", "[]")
         .env_remove("FACTORY_SLOT")
@@ -1084,26 +1158,33 @@ fn setup_daemon(name: &str) -> DaemonHarness {
     let git_log = root.join("git.log");
     let pi_log = root.join("pi.log");
     let adapter_log = root.join("adapter.log");
+    let hc_log = root.join("hc.log");
     let gh = write_daemon_gh(&root);
     let git_shim = write_git_shim(&root);
     let pi = write_fake_pi(&root);
     let adapter = write_fake_adapter(&root);
-    for p in [&gh_log, &git_log, &pi_log, &adapter_log] {
+    let hc = write_fake_hc(&root);
+    for p in [&gh_log, &git_log, &pi_log, &adapter_log, &hc_log] {
         fs::write(p, "").unwrap();
     }
     let state = root.join("state");
+    let hc_state = root.join("hc-state");
+    fs::create_dir_all(&hc_state).unwrap();
     let inner = Harness {
         repo,
         state,
         views,
+        hc_state,
         gh_log,
         git_log,
         pi_log,
         adapter_log,
+        hc_log,
         gh,
         git_shim,
         pi,
         adapter,
+        hc,
     };
     DaemonHarness { inner, count_dir }
 }
@@ -1537,5 +1618,340 @@ fn dispatch_status_names_worker_slots_and_source() {
     assert!(
         stdout.contains("worker slots: 1"),
         "serial default named, got:\n{stdout}"
+    );
+}
+
+/// AC (ticket #125): with --persistent-terminal, implement runs inside
+/// `hc run --bg` in a named terminal that stays attachable; the full
+/// pass still completes and the log names the terminal address.
+#[test]
+fn dispatch_once_persistent_terminal_runs_implement_in_named_terminal() {
+    let h = setup("hc-happy");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(&h, &["dispatch", "once", "--persistent-terminal"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.assert().success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{ledger}"
+    );
+    // Ticket #127: the terminal address is recorded on the row.
+    assert_eq!(
+        attempts[0].get("terminal").and_then(|v| v.as_str()),
+        Some("t11-impl-a1"),
+        "ledger:\n{ledger}"
+    );
+
+    // The terminal lifecycle is visible in the hc call log and attempt log.
+    let hc = fs::read_to_string(&h.hc_log).unwrap();
+    assert!(hc.contains("run"), "must spawn via hc run:\n{hc}");
+    assert!(hc.contains("--bg"), "must be backgrounded:\n{hc}");
+    assert!(
+        hc.contains("t11-impl-a1"),
+        "must use the ticket attempt name:\n{hc}"
+    );
+    assert!(hc.contains("wait"), "must wait on the terminal:\n{hc}");
+    assert!(hc.contains("read"), "must read back output:\n{hc}");
+    let log = fs::read_to_string(h.state.join("logs").join("T11-a1.log")).unwrap_or_default();
+    let log = if log.is_empty() {
+        // Fall back to whatever log exists for the slot.
+        let mut found = String::new();
+        for e in fs::read_dir(h.state.join("logs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            let body = fs::read_to_string(e.path()).unwrap_or_default();
+            if body.contains("persistent terminal") {
+                found = body;
+                break;
+            }
+        }
+        found
+    } else {
+        log
+    };
+    assert!(
+        log.contains("persistent terminal t11-impl-a1"),
+        "log must name the address for attach:\n{log}"
+    );
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh_log(&h));
+}
+
+/// AC: `hc` missing is a loud implement failure naming the sidecar, never
+/// a silent fallback to subprocesses (the flag must mean the experiment).
+#[test]
+fn dispatch_once_persistent_terminal_missing_hc_fails_loudly() {
+    let h = setup("hc-missing");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(&h, &["dispatch", "once", "--persistent-terminal"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.env("FACTORY_HC_BIN", "/nonexistent/hc-fixture");
+    cmd.assert().success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    assert!(
+        ledger.contains("impl_failed"),
+        "implement must fail loudly, ledger:\n{ledger}"
+    );
+}
+
+/// AC: expiry leaves the terminal running (kill policy is #129's call);
+/// the attempt resumes next pass and the log names the orphaned address.
+#[test]
+fn dispatch_once_persistent_terminal_timeout_leaves_terminal_running() {
+    let h = setup("hc-timeout");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(
+        &h,
+        &[
+            "dispatch",
+            "once",
+            "--persistent-terminal",
+            "--timeout-impl",
+            "5",
+        ],
+    );
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.env("HC_STATE_MODE", "live");
+    cmd.assert().success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    assert!(
+        ledger.contains("timed_out") || ledger.contains("interrupted"),
+        "attempt must record the expiry, ledger:\n{ledger}"
+    );
+    let mut found = String::new();
+    for e in fs::read_dir(h.state.join("logs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+    {
+        let body = fs::read_to_string(e.path()).unwrap_or_default();
+        if body.contains("left running") {
+            found = body;
+            break;
+        }
+    }
+    assert!(
+        found.contains("t11-impl-a1"),
+        "log must name the orphaned terminal:\n{found}"
+    );
+    assert!(
+        found.contains("still running"),
+        "check-ins must show movement while waiting:\n{found}"
+    );
+}
+
+/// AC: dry-run with the flag announces the terminal it would have used.
+#[test]
+fn dispatch_once_persistent_terminal_dry_run_announces_terminal() {
+    let h = setup("hc-dry");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(
+        &h,
+        &["dispatch", "once", "--dry-run", "--persistent-terminal"],
+    );
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.assert().success().stdout(
+        predicates::str::contains("persistent terminal")
+            .and(predicates::str::contains("t11-impl-a1")),
+    );
+    assert!(
+        !h.state.join("dispatch.json").exists(),
+        "dry-run must write nothing"
+    );
+}
+
+/// AC (ticket #126): an unsent first message (task never arrived, e.g. a
+/// trust dialog holds the screen) fails loudly naming the terminal for
+/// attach — never blindly resent, never mistaken for a working agent.
+#[test]
+fn dispatch_once_persistent_terminal_undelivered_task_fails_loudly() {
+    let h = setup("hc-readiness");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(&h, &["dispatch", "once", "--persistent-terminal"]);
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.env("HC_FIRST_SENT", "0");
+    cmd.assert().success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    assert!(
+        ledger.contains("impl_failed"),
+        "implement must fail loudly, ledger:\n{ledger}"
+    );
+    let mut found = String::new();
+    for e in fs::read_dir(h.state.join("logs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+    {
+        let body = fs::read_to_string(e.path()).unwrap_or_default();
+        if body.contains("not delivered") {
+            found = body;
+            break;
+        }
+    }
+    assert!(
+        found.contains("hc attach t11-impl-a1"),
+        "log must name the terminal for attach:\n{found}"
+    );
+}
+
+/// AC (ticket #128): with --on, the implement terminal spawns on the
+/// remote builder and the ledger records the full machine/terminal
+/// address; the pass still completes end to end.
+#[test]
+fn dispatch_once_persistent_terminal_on_machine_runs_remotely() {
+    let h = setup("hc-remote");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(
+        &h,
+        &["dispatch", "once", "--persistent-terminal", "--on", "box"],
+    );
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.assert().success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&ledger).unwrap();
+    let attempts = parsed.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        attempts[0].get("status").and_then(|v| v.as_str()),
+        Some("review_done"),
+        "ledger:\n{ledger}"
+    );
+    assert_eq!(
+        attempts[0].get("terminal").and_then(|v| v.as_str()),
+        Some("box/t11-impl-a1"),
+        "full remote address recorded, ledger:\n{ledger}"
+    );
+    let hc = fs::read_to_string(&h.hc_log).unwrap();
+    assert!(
+        hc.contains("machine ls"),
+        "must preflight the machine:\n{hc}"
+    );
+    assert!(hc.contains("--on box"), "must schedule remotely:\n{hc}");
+    assert_never_touches_dev_or_lands(&git_log(&h), &gh_log(&h));
+}
+
+/// AC: an unknown machine fails loudly with the `hc machine add` fix.
+#[test]
+fn dispatch_once_persistent_terminal_unknown_machine_fails_loudly() {
+    let h = setup("hc-nomachine");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(
+        &h,
+        &["dispatch", "once", "--persistent-terminal", "--on", "ghost"],
+    );
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.env("HC_MACHINE_LS_EMPTY", "1");
+    cmd.assert().success();
+
+    let ledger = fs::read_to_string(h.state.join("dispatch.json")).unwrap();
+    assert!(
+        ledger.contains("impl_failed"),
+        "implement must fail loudly, ledger:\n{ledger}"
+    );
+}
+
+/// AC: --on without --persistent-terminal is refused before any work.
+#[test]
+fn dispatch_once_on_without_persistent_terminal_is_refused() {
+    let h = setup("hc-on-alone");
+    let out = dispatch_cmd(&h, &["dispatch", "once", "--on", "box"])
+        .env("GH_LIST_JSON", r#"[{"number":11}]"#)
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("--persistent-terminal"),
+        "must name the required flag, got:\n{text}"
+    );
+}
+
+/// AC: dry-run with --on announces the remote terminal it would have used.
+#[test]
+fn dispatch_once_persistent_terminal_dry_run_announces_remote() {
+    let h = setup("hc-dry-remote");
+    write_view(
+        &h,
+        11,
+        "Demo widget",
+        "Build the widget.",
+        &["ticket", "ready"],
+        "OPEN",
+    );
+    let mut cmd = dispatch_cmd(
+        &h,
+        &[
+            "dispatch",
+            "once",
+            "--dry-run",
+            "--persistent-terminal",
+            "--on",
+            "box",
+        ],
+    );
+    cmd.env("GH_LIST_JSON", r#"[{"number":11}]"#);
+    cmd.assert().success().stdout(
+        predicates::str::contains("--on box").and(predicates::str::contains("t11-impl-a1")),
+    );
+    assert!(
+        !h.state.join("dispatch.json").exists(),
+        "dry-run must write nothing"
     );
 }

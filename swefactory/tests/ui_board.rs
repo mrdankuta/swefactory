@@ -182,7 +182,7 @@ fn board_groups_cards_and_renders_markers() {
         [(11, vec!["deadbee merge #11 into train".to_string()])]
             .into_iter()
             .collect();
-    let cols = board_issues_to_columns(&issues, &attempts, &changes);
+    let cols = board_issues_to_columns(&issues, &attempts, &changes, &HashMap::new());
 
     let ready = cols.iter().find(|c| c.id == "ready").unwrap();
     assert_eq!(ready.cards.len(), 1);
@@ -208,7 +208,7 @@ fn board_groups_cards_and_renders_markers() {
 
 #[test]
 fn empty_states_read_as_sentences() {
-    let cols = board_issues_to_columns(&[], &HashMap::new(), &HashMap::new());
+    let cols = board_issues_to_columns(&[], &HashMap::new(), &HashMap::new(), &HashMap::new());
     let fragment = board_fragment_html(&cols);
     assert!(
         fragment.contains(board_empty_sentence()),
@@ -228,7 +228,7 @@ fn empty_states_read_as_sentences() {
 
 #[test]
 fn board_page_polls_fragment_without_full_reload() {
-    let cols = board_issues_to_columns(&[], &HashMap::new(), &HashMap::new());
+    let cols = board_issues_to_columns(&[], &HashMap::new(), &HashMap::new(), &HashMap::new());
     let page = board_page_html(&cols);
     assert!(
         page.contains("data-board-fragment=\"/fragments/board\""),
@@ -256,6 +256,7 @@ async fn endpoints_return_200_with_markers() {
     // call, so markers asserted here are the markers served there.
     let cols = board_issues_to_columns(
         &[issue(7, "Sprout", "Cost: small", &["ready"])],
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -367,4 +368,24 @@ fn bind_and_auth_gaps_are_documented_loudly() {
     ] {
         assert!(readme.contains(marker), "README never documents {marker:?}");
     }
+}
+
+/// AC (ticket #127): a running attempt with a recorded terminal renders
+/// the attach command on its card; finished attempts render none.
+#[test]
+fn running_card_links_its_live_terminal() {
+    let issues = vec![issue(11, "Alpha", "Cost: 1 point", &["ticket", "ready"])];
+    let attempts: HashMap<u64, String> = [(11, "impl_running".to_string())].into_iter().collect();
+    let changes: HashMap<u64, Vec<String>> = HashMap::new();
+    let terminals: HashMap<u64, String> = [(11, "t11-impl-a1".to_string())].into_iter().collect();
+    let cols = board_issues_to_columns(&issues, &attempts, &changes, &terminals);
+    let html = board_fragment_html(&cols);
+    assert!(html.contains("data-terminal"), "got:\n{html}");
+    assert!(html.contains("hc attach t11-impl-a1"), "got:\n{html}");
+
+    // Finished attempt: same terminal recorded, no live marker.
+    let attempts: HashMap<u64, String> = [(11, "review_done".to_string())].into_iter().collect();
+    let cols = board_issues_to_columns(&issues, &attempts, &changes, &terminals);
+    let html = board_fragment_html(&cols);
+    assert!(!html.contains("data-terminal"), "got:\n{html}");
 }

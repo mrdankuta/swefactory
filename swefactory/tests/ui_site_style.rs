@@ -32,6 +32,7 @@ fn board_cols() -> Vec<BoardColumn> {
             cost_text: "no cost recorded".to_string(),
             changed_text: "nothing yet".to_string(),
             labels: vec!["ready".to_string()],
+            terminal: String::new(),
         }],
     }]
 }

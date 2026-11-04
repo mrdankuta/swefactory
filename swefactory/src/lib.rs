@@ -403,6 +403,19 @@ pub enum DispatchAction {
         /// MAX_CONCURRENT) provides the same value without the flag.
         #[arg(long)]
         concurrency: Option<usize>,
+        /// Experiment (ticket #125): run the implement phase inside a
+        /// persistent herdr-core terminal (`hc run --bg --name
+        /// ticket<N>-impl`) instead of a one-shot subprocess. The
+        /// terminal outlives the dispatcher and stays attachable;
+        /// expiry leaves it running and the attempt resumes next pass.
+        #[arg(long)]
+        persistent_terminal: bool,
+        /// Remote builder (ticket #128, needs --persistent-terminal):
+        /// schedule the persistent terminal on this `hc` machine
+        /// (`hc machine add` first). The ledger records the full
+        /// `machine/terminal` address; liveness stays remote.
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
     },
     /// Loop single passes on the interval until the STOP file appears
     /// (Rust port of the bash `factory-dispatch daemon` loop).
@@ -702,6 +715,8 @@ pub struct BoardIssue {
 }
 
 /// One rendered card: status, cost, and what changed in plain words.
+/// `terminal` names the persistent terminal running this ticket, if any
+/// (ticket #127); the fragment renders it as an attach command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoardCard {
     pub number: u64,
@@ -710,6 +725,7 @@ pub struct BoardCard {
     pub cost_text: String,
     pub changed_text: String,
     pub labels: Vec<String>,
+    pub terminal: String,
 }
 
 /// One board column: a label-mapped lane of cards.
@@ -816,12 +832,14 @@ pub fn board_changed_text(hits: &[String]) -> String {
 }
 
 /// Group issues into the fixed column order. `attempts` maps ticket →
-/// latest attempt status; `changes` maps ticket → `git log` hit lines.
+/// latest attempt status; `changes` maps ticket → `git log` hit lines;
+/// `terminals` maps ticket → latest persistent-terminal address.
 /// Pure over fixtures: the seam endpoint tests assert.
 pub fn board_issues_to_columns(
     issues: &[BoardIssue],
     attempts: &std::collections::HashMap<u64, String>,
     changes: &std::collections::HashMap<u64, Vec<String>>,
+    terminals: &std::collections::HashMap<u64, String>,
 ) -> Vec<BoardColumn> {
     let mut cols: Vec<BoardColumn> = BOARD_COLUMNS
         .iter()
@@ -835,16 +853,21 @@ pub fn board_issues_to_columns(
         let (id, _) = board_column_for_labels(&issue.labels);
         let empty: Vec<String> = Vec::new();
         let hits = changes.get(&issue.number).unwrap_or(&empty);
+        let status = attempts.get(&issue.number).map(|s| s.as_str());
+        let terminal = terminals.get(&issue.number).cloned().unwrap_or_default();
+        let terminal = if status.is_some_and(attempt_may_be_live) {
+            terminal
+        } else {
+            String::new()
+        };
         let card = BoardCard {
             number: issue.number,
             title: issue.title.clone(),
-            status_text: board_status_text(
-                &issue.labels,
-                attempts.get(&issue.number).map(|s| s.as_str()),
-            ),
+            status_text: board_status_text(&issue.labels, status),
             cost_text: board_cost_text(&issue.body),
             changed_text: board_changed_text(hits),
             labels: issue.labels.clone(),
+            terminal,
         };
         if let Some(col) = cols.iter_mut().find(|c| c.id == id) {
             col.cards.push(card);
@@ -938,6 +961,21 @@ pub fn board_attempt_status() -> std::collections::HashMap<u64, String> {
     map
 }
 
+/// Read-only: latest persistent-terminal address per ticket (ticket #127).
+/// Only attempts that recorded a terminal contribute; an empty map reads
+/// as no live terminals anywhere.
+pub fn board_attempt_terminals() -> std::collections::HashMap<u64, String> {
+    let state = dispatch_state_dir();
+    let ledger = load_ledger(&state);
+    let mut map = std::collections::HashMap::new();
+    for a in &ledger.attempts {
+        if !a.terminal.is_empty() {
+            map.insert(a.ticket, a.terminal.clone());
+        }
+    }
+    map
+}
+
 /// Read-only: newest `git log` lines mentioning `#<ticket>` (same seam
 /// `reconcile` uses). Failures read as no changes.
 pub fn board_changed_hits(ticket: u64) -> Vec<String> {
@@ -957,15 +995,16 @@ pub fn board_changed_hits(ticket: u64) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Read-only board assembly: issues × attempts × git hits → columns.
+/// Read-only board assembly: issues × attempts × git hits × terminals.
 pub fn board_data() -> Vec<BoardColumn> {
     let issues = fetch_board_issues();
     let attempts = board_attempt_status();
+    let terminals = board_attempt_terminals();
     let mut changes = std::collections::HashMap::new();
     for issue in &issues {
         changes.insert(issue.number, board_changed_hits(issue.number));
     }
-    board_issues_to_columns(&issues, &attempts, &changes)
+    board_issues_to_columns(&issues, &attempts, &changes, &terminals)
 }
 
 fn escape_html(s: &str) -> String {
@@ -1008,8 +1047,16 @@ pub fn board_fragment_html(columns: &[BoardColumn]) -> String {
             ));
         }
         for card in &col.cards {
+            let terminal_html = if card.terminal.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<p data-terminal>Live terminal: <code>hc attach {}</code></p>",
+                    escape_html(&card.terminal)
+                )
+            };
             html.push_str(&format!(
-                "<article data-card=\"{}\" data-column=\"{}\"><h3>#{} {}</h3><p data-status>{}</p><p data-cost>{}</p><p data-changed>{}</p><a data-detail-link href=\"/tickets/{}\">Open detail</a></article>",
+                "<article data-card=\"{}\" data-column=\"{}\"><h3>#{} {}</h3><p data-status>{}</p><p data-cost>{}</p><p data-changed>{}</p>{}<a data-detail-link href=\"/tickets/{}\">Open detail</a></article>",
                 card.number,
                 col.id,
                 card.number,
@@ -1017,6 +1064,7 @@ pub fn board_fragment_html(columns: &[BoardColumn]) -> String {
                 escape_html(&card.status_text),
                 escape_html(&card.cost_text),
                 escape_html(&card.changed_text),
+                terminal_html,
                 card.number,
             ));
         }
@@ -8047,6 +8095,13 @@ struct DispatchAttempt {
     /// older ledgers parsing.
     #[serde(default)]
     timeout_secs: u64,
+    /// Persistent-terminal address (ticket #127, spec #125 follow-up):
+    /// the `hc` terminal running this attempt (`t11-impl-a1`), empty for
+    /// subprocess attempts and pre-terminal ledgers (`#[serde(default)]`).
+    /// Recorded when the terminal spawns so `log` and the board can
+    /// surface liveness even if the dispatcher never returns.
+    #[serde(default)]
+    terminal: String,
 }
 
 #[derive(Serialize, serde::Deserialize, Default)]
@@ -9112,6 +9167,419 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Dry-run announce for the persistent-terminal experiment so the survey
+/// names the execution mode it would have used.
+fn dry_run_implement_line(
+    persistent_terminal: bool,
+    on_machine: Option<&str>,
+    ticket: u64,
+) -> String {
+    if !persistent_terminal {
+        return String::new();
+    }
+    let name = hc_terminal_name(ticket, "impl", 1);
+    match on_machine {
+        Some(m) => format!(" (persistent terminal on {m}: hc run --bg --on {m} --name {name})",),
+        None => format!(" (persistent terminal: hc run --bg --name {name})",),
+    }
+}
+
+/// Persistent-terminal name for one phase attempt (ticket #125): `hc`
+/// names allow 1-32 chars of lowercase alnum, `-`, `_`.
+fn hc_terminal_name(ticket: u64, phase: &str, attempt_no: u64) -> String {
+    let raw = format!("t{ticket}-{phase}-a{attempt_no}");
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    name.truncate(32);
+    while name.ends_with('-') {
+        name.pop();
+    }
+    if name.is_empty() {
+        name.push('t');
+    }
+    name
+}
+
+/// Lenient address extraction from `hc run --bg` output (text or JSON):
+/// prefer a `terminal`/`address`/`id`/`name` field, else the last
+/// whitespace token, else the name we launched with.
+fn hc_extract_address(stdout: &str, fallback: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) {
+        for key in ["terminal", "address", "id", "name"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    stdout
+        .split_whitespace()
+        .last()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Recursive JSON search for a numeric `exit_code` (walking objects and
+/// arrays): `hc get` shapes are versioned, so never assume a layout.
+fn hc_find_exit_code(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Object(m) => {
+            if let Some(n) = m.get("exit_code").and_then(|x| x.as_i64()) {
+                return Some(n);
+            }
+            m.values().find_map(hc_find_exit_code)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(hc_find_exit_code),
+        _ => None,
+    }
+}
+
+/// First-message delivery from `hc get` output (ticket #126): a sent
+/// launch task counts the agent as working; an unsent one (`sent: false`)
+/// means the task never arrived (e.g. a trust dialog holds the screen).
+/// `None` when the shape carries no delivery record — proceed leniently.
+fn hc_first_message_sent(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Object(m) => {
+            if let Some(sent) = m
+                .get("first_message")
+                .and_then(|f| f.get("sent"))
+                .and_then(|s| s.as_bool())
+            {
+                return Some(sent);
+            }
+            m.values().find_map(hc_first_message_sent)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(hc_first_message_sent),
+        _ => None,
+    }
+}
+/// Finished is the only lifecycle word that ends a wait; agent status
+/// words (idle/working/done/...) never collide with it.
+/// True when any terminal record in the JSON reports `state: finished`.
+/// Finished is the only lifecycle word that ends a wait; agent status
+/// words (idle/working/done/...) never collide with it.
+fn hc_terminal_finished(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(m) => {
+            if m.get("state").and_then(|x| x.as_str()) == Some("finished") {
+                return true;
+            }
+            m.values().any(hc_terminal_finished)
+        }
+        serde_json::Value::Array(a) => a.iter().any(hc_terminal_finished),
+        _ => false,
+    }
+}
+
+/// Run one phase (implement only, ticket #125) inside a persistent `hc`
+/// terminal instead of a one-shot subprocess:
+/// `hc run --bg --name <name> --cwd <wt> -- <program> <args...>`, then
+/// `hc wait` bounded by `timeout`, then `hc read` + `hc get` for output
+/// and exit code. The terminal outlives the dispatcher either way: the
+/// address is logged and printed so a human can `hc attach` it.
+///
+/// Expiry deliberately leaves the terminal running (kill-vs-keep policy
+/// is decided in #129): the attempt resumes next pass and may spawn a
+/// successor, so the log always names the orphaned address for cleanup.
+/// `hc` missing or unparseable is a loud Failure, never silent fallback —
+/// the experiment flag must mean the experiment ran.
+#[allow(clippy::too_many_arguments)]
+fn run_phase_hc(
+    program: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    slot: &str,
+    log: &std::path::Path,
+    phase: &str,
+    attempt_id: u64,
+    ticket: u64,
+    attempt_no: u64,
+    timeout: std::time::Duration,
+    on_machine: Option<&str>,
+    terminal_out: &mut String,
+) -> PhaseResult {
+    append_log_append(
+        log,
+        &format!("--- {phase} {slot} running in persistent terminal ---\n"),
+    );
+    // Terminal names stay short and ticket-readable (`t11-impl-a1`);
+    // the phase label keeps its ledger spelling in log lines.
+    let name_phase = if phase == "implement" { "impl" } else { phase };
+    let name = hc_terminal_name(ticket, name_phase, attempt_no);
+    let hc = hc_bin();
+    // Remote preflight (ticket #128): the machine must be known to the
+    // core before anything spawns there. Lenient shape check — the
+    // machine name must appear in `hc machine ls` output.
+    if let Some(m) = on_machine {
+        let ls = Command::new(&hc).args(["machine", "ls"]).output();
+        let known = ls
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(m))
+            .unwrap_or(false);
+        if !known {
+            let msg = format!(
+                "--- {phase} unknown machine {m}: add it first with: hc machine add <target> --name {m} ---\n"
+            );
+            append_log_append(log, &msg);
+            log_event(log, attempt_id, ticket, phase, 1);
+            return PhaseResult::Failure(msg);
+        }
+    }
+    let mut run_argv = vec![
+        "run".to_string(),
+        "--bg".to_string(),
+        "--json".to_string(),
+        "--name".to_string(),
+        name.clone(),
+    ];
+    if let Some(m) = on_machine {
+        run_argv.push("--on".to_string());
+        run_argv.push(m.to_string());
+    }
+    run_argv.extend([
+        "--cwd".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "--".to_string(),
+        program.to_string(),
+    ]);
+    run_argv.extend(args.iter().map(|s| s.to_string()));
+    let run_out = match Command::new(&hc).args(&run_argv).output() {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!(
+                "--- {phase} failed to spawn {hc}: {e} (persistent terminal unavailable) ---\n"
+            );
+            append_log_append(log, &msg);
+            log_event(log, attempt_id, ticket, phase, 1);
+            return PhaseResult::Failure(msg);
+        }
+    };
+    if !run_out.status.success() {
+        let err = String::from_utf8_lossy(&run_out.stderr).trim().to_string();
+        let msg = format!(
+            "--- {phase} {hc} run refused (exit {}): {err} ---\n",
+            run_out.status.code().unwrap_or(1)
+        );
+        append_log_append(log, &msg);
+        log_event(log, attempt_id, ticket, phase, 1);
+        return PhaseResult::Failure(msg);
+    }
+    let addr = hc_extract_address(String::from_utf8_lossy(&run_out.stdout).trim(), &name);
+    let addr_line = format!("persistent terminal {addr} (hc attach {addr} to take over)\n");
+    append_log_append(log, &addr_line);
+    println!("  implement: {}", addr_line.trim_end());
+    terminal_out.push_str(&addr);
+    let secs = timeout.as_secs();
+    // Readiness gate (ticket #126): the launch carries the task as the
+    // first message. `sent: false` means it never arrived (trust dialog,
+    // slow startup) — never blindly resend; fail loudly naming the
+    // terminal so a human attaches and resolves readiness. Unknown shapes
+    // proceed leniently: absence of a delivery record is not evidence.
+    let get_once = || {
+        Command::new(&hc)
+            .args(["get", "--json", &addr])
+            .output()
+            .ok()
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+    };
+    if get_once().as_ref().and_then(hc_first_message_sent) == Some(false) {
+        let read_out = Command::new(&hc)
+            .args(["read", "--lines", "0", &addr])
+            .output();
+        let screen = read_out
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if !screen.is_empty() {
+            append_log_append(log, &screen);
+        }
+        let msg = format!(
+            "--- {phase} {slot} task not delivered to terminal {addr} (first message unsent — resolve readiness, e.g. a trust dialog, with: hc attach {addr}) ---\n"
+        );
+        append_log_append(log, &msg);
+        log_event(log, attempt_id, ticket, phase, 1);
+        return PhaseResult::Failure(msg);
+    }
+    // Wait loop (ticket #126): a wait can return early as a check-in
+    // without the terminal finishing, so re-wait until the terminal
+    // reports finished or the total bound expires. Each check-in is
+    // logged with elapsed time so the watch pane shows movement.
+    // No sleep-poll: `hc wait` blocks; the pause below only spaces
+    // iterations when a wait returns instantly (unavailable core).
+    let deadline = std::time::Instant::now() + timeout;
+    let mut checkins = 0u32;
+    let finished = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let leg = remaining.min(std::time::Duration::from_secs(180)).as_secs();
+        let leg_start = std::time::Instant::now();
+        let _ = Command::new(&hc)
+            .args(["wait", "--json", &addr, "--timeout", &leg.to_string()])
+            .output();
+        if get_once().as_ref().is_some_and(hc_terminal_finished) {
+            break true;
+        }
+        if deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .is_zero()
+        {
+            break false;
+        }
+        checkins += 1;
+        let elapsed = timeout.as_secs().saturating_sub(remaining.as_secs());
+        append_log_append(
+            log,
+            &format!("--- {phase} {slot} terminal {addr} still running ({elapsed}s elapsed, check-in {checkins}) ---\n"),
+        );
+        if leg_start.elapsed() < std::time::Duration::from_secs(1) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    };
+    // State comes from `hc get`, never inferred: finished carries the
+    // exit code, a still-live terminal means the bound expired.
+    let get_json = get_once();
+    let read_out = Command::new(&hc)
+        .args(["read", "--lines", "0", &addr])
+        .output();
+    let screen = read_out
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if !screen.is_empty() {
+        append_log_append(log, &screen);
+        if !screen.ends_with('\n') {
+            append_log_append(log, "\n");
+        }
+    }
+    if finished {
+        let code = get_json.as_ref().and_then(hc_find_exit_code).unwrap_or(1);
+        append_log_append(
+            log,
+            &format!("--- {phase} {slot} terminal {addr} finished (exit {code}) ---\n"),
+        );
+        log_event(log, attempt_id, ticket, phase, code as i32);
+        if code == 0 {
+            PhaseResult::Success(screen)
+        } else {
+            PhaseResult::Failure(screen)
+        }
+    } else {
+        append_log_append(
+                log,
+                &format!("--- {phase} {slot} timed out after {secs}s — terminal {addr} left running, resumable ---\n"),
+            );
+        log_event(log, attempt_id, ticket, phase, 124);
+        PhaseResult::TimedOut(screen)
+    }
+}
+
+/// Live tail of a persistent terminal for `factory log` (ticket #127):
+/// `hc read --lines <tail> <addr>`. `None` when `hc` is missing, the
+/// terminal is gone, or the read fails — the ledger transcript stays
+/// authoritative and callers render a calm note instead of erroring.
+fn live_terminal_tail(addr: &str, tail: usize) -> Option<String> {
+    let out = Command::new(hc_bin())
+        .args(["read", "--lines", &tail.to_string(), addr])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// True while an attempt may still be producing output (ticket #127):
+/// only then can a recorded terminal have a live tail worth showing.
+fn attempt_may_be_live(status: &str) -> bool {
+    status.ends_with("_running")
+}
+
+/// Unit tests (ticket #125): the persistent-terminal naming and output
+/// parsing are pure, so they pin without processes or the `hc` binary.
+#[cfg(test)]
+mod hc_spike_tests {
+    use super::{
+        hc_extract_address, hc_find_exit_code, hc_first_message_sent, hc_terminal_finished,
+        hc_terminal_name,
+    };
+
+    #[test]
+    fn terminal_name_is_ticket_readable_and_bounded() {
+        assert_eq!(hc_terminal_name(11, "impl", 1), "t11-impl-a1");
+        let long = hc_terminal_name(123456789, "implement", 88888);
+        assert!(long.len() <= 32, "name must fit hc limits: {long}");
+        assert!(
+            long.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+            "name must be hc-legal: {long}"
+        );
+    }
+
+    #[test]
+    fn address_prefers_json_terminal_then_last_token_then_fallback() {
+        assert_eq!(
+            hc_extract_address(r#"{"terminal":"box/t7"}"#, "t11-impl-a1"),
+            "box/t7"
+        );
+        assert_eq!(
+            hc_extract_address(r#"{"address":"t9"}"#, "t11-impl-a1"),
+            "t9"
+        );
+        assert_eq!(
+            hc_extract_address("started t11-impl-a1\n", "fallback"),
+            "t11-impl-a1"
+        );
+        assert_eq!(hc_extract_address("", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn exit_code_search_ignores_layout() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"terminal":{"record":{"exit_code":3}}}"#).unwrap();
+        assert_eq!(hc_find_exit_code(&v), Some(3));
+        let v: serde_json::Value = serde_json::from_str(r#"{"state":"live"}"#).unwrap();
+        assert_eq!(hc_find_exit_code(&v), None);
+    }
+
+    #[test]
+    fn finished_detection_ignores_agent_status_words() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"state":"live","status":{"words":["working"]}}"#).unwrap();
+        assert!(!hc_terminal_finished(&v));
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"terminal":{"state":"finished","exit_code":0}}"#).unwrap();
+        assert!(hc_terminal_finished(&v));
+    }
+
+    #[test]
+    fn undelivered_first_message_blocks_launch() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"terminal":{"first_message":{"sent":false}}}"#).unwrap();
+        assert_eq!(hc_first_message_sent(&v), Some(false));
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"terminal":{"first_message":{"sent":true}}}"#).unwrap();
+        assert_eq!(hc_first_message_sent(&v), Some(true));
+        let v: serde_json::Value = serde_json::from_str(r#"{"state":"live"}"#).unwrap();
+        assert_eq!(hc_first_message_sent(&v), None);
+    }
+}
+
 /// Run one phase (implement / verify / review) with slot + private TMPDIR
 /// isolation, streaming running output live to the attempt log.
 /// `timeout` bounds the wait for implement/review (None = unbounded,
@@ -10144,6 +10612,11 @@ struct PhaseCtx {
     /// `None` when the ticket links no frozen spec — referencing the
     /// placeholder then fails composition naming the key.
     spec_freeze: Option<String>,
+    /// Experiment (ticket #125): implement inside `hc run --bg` instead
+    /// of a one-shot `pi -p` subprocess.
+    persistent_terminal: bool,
+    /// Remote builder (ticket #128): machine for the persistent terminal.
+    on_machine: Option<String>,
 }
 
 /// Run attempt phases from `start_phase` onward (ticket #61, spec #59).
@@ -10224,18 +10697,49 @@ fn run_attempt_phases(
             "  implement: pi -p (slot {slot}, timeout {}s)",
             ctx.implement_timeout_secs
         );
-        let implement_outcome = run_phase(
-            &pi_bin(),
-            &["-p", &prompt],
-            wt,
-            slot,
-            tmpdir,
-            log_path,
-            "implement",
-            id,
-            ticket,
-            Some(implement_timeout),
-        );
+        // Persistent-terminal experiment (ticket #125): the same prompt
+        // runs inside `hc run --bg` and stays attachable; otherwise the
+        // historical one-shot subprocess path is unchanged.
+        let implement_outcome = if ctx.persistent_terminal {
+            let mut terminal = String::new();
+            let outcome = run_phase_hc(
+                &pi_bin(),
+                &["-p", &prompt],
+                wt,
+                slot,
+                log_path,
+                "implement",
+                id,
+                ticket,
+                ctx.attempt_no,
+                implement_timeout,
+                ctx.on_machine.as_deref(),
+                &mut terminal,
+            );
+            // Record the terminal on the row at spawn (ticket #127):
+            // `log` and the board surface liveness even when the
+            // dispatcher never returns to this pass.
+            if !terminal.is_empty() {
+                lock_ledger(shared).attempts[idx].terminal = terminal;
+                if let Err(e) = save_shared_ledger(state, shared) {
+                    eprintln!("dispatch: cannot record terminal: {e}");
+                }
+            }
+            outcome
+        } else {
+            run_phase(
+                &pi_bin(),
+                &["-p", &prompt],
+                wt,
+                slot,
+                tmpdir,
+                log_path,
+                "implement",
+                id,
+                ticket,
+                Some(implement_timeout),
+            )
+        };
         match implement_outcome {
             PhaseResult::TimedOut(_) => {
                 return expire_attempt(
@@ -10625,12 +11129,16 @@ fn run_attempt_phases(
 /// level travels with the attempt budget and phase timeouts as one value,
 /// so inner admission gates can never re-resolve a different level —
 /// finding #2 is structural, not conventional.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PassTuning {
     max_attempts: u64,
     max_concurrent: usize,
     timeout_impl: Option<u64>,
     timeout_review: Option<u64>,
+    /// Experiment (ticket #125): implement inside a persistent terminal.
+    persistent_terminal: bool,
+    /// Remote builder (ticket #128): `hc` machine for the terminal.
+    on_machine: Option<String>,
 }
 
 fn resume_ticket_attempt(
@@ -10645,6 +11153,8 @@ fn resume_ticket_attempt(
     let max_concurrent = tuning.max_concurrent;
     let timeout_impl = tuning.timeout_impl;
     let timeout_review = tuning.timeout_review;
+    let persistent_terminal = tuning.persistent_terminal;
+    let on_machine = tuning.on_machine.clone();
     let max_attempts = tuning.max_attempts;
     let attempt_no = lock_ledger(shared).attempts[idx].attempt_no;
     let phase = attempt_phase(&lock_ledger(shared).attempts[idx]).to_string();
@@ -10775,6 +11285,8 @@ fn resume_ticket_attempt(
         open_train_branch: live_train,
         max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
+        persistent_terminal,
+        on_machine: on_machine.clone(),
         review_timeout_secs: review_timeout_secs(timeout_review),
         spec_freeze: approved_freeze(&comment_bodies),
     };
@@ -10792,6 +11304,8 @@ fn cmd_dispatch_ticket(
     let max_attempts = tuning.max_attempts;
     let timeout_impl = tuning.timeout_impl;
     let timeout_review = tuning.timeout_review;
+    let persistent_terminal = tuning.persistent_terminal;
+    let on_machine = tuning.on_machine.clone();
     let view_text = match dgh(&[
         "issue",
         "view",
@@ -10908,8 +11422,13 @@ fn cmd_dispatch_ticket(
     let slot = format!("T{ticket}-a{attempt_no}");
     if dry_run {
         println!(
-            "dry-run: would build factory/T{ticket}-<slug> @ {}/worktrees/{slot}, run implement, verify, review",
-            state.display()
+            "dry-run: would build factory/T{ticket}-<slug> @ {}/worktrees/{slot}, run implement{}, verify, review",
+            state.display(),
+            dry_run_implement_line(
+                tuning.persistent_terminal,
+                tuning.on_machine.as_deref(),
+                ticket,
+            )
         );
         return TicketOutcome::DryRunAdmit { resume: false };
     }
@@ -10954,6 +11473,7 @@ fn cmd_dispatch_ticket(
                     resumed: 0,
                     timed_out: false,
                     timeout_secs: 0,
+                    terminal: String::new(),
                 },
             );
             log_event(&log_path, id, ticket, "spec-gate", 1);
@@ -11027,6 +11547,7 @@ fn cmd_dispatch_ticket(
             resumed: 0,
             timed_out: false,
             timeout_secs: 0,
+            terminal: String::new(),
         },
     );
     // Plan checkpoint: committed before any side-effecting work begins.
@@ -11102,6 +11623,8 @@ fn cmd_dispatch_ticket(
         open_train_branch: open_train_branch.clone(),
         max_attempts,
         implement_timeout_secs: implement_timeout_secs(timeout_impl),
+        persistent_terminal,
+        on_machine: on_machine.clone(),
         review_timeout_secs: review_timeout_secs(timeout_review),
         spec_freeze,
     };
@@ -11272,6 +11795,10 @@ fn stop_now(state: &std::path::Path) -> bool {
 const STOP_HALT_LINE: &str =
     "dispatch: STOP file present — halting admission (in-flight workers finish)";
 
+/// One scheduling pass over ready tickets. `on_machine` rides the
+/// persistent-terminal experiment (ticket #128); `None` preserves the
+/// historical subprocess behavior byte-for-byte.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_dispatch_once(
     json: bool,
     dry_run: bool,
@@ -11279,6 +11806,8 @@ pub fn cmd_dispatch_once(
     concurrency: Option<usize>,
     timeout_impl: Option<u64>,
     timeout_review: Option<u64>,
+    persistent_terminal: bool,
+    on_machine: Option<String>,
 ) -> i32 {
     let state = dispatch_state_dir();
     for sub in ["logs", "worktrees", "tmp"] {
@@ -11291,6 +11820,10 @@ pub fn cmd_dispatch_once(
         println!("dispatch: another dispatcher holds the lock — exiting");
         return 0;
     };
+    if on_machine.is_some() && !persistent_terminal {
+        eprintln!("dispatch: --on needs --persistent-terminal (remote scheduling rides the persistent terminal)");
+        return 1;
+    }
     let mut ledger = load_ledger(&state);
     // Stale-lease reaper (ticket #61, spec #59): running rows under the
     // lock are dead workers, so they become resumable checkpoints before
@@ -11329,6 +11862,8 @@ pub fn cmd_dispatch_once(
         max_concurrent,
         timeout_impl,
         timeout_review,
+        persistent_terminal,
+        on_machine,
     };
     // Effective bounded-wait values (ticket #94): flags win over env.
     // Dry-run announces them; every pass states them the same way.
@@ -11463,7 +11998,7 @@ pub fn cmd_dispatch_once(
             if ticket == 0 {
                 continue;
             }
-            match cmd_dispatch_ticket(&state, &shared, ticket, true, tuning) {
+            match cmd_dispatch_ticket(&state, &shared, ticket, true, tuning.clone()) {
                 TicketOutcome::DryRunAdmit { resume } => {
                     decisions.push((ticket, PlanDecision::Admit { resume }));
                 }
@@ -11497,7 +12032,7 @@ pub fn cmd_dispatch_once(
             if ticket == 0 {
                 continue;
             }
-            match cmd_dispatch_ticket(&state, &shared, ticket, false, tuning) {
+            match cmd_dispatch_ticket(&state, &shared, ticket, false, tuning.clone()) {
                 TicketOutcome::Done => {
                     attempted += 1;
                     if let Err(e) = save_shared_ledger(&state, &shared) {
@@ -11568,8 +12103,9 @@ pub fn cmd_dispatch_once(
             std::thread::scope(|s| {
                 let mut handles = Vec::new();
                 for t in now {
-                    handles
-                        .push(s.spawn(|| cmd_dispatch_ticket(&state, &shared, *t, false, tuning)));
+                    handles.push(
+                        s.spawn(|| cmd_dispatch_ticket(&state, &shared, *t, false, tuning.clone())),
+                    );
                 }
                 for (ticket, handle) in now.iter().zip(handles) {
                     match handle.join() {
@@ -11682,7 +12218,16 @@ pub fn cmd_dispatch_daemon(
             }
             first_pass = false;
         }
-        let code = cmd_dispatch_once(json, false, None, None, timeout_impl, timeout_review);
+        let code = cmd_dispatch_once(
+            json,
+            false,
+            None,
+            None,
+            timeout_impl,
+            timeout_review,
+            false,
+            None,
+        );
         if code != 0 {
             // Transient failure: report and retry next interval instead of
             // killing autonomous operation (bash `set -e` would abort here;
@@ -13474,6 +14019,14 @@ pub fn cmd_log(
         // Machine verdict (ticket #105): the same tag-first decision the
         // human transcript shows. Null when no verdict recorded yet.
         let verdict = verdict_of_transcript(&full);
+        // Live terminal (ticket #127): for attempts that may still be
+        // running, read the recorded terminal's tail beside the ledger
+        // transcript. Null when there is no terminal or it is unreadable.
+        let live = if attempt_may_be_live(&a.status) && !a.terminal.is_empty() {
+            live_terminal_tail(&a.terminal, tail)
+        } else {
+            None
+        };
         rows.push(serde_json::json!({
             "ticket": a.ticket,
             "attempt": a.attempt_no,
@@ -13492,6 +14045,8 @@ pub fn cmd_log(
             "started": a.started_at,
             "finished": a.finished_at,
             "exit_code": a.exit_code,
+            "terminal": a.terminal,
+            "live_transcript": live,
             "transcript": shown,
             "truncated": truncated,
         }));
@@ -13581,6 +14136,28 @@ pub fn cmd_log(
             print!("{transcript}");
             if !transcript.ends_with('\n') {
                 println!();
+            }
+        }
+        // Live terminal (ticket #127): the running attempt's terminal
+        // tail beside its ledger transcript, with the attach command.
+        // Finished attempts skip this: their transcript already holds
+        // everything the terminal printed.
+        let terminal = row.get("terminal").and_then(|v| v.as_str()).unwrap_or("");
+        let running = row
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(attempt_may_be_live);
+        if running && !terminal.is_empty() {
+            match row.get("live_transcript").and_then(|v| v.as_str()) {
+                Some(live) => {
+                    println!("Live terminal {terminal} (hc attach {terminal} to take over):");
+                    println!("{live}");
+                }
+                None => {
+                    println!(
+                        "Live terminal {terminal} is not readable right now (finished, or is hc installed?)."
+                    );
+                }
             }
         }
         if i + 1 < rows.len() {
@@ -16059,6 +16636,7 @@ fn cutover_attempt(row: &sqlite::Row) -> Result<DispatchAttempt, String> {
         resumed: 0,
         timed_out: false,
         timeout_secs: 0,
+        terminal: String::new(),
     })
 }
 
@@ -17978,6 +18556,8 @@ pub fn run() -> i32 {
                 concurrency,
                 timeout_impl,
                 timeout_review,
+                persistent_terminal,
+                on,
             } => cmd_dispatch_once(
                 cli.json,
                 dry_run,
@@ -17985,6 +18565,8 @@ pub fn run() -> i32 {
                 concurrency,
                 timeout_impl,
                 timeout_review,
+                persistent_terminal,
+                on,
             ),
             DispatchAction::Daemon {
                 interval,

@@ -428,3 +428,130 @@ fn log_observing_changes_nothing_in_all_modes() {
         assert_eq!(mtime_b, mtime_a, "mtime of {rel_b} unchanged");
     }
 }
+
+/// AC (ticket #127): a running attempt with a recorded terminal shows the
+/// live tail beside its ledger transcript, with the attach command.
+#[test]
+fn log_shows_live_terminal_tail_for_running_attempt() {
+    let h = setup("live-tail");
+    fs::create_dir_all(&h.state).unwrap();
+    let hc = h.state.join("hc.sh");
+    fs::write(
+        &hc,
+        "#!/bin/sh\nif [ \"$1\" = \"read\" ]; then echo \"LIVE LINE from terminal\"; exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hc, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut a = attempt_with_log(&h, 98, 1, 1, "impl_running", 0);
+    a["terminal"] = serde_json::json!("t98-impl-a1");
+    a["finished_at"] = serde_json::json!("");
+    write_ledger(&h, serde_json::json!([a]));
+    write_impl_log(&h, 98, 1, "ledger line 1\n");
+
+    let out = log_cmd(&h, &["log", "98"])
+        .env("FACTORY_HC_BIN", &hc)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("ledger line 1"),
+        "ledger history stays:\n{text}"
+    );
+    assert!(
+        text.contains("Live terminal t98-impl-a1"),
+        "live section names the terminal:\n{text}"
+    );
+    assert!(
+        text.contains("hc attach t98-impl-a1"),
+        "attach command shown:\n{text}"
+    );
+    assert!(
+        text.contains("LIVE LINE from terminal"),
+        "live tail shown:\n{text}"
+    );
+
+    let out = log_cmd(&h, &["--json", "log", "98"])
+        .env("FACTORY_HC_BIN", &hc)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let attempts = v.get("attempts").and_then(|a| a.as_array()).unwrap();
+    assert_eq!(
+        attempts[0].get("terminal").and_then(|t| t.as_str()),
+        Some("t98-impl-a1")
+    );
+    assert!(
+        attempts[0]
+            .get("live_transcript")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .contains("LIVE LINE"),
+        "machine output carries the live tail: {v}"
+    );
+}
+
+/// AC: an unreadable terminal reads as a calm note, never an error.
+#[test]
+fn log_names_unreadable_terminal_calmly() {
+    let h = setup("live-unreadable");
+    let mut a = attempt_with_log(&h, 98, 1, 1, "impl_running", 0);
+    a["terminal"] = serde_json::json!("t98-impl-a1");
+    a["finished_at"] = serde_json::json!("");
+    write_ledger(&h, serde_json::json!([a]));
+    write_impl_log(&h, 98, 1, "ledger line 1\n");
+
+    let out = log_cmd(&h, &["log", "98"])
+        .env("FACTORY_HC_BIN", "/nonexistent/hc-fixture")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("not readable right now"),
+        "calm note, got:\n{text}"
+    );
+}
+
+/// Finished attempts skip the live section: the transcript already holds
+/// everything the terminal printed.
+#[test]
+fn log_skips_live_section_for_finished_attempt() {
+    let h = setup("live-finished");
+    fs::create_dir_all(&h.state).unwrap();
+    let hc = h.state.join("hc.sh");
+    fs::write(&hc, "#!/bin/sh\necho \"SHOULD NOT APPEAR\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hc, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut a = attempt_with_log(&h, 98, 1, 1, "review_done", 0);
+    a["terminal"] = serde_json::json!("t98-impl-a1");
+    write_ledger(&h, serde_json::json!([a]));
+    write_impl_log(&h, 98, 1, "ledger line 1\n");
+
+    let out = log_cmd(&h, &["log", "98"])
+        .env("FACTORY_HC_BIN", &hc)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("Live terminal"),
+        "no live section for finished attempts:\n{text}"
+    );
+}
