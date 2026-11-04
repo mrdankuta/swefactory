@@ -7,7 +7,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fresh scratch dir for one test (unique per test, no extra deps).
+/// Also pins XDG_CONFIG_HOME (once per test-binary process) so `init`'s
+/// agent-template seeding never touches the developer's real config.
 fn scratch_dir(name: &str) -> PathBuf {
+    use std::sync::OnceLock;
+    static XDG: OnceLock<PathBuf> = OnceLock::new();
+    XDG.get_or_init(|| {
+        let xdg =
+            std::env::temp_dir().join(format!("factory-init-test-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        xdg
+    });
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
         "factory-init-test-{}-{}-{}",
@@ -1019,4 +1030,80 @@ fn six_new_adapters_follow_the_uniform_contract() {
             "--stack {stack} adapter must print the success marker last (green path only)"
         );
     }
+}
+
+/// Serializes the agent-template tests: they share one pinned XDG dir,
+/// so install-assertions and customize-and-restore must not interleave.
+static AGENT_TEMPLATES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// AC (ticket #124): init installs the implementer + reviewer role templates
+/// where `hc` resolves them, with the command and reporting contract.
+#[test]
+fn init_installs_agent_role_templates() {
+    let _guard = AGENT_TEMPLATES_LOCK.lock().unwrap();
+    let dir = scratch_dir("agent-templates");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    cmd.assert().success();
+
+    let xdg = std::env::var("XDG_CONFIG_HOME").expect("XDG pinned by scratch_dir");
+    for name in ["implementer.md", "reviewer.md"] {
+        let f = PathBuf::from(&xdg).join("herdr-core/templates").join(name);
+        let body = fs::read_to_string(&f).unwrap_or_else(|_| panic!("missing template {name}"));
+        assert!(
+            body.contains("command: pi"),
+            "{name} must name the runner command"
+        );
+        assert!(
+            body.contains("hc send $HC_TERMINAL_ID"),
+            "{name} must carry the report-back contract"
+        );
+    }
+    let reviewer =
+        fs::read_to_string(PathBuf::from(&xdg).join("herdr-core/templates/reviewer.md")).unwrap();
+    assert!(
+        reviewer.to_lowercase().contains("do not edit"),
+        "reviewer must be read-only scoped"
+    );
+}
+
+/// AC: rerun keeps customized templates byte-identical (never overwrites).
+/// Serialized with the install-test above; restores the template after.
+#[test]
+fn init_never_clobbers_customized_agent_templates() {
+    let _guard = AGENT_TEMPLATES_LOCK.lock().unwrap();
+    let dir = scratch_dir("agent-templates-keep");
+    let (_bin, path) = empty_path();
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    cmd.assert().success();
+
+    let xdg = PathBuf::from(std::env::var("XDG_CONFIG_HOME").expect("XDG pinned"));
+    let reviewer = xdg.join("herdr-core/templates/reviewer.md");
+    let shipped = fs::read(&reviewer).expect("reviewer seeded by earlier init");
+    fs::write(&reviewer, "customized by human\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("init");
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("keep:"));
+    assert_eq!(
+        fs::read_to_string(&reviewer).unwrap(),
+        "customized by human\n",
+        "customized template must survive re-init"
+    );
+
+    // update also refreshes without clobbering.
+    let mut cmd = Command::cargo_bin("factory").unwrap();
+    cmd.current_dir(&dir).env("PATH", &path).arg("update");
+    cmd.assert().success();
+    assert_eq!(
+        fs::read_to_string(&reviewer).unwrap(),
+        "customized by human\n",
+        "customized template must survive update"
+    );
+    // Restore for the shared XDG dir, then done.
+    fs::write(&reviewer, &shipped).unwrap();
 }

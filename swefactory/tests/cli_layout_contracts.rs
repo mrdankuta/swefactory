@@ -19,6 +19,19 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 const DECOY_MARKER: &str = "PREDECESSOR-DECOY-9f3c1a-do-not-seed";
 
 fn scratch_dir(name: &str) -> PathBuf {
+    // Pin XDG_CONFIG_HOME (once per test-binary process) so `init`'s
+    // agent-template seeding never touches the developer's real config.
+    use std::sync::OnceLock;
+    static XDG: OnceLock<PathBuf> = OnceLock::new();
+    XDG.get_or_init(|| {
+        let xdg = std::env::temp_dir().join(format!(
+            "factory-layout-contracts-xdg-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        xdg
+    });
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
         "factory-layout-contracts-{}-{}-{}",

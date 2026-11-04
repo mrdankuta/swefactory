@@ -5464,6 +5464,33 @@ const PROMPT_BUILD: &str = include_str!("../templates/prompts/build.md");
 const PROMPT_REVIEW: &str = include_str!("../templates/prompts/review.md");
 const PROMPT_HANDOFF: &str = include_str!("../templates/prompts/handoff.md");
 
+/// herdr-core agent-role templates, seeded into the herdr config dir
+/// (`$XDG_CONFIG_HOME/herdr-core/templates/`, else
+/// `~/.config/herdr-core/templates/`; `%APPDATA%` on Windows).
+/// `hc run --bg <name>` resolves a template there and combines its
+/// instructions with the task. Never overwrite: filenames are fixed.
+const HC_IMPLEMENTER: &str = include_str!("../templates/hc/implementer.md");
+const HC_REVIEWER: &str = include_str!("../templates/hc/reviewer.md");
+
+const HC_TEMPLATES: &[(&str, &str)] = &[
+    ("implementer.md", HC_IMPLEMENTER),
+    ("reviewer.md", HC_REVIEWER),
+];
+
+/// Where `hc templates` looks. Honors XDG_CONFIG_HOME so tests can point
+/// it at a sandbox; falls back to the platform config home.
+fn herdr_templates_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("herdr-core/templates");
+    }
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata).join("herdr-core/templates");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".config/herdr-core/templates")
+}
+
 const ISSUE_SPEC: &str = include_str!("../templates/issue-templates/spec.yml");
 const ISSUE_TICKET: &str = include_str!("../templates/issue-templates/ticket.yml");
 
@@ -6150,7 +6177,37 @@ fn seed_project_local(
     ins.seed(".github/ISSUE_TEMPLATE/spec.yml", ISSUE_SPEC);
     ins.seed(".github/ISSUE_TEMPLATE/ticket.yml", ISSUE_TICKET);
 
+    // --- agent-role templates (herdr config dir; hc resolves them by name) ---
+    seed_agent_templates(ins);
+
     ins.finish_dirs_and_markers();
+}
+
+/// Seed herdr-core role templates (`implementer`, `reviewer`) into the
+/// herdr config dir. Runs on both init and update through
+/// seed_project_local; never overwrites a customized template.
+fn seed_agent_templates(ins: &mut Installer) {
+    let dir = herdr_templates_dir();
+    for (name, content) in HC_TEMPLATES {
+        let target = dir.join(name);
+        let display = format!("{}/{}", dir.display(), name);
+        if target.exists() {
+            ins.kept.push(display.clone());
+            ins.say(&format!("keep: {display} exists, not overwriting"));
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            ins.warn(&format!("WARN: cannot create {}: {e}", dir.display()));
+            return;
+        }
+        match std::fs::write(&target, content) {
+            Ok(()) => {
+                ins.installed.push(display.clone());
+                ins.say(&format!("install: {display}"));
+            }
+            Err(e) => ins.warn(&format!("WARN: cannot write {display}: {e}")),
+        }
+    }
 }
 
 // --- bounded guided mode (ticket #49, spec #45) ----------------------------
