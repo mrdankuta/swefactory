@@ -1429,11 +1429,7 @@ pub fn desktop_board_html_with_selection(
 /// Shared render core for the center board (single copy of the
 /// columns/cards/stale markup). `selected` flags one card with
 /// `data-selected="true"` and scopes the board to the detail pane.
-fn desktop_board_html_inner(
-    feed: &DesktopBoardFeed,
-    poll_ms: u64,
-    picked: Option<u64>,
-) -> String {
+fn desktop_board_html_inner(feed: &DesktopBoardFeed, poll_ms: u64, picked: Option<u64>) -> String {
     let ms = poll_ms.clamp(DESKTOP_BOARD_POLL_MS_MIN, DESKTOP_BOARD_POLL_MS_MAX);
     let sel_attr = match picked {
         Some(n) => format!(" data-selected-card=\"{n}\" data-scopes=\"detail\"").to_string(),

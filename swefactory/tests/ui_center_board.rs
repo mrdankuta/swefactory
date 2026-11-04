@@ -84,7 +84,9 @@ fn card_selection_scopes_detail_pane() {
 /// boundaries, not fixed char windows, so refactors don't shift/break it.
 fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
     let marker = format!("pub fn {name}");
-    let start = src.find(&marker).unwrap_or_else(|| panic!("{name} fn exists"));
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{name} fn exists"));
     let rest = &src[start..];
     // Skip past the marker itself, then find the next top-level fn.
     let after = &rest[marker.len()..];
@@ -122,9 +124,19 @@ fn repeated_card_selection_keeps_scoping_detail() {
     let f = feed();
     for n in [7u64, 8, 7] {
         let html = desktop_board_html_with_selection(&f, DESKTOP_BOARD_POLL_MS, Some(n));
-        assert!(html.contains(&format!("data-selected-card=\"{n}\"")) && html.contains("data-scopes=\"detail\""), "repeat select scopes detail, got:\n{html}");
+        assert!(
+            html.contains(&format!("data-selected-card=\"{n}\""))
+                && html.contains("data-scopes=\"detail\""),
+            "repeat select scopes detail, got:\n{html}"
+        );
     }
     let shell = include_str!("../../shell/index.html");
-    assert!(!shell.contains("once:true") && !shell.contains("once: true"), "click listener must not use once:true");
-    assert!(shell.contains("addEventListener"), "click listener registered");
+    assert!(
+        !shell.contains("once:true") && !shell.contains("once: true"),
+        "click listener must not use once:true"
+    );
+    assert!(
+        shell.contains("addEventListener"),
+        "click listener registered"
+    );
 }
