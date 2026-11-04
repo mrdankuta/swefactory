@@ -1427,6 +1427,42 @@ pub fn desktop_board_html(feed: &DesktopBoardFeed, poll_ms: u64) -> String {
     html
 }
 
+/// Left-rail project switcher HTML (ticket #140): lists factory repos;
+/// selecting one scopes board + agents + detail (the `data-scopes` +
+/// `data-active-project` contract the client reads). Pure over inputs.
+pub fn desktop_project_switcher_html(projects: &[String], active: Option<&str>) -> String {
+    let active = active.unwrap_or("");
+    let mut html = format!(
+        "<nav data-project-switcher data-active-project=\"{}\" data-scopes=\"board agents detail\">",
+        escape_html(active)
+    );
+    for p in projects {
+        let sel = if p.as_str() == active {
+            "true"
+        } else {
+            "false"
+        };
+        html.push_str(&format!(
+            "<button data-project=\"{}\" data-selected=\"{}\">{}</button>",
+            escape_html(p),
+            sel,
+            escape_html(p)
+        ));
+    }
+    html.push_str("</nav>");
+    html
+}
+
+/// Settings Privacy telemetry toggle (ticket #140): reflects
+/// `telemetry_enabled` (`checked` = on by default in releases).
+/// Pure over the enabled flag. Escaping is unnecessary (no input).
+pub fn desktop_settings_privacy_html(telemetry_on: bool) -> String {
+    format!(
+        "<section data-settings-privacy><label>Usage telemetry<input type=\"checkbox\" data-telemetry-toggle{}></label></section>",
+        if telemetry_on { " checked" } else { "" }
+    )
+}
+
 // --- ticket detail (ticket #30, spec #27) ---------------------------------
 //
 // Bea taps a board card and lands here: the issue body in plain words,
